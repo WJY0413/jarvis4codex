@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+build/
+dist/
+
+# Runtime state belongs in the configured Jarvis data root, never source control.
+runtime/
+state/
+logs/
