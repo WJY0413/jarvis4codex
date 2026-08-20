@@ -1,8 +1,10 @@
-# Jarvis 0.1.0
+# Jarvis 0.1.1
 
-## Foundation
+## Capability input port
 
-- Created a separate product repository and `codex/jarvis-0.1.0` branch.
-- Added harness-neutral contracts, adapter SDK and heartbeat engine boundary.
-- Added source-controlled Codex heartbeat and monitoring operator skills.
-- No production service, schedule, credential, or existing runtime state was changed.
+- Added `jarvis-capability-request/v1` and `jarvis-capability-receipt/v1`.
+- Added a caller-owned `JarvisCapabilityPort` for monitor, resume,
+  monitor-to-resume composition, and heartbeat control requests.
+- The Port leaves HostBridge adaptation and external delivery outside the
+  standard package; each caller supplies its own integration adapter.
+- No scheduler, credential, or existing runtime state is migrated by this release.

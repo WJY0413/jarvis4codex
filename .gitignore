@@ -4,6 +4,7 @@ __pycache__/
 .venv/
 build/
 dist/
+*.egg-info/
 
 # Runtime state belongs in the configured Jarvis data root, never source control.
 runtime/
