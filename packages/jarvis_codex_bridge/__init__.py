@@ -2,7 +2,14 @@
 
 from .contracts import BridgeReceipt, MonitorReceipt, ReceiptRoute, ResumeRequest, StartedTurn, TerminalContinuationRule, ThreadState, TurnState
 from .journal import JsonlReceiptJournal, ReceiptJournal
-from .monitor import ThreadTerminalMonitor
+from .monitor import (
+    DEFAULT_MONITOR_INTERVAL_SECONDS,
+    DEFAULT_MONITOR_MAX_DURATION_SECONDS,
+    ContinuousMonitorResult,
+    ContinuousMonitorSpec,
+    ContinuousTerminalContinuationMonitor,
+    ThreadTerminalMonitor,
+)
 from .port import (
     CAPABILITY_RECEIPT_SCHEMA,
     CAPABILITY_REQUEST_SCHEMA,
@@ -20,6 +27,11 @@ __all__ = [
     "CAPABILITY_REQUEST_SCHEMA",
     "CapabilityReceipt",
     "CapabilityRequest",
+    "ContinuousMonitorResult",
+    "ContinuousMonitorSpec",
+    "ContinuousTerminalContinuationMonitor",
+    "DEFAULT_MONITOR_INTERVAL_SECONDS",
+    "DEFAULT_MONITOR_MAX_DURATION_SECONDS",
     "ExistingThreadBridge",
     "ExistingThreadTransport",
     "HeartbeatControlPort",

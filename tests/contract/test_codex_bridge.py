@@ -4,6 +4,8 @@ import unittest
 
 from jarvis_codex_bridge import (
     CapabilityRequest,
+    ContinuousMonitorSpec,
+    ContinuousTerminalContinuationMonitor,
     ExistingThreadBridge,
     JarvisCapabilityPort,
     JsonlReceiptJournal,
@@ -23,6 +25,7 @@ class FakeTransport:
     def __init__(self, state: ThreadState):
         self.state = state
         self.calls = 0
+        self.prompts = []
 
     def health(self):
         return {"adapter": self.name, "status": "ok"}
@@ -33,19 +36,21 @@ class FakeTransport:
 
     def resume_existing(self, request):
         self.calls += 1
+        self.prompts.append(request.prompt)
+        turn_id = f"turn-{self.calls + 1}"
         self.state = ThreadState(
             request.thread_id,
             "idle",
             (
                 *self.state.turns,
                 TurnState(
-                    "turn-2",
+                    turn_id,
                     "completed",
                     ({"type": "agentMessage", "phase": "final_answer", "text": "continued"},),
                 ),
             ),
         )
-        return StartedTurn(request.thread_id, "turn-2", "completed")
+        return StartedTurn(request.thread_id, turn_id, "completed")
 
 
 class FakeHeartbeatControl:
@@ -124,6 +129,118 @@ class CodexBridgeContractTest(unittest.TestCase):
             self.assertEqual(request.thread_id, "worker-thread-7")
             self.assertEqual(request.prompt, "继续")
             self.assertEqual(request.request_id, f"terminal-continue:monitor-1:{receipt.fingerprint[:32]}")
+
+    def test_continuous_monitor_is_separate_from_heartbeat_and_runs_ordered_prompts(self):
+        transport = FakeTransport(
+            ThreadState("thread-1", "idle", (TurnState("turn-0", "completed"),))
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            monitor = ThreadTerminalMonitor(transport, Path(temp) / "monitor.json")
+            bridge = ExistingThreadBridge(transport, JsonlReceiptJournal(Path(temp) / "receipts.jsonl"))
+
+            def after_baseline(receipt):
+                if receipt.state == "baseline_terminal":
+                    transport.state = ThreadState(
+                        "thread-1", "idle", (TurnState("turn-1", "completed"),)
+                    )
+
+            result = ContinuousTerminalContinuationMonitor(
+                monitor,
+                bridge,
+                ContinuousMonitorSpec(
+                    monitor_id="continuous-monitor-1",
+                    route=ReceiptRoute("thread-1", "parent-thread"),
+                    resume_target_thread_id="thread-1",
+                    continuation_prompts=("test", "测试完成"),
+                    source_ref="contract-test",
+                    interval_seconds=1,
+                ),
+            ).run(on_observation=after_baseline)
+            self.assertEqual(result.status, "completed")
+            self.assertEqual(transport.calls, 2)
+            self.assertEqual(
+                transport.prompts,
+                ["test", "测试完成"],
+            )
+            self.assertEqual(result.observations[0].state, "baseline_terminal")
+            self.assertTrue(all(
+                receipt.state == "terminal_changed" for receipt in result.observations[1:]
+            ))
+
+    def test_continuous_monitor_rejects_lifetime_over_24_hours(self):
+        with self.assertRaisesRegex(ValueError, "24 hours"):
+            ContinuousMonitorSpec(
+                monitor_id="too-long",
+                route=ReceiptRoute("thread-1", "parent-thread"),
+                resume_target_thread_id="thread-1",
+                continuation_prompts=("test",),
+                source_ref="contract-test",
+                max_duration_seconds=24 * 60 * 60 + 1,
+            )
+
+    def test_continuous_monitor_repeats_completed_cycles_with_custom_prompts(self):
+        transport = FakeTransport(
+            ThreadState("thread-1", "idle", (TurnState("turn-0", "completed"),))
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            monitor = ThreadTerminalMonitor(transport, Path(temp) / "monitor.json")
+            bridge = ExistingThreadBridge(transport, JsonlReceiptJournal(Path(temp) / "receipts.jsonl"))
+
+            def after_baseline(receipt):
+                if receipt.state == "baseline_terminal":
+                    transport.state = ThreadState(
+                        "thread-1", "idle", (TurnState("turn-1", "completed"),)
+                    )
+
+            result = ContinuousTerminalContinuationMonitor(
+                monitor,
+                bridge,
+                ContinuousMonitorSpec(
+                    monitor_id="persistent-monitor-1",
+                    route=ReceiptRoute("thread-1", "parent-thread"),
+                    resume_target_thread_id="thread-1",
+                    continuation_prompts=("continue",),
+                    continuation_prompt_provider=lambda cycle, _: f"next-{cycle}",
+                    max_continuations=3,
+                    source_ref="contract-test",
+                    interval_seconds=1,
+                ),
+            ).run(on_observation=after_baseline)
+
+            self.assertEqual(result.status, "completed")
+            self.assertEqual(transport.calls, 3)
+            self.assertEqual(transport.prompts, ["next-1", "next-2", "next-3"])
+
+    def test_continuous_monitor_does_not_continue_an_interrupted_turn(self):
+        transport = FakeTransport(
+            ThreadState("thread-1", "running", (TurnState("turn-1", "inProgress"),))
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            monitor = ThreadTerminalMonitor(transport, Path(temp) / "monitor.json")
+            bridge = ExistingThreadBridge(transport, JsonlReceiptJournal(Path(temp) / "receipts.jsonl"))
+
+            def interrupt_after_baseline(receipt):
+                if receipt.state == "baseline_active":
+                    transport.state = ThreadState(
+                        "thread-1", "idle", (TurnState("turn-1", "interrupted"),)
+                    )
+
+            result = ContinuousTerminalContinuationMonitor(
+                monitor,
+                bridge,
+                ContinuousMonitorSpec(
+                    monitor_id="interrupted-monitor-1",
+                    route=ReceiptRoute("thread-1", "parent-thread"),
+                    resume_target_thread_id="thread-1",
+                    continuation_prompts=("continue",),
+                    source_ref="contract-test",
+                    interval_seconds=1,
+                ),
+            ).run(on_observation=interrupt_after_baseline)
+
+            self.assertEqual(result.status, "requires_readback")
+            self.assertIn("interrupted", result.reason)
+            self.assertEqual(transport.prompts, [])
 
     def test_capability_port_resumes_an_explicit_thread_with_a_custom_prompt(self):
         transport = FakeTransport(ThreadState("thread-1", "idle", (TurnState("turn-1", "completed"),)))
