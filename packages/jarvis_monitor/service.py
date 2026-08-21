@@ -10,7 +10,8 @@ import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any
+from jarvis_harness_sdk.adapter import MonitorAdapter
 
 
 class MonitorError(RuntimeError): pass
@@ -18,12 +19,6 @@ class MonitorError(RuntimeError): pass
 
 def now() -> str: return datetime.now(timezone.utc).isoformat()
 def packed(value: object) -> str: return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-
-
-class MonitorAdapter(Protocol):
-    def read_thread(self, thread_id: str) -> dict[str, object]: ...
-    def resume_thread(self, thread_id: str, user_message_text: str, *, client_user_message_id: str, source_event_key: str, model: str | None, reasoning_effort: str | None) -> dict[str, object]: ...
-    def enqueue_bot_notification(self, *, monitor_id: str, observed_thread_id: str, notification_text: str, source_event_key: str) -> dict[str, object]: ...
 
 
 class MonitorStore:
