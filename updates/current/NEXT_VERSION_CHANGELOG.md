@@ -1,3 +1,16 @@
+# Jarvis 0.1.3
+
+## Independent Monitor output layer
+
+- Added a durable, bounded Monitor engine separate from Heartbeat scheduling.
+- A Monitor observes an existing thread only; a new completed turn can fan out to
+  an explicit thread resume, the source thread resume, and/or the Jarvis Bot outbox.
+- Output messages use a built-in structured completion summary by default and
+  accept per-output `user_message_text` / `notification_text` overrides.
+- Resume outputs persist a deterministic `client_user_message_id` before calling
+  the runtime adapter; Bot outputs remain `QUEUED` until the existing outbox
+  records delivery.
+
 # Jarvis 0.1.2
 
 ## Stable Desktop message identity
