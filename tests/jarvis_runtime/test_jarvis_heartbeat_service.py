@@ -835,9 +835,26 @@ class HeartbeatTestCase(unittest.TestCase):
             THREAD_ID,
             "Do not overlap",
             source_event_key="event-active",
+            client_user_message_id="wake-now:active-thread-001",
         )
         self.assertEqual(result["outcome"], "deferred_busy")
         self.assertNotIn("turn/start", [call[0] for call in FakeClient.instances[-1].calls])
+
+    def test_wake_controller_rejects_missing_client_message_id(self) -> None:
+        FakeClient.instances.clear()
+        controller = WakeController(self.config, client_factory=FakeClient)
+        result = controller.wake(
+            THREAD_ID,
+            "Do not start without a stable client message identity.",
+            source_event_key="wake-now-missing-controller-id",
+            client_user_message_id=None,
+        )
+        self.assertEqual(result["outcome"], "failed")
+        self.assertEqual(
+            result["error"], "client_user_message_id is required for turn/start"
+        )
+        self.assertIsNone(result["client_user_message_id"])
+        self.assertEqual(FakeClient.instances, [])
 
     def test_wake_controller_existing_task_path_matches_inbox_transport(self) -> None:
         FakeClient.instances.clear()

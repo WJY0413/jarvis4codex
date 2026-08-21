@@ -1656,9 +1656,16 @@ class WakeController:
     ) -> dict[str, Any]:
         started_at = utc_now()
         desktop = {"desktop_status": "not_requested", "desktop_exe": None}
-        resolved_client_user_message_id = (
-            client_user_message_id or f"jarvis-heartbeat-{uuid.uuid4()}"
-        ) if prompt else None
+        resolved_client_user_message_id = client_user_message_id
+        if prompt and not str(resolved_client_user_message_id or "").strip():
+            return {
+                "outcome": "failed",
+                "started_at": started_at,
+                "thread_status": "unknown",
+                "error": "client_user_message_id is required for turn/start",
+                "client_user_message_id": None,
+                **desktop,
+            }
         try:
             if ensure_desktop:
                 desktop = self.desktop_factory(self.config).ensure_running()
@@ -2817,6 +2824,10 @@ class HeartbeatService:
                         model=heartbeat.get("model"),
                         reasoning_effort=heartbeat.get("reasoning_effort"),
                         on_turn_started=record_turn_started,
+                        client_user_message_id=(
+                            f"jarvis-heartbeat-{heartbeat['heartbeat_id']}-"
+                            f"run-{inflight['run_id']}"
+                        ),
                     )
                     if result.get("outcome") == "turn_completed":
                         result["continuation_receipt"] = self._read_continuation_receipt(
