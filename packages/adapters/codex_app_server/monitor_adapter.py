@@ -1,7 +1,7 @@
 """Concrete App Server and Jarvis Bot adapter for the Monitor SDK seam."""
 from __future__ import annotations
 from typing import Any
-from coo_dispatcher_store import iter_jsonl
+from jarvis_runtime.coo_dispatcher_store import iter_jsonl
 
 class CodexAppServerMonitorAdapter:
     name = "codex-app-server-monitor"
