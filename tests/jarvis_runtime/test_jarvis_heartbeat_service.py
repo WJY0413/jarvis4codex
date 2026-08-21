@@ -3,15 +3,19 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import hashlib
+import io
 import json
 from pathlib import Path
 import sqlite3
+import sys
 import tempfile
 import threading
 import time
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
+import jarvis_heartbeat_service
 from jarvis_heartbeat_service import (
     ACTIVE,
     DesktopRecovery,
@@ -103,20 +107,26 @@ class FakeDesktop:
 
 
 class FakeWakeController:
-    def __init__(self):
+    instances: list["FakeWakeController"] = []
+
+    def __init__(self, *_args: object, **_kwargs: object):
         self.calls: list[dict[str, object]] = []
+        self.__class__.instances.append(self)
 
     def wake(self, target_thread_id: str, prompt: str, **kwargs: object) -> dict[str, object]:
         self.calls.append(
             {"target_thread_id": target_thread_id, "prompt": prompt, **kwargs}
         )
-        return {
+        result: dict[str, object] = {
             "outcome": "turn_completed",
             "started_at": datetime.now(timezone.utc).isoformat(),
             "thread_status": "active",
             "turn_id": "turn-service-1",
             "desktop_status": "not_requested",
         }
+        if "client_user_message_id" in kwargs:
+            result["client_user_message_id"] = kwargs["client_user_message_id"]
+        return result
 
 
 class SequenceQuotaProbe:
@@ -694,6 +704,7 @@ class HeartbeatTestCase(unittest.TestCase):
             "Exact requirement",
             source_event_key="event-wake",
             ensure_desktop=True,
+            client_user_message_id="wake-now:exact-client-message-001",
         )
         self.assertEqual(result["outcome"], "turn_completed")
         self.assertEqual(result["turn_id"], "turn-1")
@@ -704,12 +715,117 @@ class HeartbeatTestCase(unittest.TestCase):
         self.assertEqual(calls[2][0], "turn/start")
         self.assertEqual(calls[2][1]["threadId"], THREAD_ID)
         self.assertEqual(
+            calls[2][1]["clientUserMessageId"],
+            "wake-now:exact-client-message-001",
+        )
+        self.assertEqual(
+            result["client_user_message_id"],
+            "wake-now:exact-client-message-001",
+        )
+        self.assertEqual(
             calls[2][1]["input"],
             [{"type": "text", "text": "Exact requirement"}],
         )
         self.assertEqual(calls[3][0], "wait_for_turn_terminal")
         self.assertEqual(calls[4][0], "thread/read")
         self.assertTrue(FakeClient.instances[-1].closed)
+
+    def test_wake_now_requires_and_persists_exact_client_message_id(self) -> None:
+        missing_request = self.root / "wake-now-missing-id.json"
+        missing_request.write_text(json.dumps({
+            "target_thread_id": THREAD_ID,
+            "source_event_key": "wake-now-source-event-1",
+            "prompt": "Wake the exact existing task.",
+        }), encoding="utf-8")
+        with patch.object(sys, "argv", [
+            "jarvis_heartbeat_service.py", "--config", str(self.config.path),
+            "wake-now", "--request", str(missing_request),
+        ]):
+            with self.assertRaisesRegex(
+                HeartbeatError, "client_user_message_id is required for wake-now"
+            ):
+                jarvis_heartbeat_service.main()
+
+        client_user_message_id = "wake-now:stable-message-001"
+        source_event_key = "wake-now-source-event-1"
+        request_path = self.root / "wake-now.json"
+        request_path.write_text(json.dumps({
+            "target_thread_id": THREAD_ID,
+            "source_event_key": source_event_key,
+            "client_user_message_id": client_user_message_id,
+            "prompt": "Wake the exact existing task.",
+        }), encoding="utf-8")
+        FakeWakeController.instances.clear()
+        with patch.object(jarvis_heartbeat_service, "WakeController", FakeWakeController):
+            with patch.object(sys, "argv", [
+                "jarvis_heartbeat_service.py", "--config", str(self.config.path),
+                "wake-now", "--request", str(request_path),
+            ]):
+                with patch("sys.stdout", new_callable=io.StringIO):
+                    self.assertEqual(jarvis_heartbeat_service.main(), 0)
+
+        controller_call = FakeWakeController.instances[-1].calls[0]
+        self.assertEqual(controller_call["client_user_message_id"], client_user_message_id)
+        self.assertEqual(controller_call["source_event_key"], source_event_key)
+        with self.store.session() as connection:
+            receipt = connection.execute(
+                """
+                SELECT source_event_key,client_user_message_id,target_thread_id,turn_id
+                FROM heartbeat_runs
+                WHERE source_event_key=?
+                """,
+                (source_event_key,),
+            ).fetchone()
+        self.assertIsNotNone(receipt)
+        assert receipt is not None
+        self.assertEqual(receipt["client_user_message_id"], client_user_message_id)
+        self.assertEqual(receipt["source_event_key"], source_event_key)
+        self.assertEqual(receipt["target_thread_id"], THREAD_ID)
+        self.assertEqual(receipt["turn_id"], "turn-service-1")
+
+    def test_run_receipt_migration_adds_client_message_id(self) -> None:
+        legacy_config = replace(self.config, db_path=self.root / "legacy-runs.sqlite")
+        connection = sqlite3.connect(legacy_config.db_path)
+        try:
+            connection.execute(
+                """
+                CREATE TABLE heartbeat_runs (
+                    run_id TEXT PRIMARY KEY,
+                    heartbeat_id TEXT,
+                    source_event_key TEXT,
+                    target_thread_id TEXT NOT NULL,
+                    scheduled_at TEXT,
+                    started_at TEXT NOT NULL,
+                    completed_at TEXT,
+                    outcome TEXT NOT NULL,
+                    desktop_status TEXT,
+                    thread_status TEXT,
+                    turn_id TEXT,
+                    error TEXT,
+                    probe_result_json TEXT
+                )
+                """
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        store = HeartbeatStore(legacy_config)
+        with store.session() as connection:
+            columns = {
+                row["name"] for row in connection.execute(
+                    "PRAGMA table_info(heartbeat_runs)"
+                )
+            }
+        self.assertIn("client_user_message_id", columns)
+        store.record_run(None, "legacy-wake-event", THREAD_ID, {
+            "outcome": "turn_completed",
+            "client_user_message_id": "wake-now:legacy-readback-001",
+        })
+        with store.session() as connection:
+            receipt = connection.execute(
+                "SELECT client_user_message_id FROM heartbeat_runs"
+            ).fetchone()
+        self.assertEqual(receipt["client_user_message_id"], "wake-now:legacy-readback-001")
 
     def test_wake_controller_does_not_overlap_active_thread(self) -> None:
         FakeClient.instances.clear()

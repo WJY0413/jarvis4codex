@@ -301,6 +301,7 @@ class HeartbeatStore:
                     run_id TEXT PRIMARY KEY,
                     heartbeat_id TEXT,
                     source_event_key TEXT,
+                    client_user_message_id TEXT,
                     target_thread_id TEXT NOT NULL,
                     scheduled_at TEXT,
                     started_at TEXT NOT NULL,
@@ -364,6 +365,10 @@ class HeartbeatStore:
             if "probe_result_json" not in run_columns:
                 connection.execute(
                     "ALTER TABLE heartbeat_runs ADD COLUMN probe_result_json TEXT"
+                )
+            if "client_user_message_id" not in run_columns:
+                connection.execute(
+                    "ALTER TABLE heartbeat_runs ADD COLUMN client_user_message_id TEXT"
                 )
 
     def audit(
@@ -1213,13 +1218,14 @@ class HeartbeatStore:
                 connection.execute(
                     """
                     INSERT INTO heartbeat_runs(
-                        run_id, heartbeat_id, source_event_key, target_thread_id,
+                        run_id, heartbeat_id, source_event_key, client_user_message_id, target_thread_id,
                         scheduled_at, started_at, completed_at, outcome,
                         desktop_status, thread_status, turn_id, error, probe_result_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
-                        run_id, heartbeat_id_value, source_event_key, target_thread_id,
+                        run_id, heartbeat_id_value, source_event_key,
+                        result.get("client_user_message_id"), target_thread_id,
                         scheduled_at, str(result.get("started_at") or now), now, outcome,
                         result.get("desktop_status"), result.get("thread_status"),
                         result.get("turn_id"), result.get("error"),
@@ -1237,7 +1243,8 @@ class HeartbeatStore:
                     """
                     UPDATE heartbeat_runs
                     SET completed_at=?, outcome=?, desktop_status=?, thread_status=?,
-                        turn_id=COALESCE(?,turn_id), error=?, probe_result_json=?
+                        turn_id=COALESCE(?,turn_id), error=?, probe_result_json=?,
+                        client_user_message_id=COALESCE(?,client_user_message_id)
                     WHERE run_id=? AND completed_at IS NULL
                     """,
                     (
@@ -1246,6 +1253,7 @@ class HeartbeatStore:
                         result.get("error"),
                         json.dumps(result.get("probe_result"), ensure_ascii=False, sort_keys=True)
                         if result.get("probe_result") is not None else None,
+                        result.get("client_user_message_id"),
                         run_id,
                     ),
                 )
@@ -1648,6 +1656,9 @@ class WakeController:
     ) -> dict[str, Any]:
         started_at = utc_now()
         desktop = {"desktop_status": "not_requested", "desktop_exe": None}
+        resolved_client_user_message_id = (
+            client_user_message_id or f"jarvis-heartbeat-{uuid.uuid4()}"
+        ) if prompt else None
         try:
             if ensure_desktop:
                 desktop = self.desktop_factory(self.config).ensure_running()
@@ -1675,13 +1686,12 @@ class WakeController:
                         "outcome": "deferred_busy",
                         "started_at": started_at,
                         "thread_status": thread_status,
+                        "client_user_message_id": resolved_client_user_message_id,
                         **desktop,
                     }
                 params: dict[str, Any] = {
                     "threadId": target_thread_id,
-                    "clientUserMessageId": (
-                        client_user_message_id or f"jarvis-heartbeat-{uuid.uuid4()}"
-                    ),
+                    "clientUserMessageId": resolved_client_user_message_id,
                     "input": [{"type": "text", "text": prompt}],
                 }
                 if model:
@@ -1723,6 +1733,7 @@ class WakeController:
                     "thread_status": readback_status,
                     "turn_id": turn_id,
                     "turn_status": terminal_status,
+                    "client_user_message_id": resolved_client_user_message_id,
                     **desktop,
                 }
             finally:
@@ -1733,6 +1744,7 @@ class WakeController:
                 "started_at": started_at,
                 "thread_status": "unknown",
                 "error": str(exc),
+                "client_user_message_id": resolved_client_user_message_id,
                 **desktop,
             }
 
@@ -3019,6 +3031,9 @@ def main() -> int:
         source_event_key = str(request.get("source_event_key") or "").strip()
         if not source_event_key:
             raise HeartbeatError("source_event_key is required")
+        client_user_message_id = str(request.get("client_user_message_id") or "").strip()
+        if args.command == "wake-now" and not client_user_message_id:
+            raise HeartbeatError("client_user_message_id is required for wake-now")
         prompt = (
             None
             if args.command == "recover-codex"
@@ -3039,6 +3054,9 @@ def main() -> int:
             model=str(request.get("model") or "").strip() or None,
             reasoning_effort=(
                 str(request.get("reasoning_effort") or "").strip() or None
+            ),
+            client_user_message_id=(
+                client_user_message_id if args.command == "wake-now" else None
             ),
         )
         recorded = store.record_run(
