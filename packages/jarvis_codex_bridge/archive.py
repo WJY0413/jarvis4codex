@@ -33,8 +33,12 @@ class SQLiteThreadArchive:
     def _connect(self) -> sqlite3.Connection:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         connection = sqlite3.connect(self.path)
-        connection.execute("PRAGMA foreign_keys = ON")
-        self._migrate(connection)
+        try:
+            connection.execute("PRAGMA foreign_keys = ON")
+            self._migrate(connection)
+        except BaseException:
+            connection.close()
+            raise
         return connection
 
     @staticmethod
