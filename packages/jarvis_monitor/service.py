@@ -93,13 +93,16 @@ class MonitorService:
         for monitor in self.store.due():
             mid=str(monitor["monitor_id"])
             if monitor["monitor_status"] == "OUTPUT_PENDING":
+                failed=False
                 for delivery in self.store.queued_deliveries(mid):
                     readback=self.adapter.read_bot_delivery(str(delivery.get("outbox_id") or ""))
                     status=str(readback.get("delivery_status") or "queued").upper()
-                    if status in {"DELIVERED","FAILED","EXPIRED"}: self.store.complete_delivery(delivery,status,error=str(readback.get("error") or "") or None)
+                    if status in {"DELIVERED","FAILED","EXPIRED"}:
+                        self.store.complete_delivery(delivery,status,error=str(readback.get("error") or "") or None)
+                        failed = failed or status in {"FAILED","EXPIRED"}
                 queued=self.store.queued_deliveries(mid)
-                self.store.status(mid,"OUTPUT_PENDING" if queued else "COMPLETED")
-                results.append({"monitor_id":mid,"outcome":"output_pending" if queued else "completed"}); continue
+                self.store.status(mid,"OUTPUT_PENDING" if queued else ("REQUIRES_READBACK" if failed else "COMPLETED"))
+                results.append({"monitor_id":mid,"outcome":"output_pending" if queued else ("requires_readback" if failed else "completed")}); continue
             if datetime.now(timezone.utc)>=datetime.fromisoformat(str(monitor["expires_at"])): self.store.status(mid,"EXPIRED"); results.append({"monitor_id":mid,"outcome":"expired"}); continue
             try:
                 state=self.adapter.read_thread(str(monitor["observed_thread_id"])); turns=state.get("turns") or []; latest=turns[-1] if isinstance(turns,list) and turns else {}

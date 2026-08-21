@@ -52,5 +52,13 @@ class MonitorServiceTest(unittest.TestCase):
             self.due_now(store,monitor["monitor_id"]); adapter.bot_status="delivered"; self.assertEqual(service.run_once()[0]["outcome"],"completed")
             self.assertEqual(store.get(monitor["monitor_id"])["monitor_status"],"COMPLETED")
 
+    def test_failed_bot_delivery_requires_readback(self):
+        with tempfile.TemporaryDirectory() as temp:
+            adapter=FakeAdapter(); store=MonitorStore(Path(temp)/"monitor.sqlite"); service=MonitorService(store,adapter)
+            monitor=store.start({"observed_thread_id":"child-1","outputs":[{"type":"notify_jarvis_bot"}]})
+            service.run_once(); self.due_now(store,monitor["monitor_id"]); adapter.state={"id":"child-1","status":"idle","turns":[{"id":"turn-1","status":"completed"}]}; service.run_once()
+            self.due_now(store,monitor["monitor_id"]); adapter.bot_status="failed"; self.assertEqual(service.run_once()[0]["outcome"],"requires_readback")
+            self.assertEqual(store.get(monitor["monitor_id"])["monitor_status"],"REQUIRES_READBACK")
+
 
 if __name__ == "__main__": unittest.main()
