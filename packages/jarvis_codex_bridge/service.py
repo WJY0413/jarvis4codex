@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from typing import Protocol
 
 from .contracts import BridgeReceipt, ResumeRequest, ThreadState, utc_now
 from .journal import ReceiptJournal
@@ -12,6 +13,20 @@ from .transport import ExistingThreadTransport
 _ACTIVE = {"active", "running", "inprogress", "in_progress", "pending"}
 
 
+class ThreadArchive(Protocol):
+    """Caller-owned durable store for complete readback thread snapshots."""
+
+    def store(self, state: ThreadState) -> None: ...
+
+
+def utf8_text(value: object) -> str:
+    """Return externally supplied text without falling back to a local code page."""
+
+    if isinstance(value, bytes):
+        return value.decode("utf-8")
+    return value if isinstance(value, str) else str(value)
+
+
 def final_output(state: ThreadState, turn_id: str) -> str:
     for turn in reversed(state.turns):
         if turn.turn_id != turn_id:
@@ -19,7 +34,7 @@ def final_output(state: ThreadState, turn_id: str) -> str:
         messages = [item for item in turn.items if item.get("type") == "agentMessage"]
         finals = [item for item in messages if item.get("phase") == "final_answer"]
         selected = finals[-1] if finals else (messages[-1] if messages else None)
-        return str(selected.get("text") or "").strip() if selected else ""
+        return utf8_text(selected.get("text") or "").strip() if selected else ""
     return ""
 
 
@@ -31,15 +46,26 @@ class ExistingThreadBridge:
     post-turn readback and the no-output stop rule.
     """
 
-    def __init__(self, transport: ExistingThreadTransport, journal: ReceiptJournal):
+    def __init__(
+        self,
+        transport: ExistingThreadTransport,
+        journal: ReceiptJournal,
+        archive: ThreadArchive | None = None,
+    ):
         self.transport = transport
         self.journal = journal
+        self.archive = archive
 
     def health(self) -> dict[str, object]:
         return {"package": "jarvis-codex-bridge", **self.transport.health()}
 
     def observe_thread(self, thread_id: str) -> ThreadState:
-        return self.transport.read_thread(thread_id)
+        state = self.transport.read_thread(thread_id)
+        if state.thread_id != thread_id:
+            raise RuntimeError("transport readback thread id does not match the requested thread")
+        if self.archive is not None:
+            self.archive.store(state)
+        return state
 
     def resume_existing(self, request: ResumeRequest) -> BridgeReceipt:
         previous = self.journal.find_terminal(request.request_id)

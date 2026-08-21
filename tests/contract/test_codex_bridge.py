@@ -11,6 +11,7 @@ from jarvis_codex_bridge import (
     JsonlReceiptJournal,
     ReceiptRoute,
     ResumeRequest,
+    SQLiteThreadArchive,
     StartedTurn,
     TerminalContinuationRule,
     ThreadState,
@@ -22,8 +23,9 @@ from jarvis_codex_bridge import (
 class FakeTransport:
     name = "fake-codex"
 
-    def __init__(self, state: ThreadState):
+    def __init__(self, state: ThreadState, reply_text="continued"):
         self.state = state
+        self.reply_text = reply_text
         self.calls = 0
         self.prompts = []
 
@@ -46,7 +48,7 @@ class FakeTransport:
                 TurnState(
                     turn_id,
                     "completed",
-                    ({"type": "agentMessage", "phase": "final_answer", "text": "continued"},),
+                    ({"type": "agentMessage", "phase": "final_answer", "text": self.reply_text},),
                 ),
             ),
         )
@@ -76,6 +78,41 @@ class CodexBridgeContractTest(unittest.TestCase):
             replay = bridge.resume_existing(ResumeRequest("package-1", "thread-1", "继续", "test"))
             self.assertTrue(replay.replayed)
             self.assertEqual(transport.calls, 1)
+
+    def test_resume_decodes_a_utf8_chinese_reply(self):
+        transport = FakeTransport(
+            ThreadState("thread-zh", "idle", (TurnState("turn-1", "completed"),)),
+            "中文回复".encode("utf-8"),
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            bridge = ExistingThreadBridge(transport, JsonlReceiptJournal(Path(temp) / "receipts.jsonl"))
+            receipt = bridge.resume_existing(ResumeRequest("package-zh", "thread-zh", "继续", "test"))
+            self.assertEqual(receipt.output, "中文回复")
+
+    def test_observe_archives_a_complete_chinese_thread(self):
+        state = ThreadState(
+            "thread-history-zh",
+            "idle",
+            (
+                TurnState(
+                    "turn-1",
+                    "completed",
+                    (
+                        {"type": "userMessage", "text": "请保留整段对话"},
+                        {"type": "agentMessage", "phase": "final_answer", "text": "已完整保存。"},
+                    ),
+                ),
+            ),
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            archive = SQLiteThreadArchive(Path(temp) / "thread-library.sqlite")
+            bridge = ExistingThreadBridge(
+                FakeTransport(state),
+                JsonlReceiptJournal(Path(temp) / "receipts.jsonl"),
+                archive,
+            )
+            self.assertEqual(bridge.observe_thread("thread-history-zh"), state)
+            self.assertEqual(archive.rebuild_thread("thread-history-zh"), state)
 
     def test_active_thread_is_not_contacted(self):
         transport = FakeTransport(ThreadState("thread-1", "running", (TurnState("turn-1", "inProgress"),)))

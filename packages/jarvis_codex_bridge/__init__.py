@@ -1,6 +1,7 @@
 """Standard package for Jarvis-to-existing-Codex-thread bridging."""
 
 from .contracts import BridgeReceipt, MonitorReceipt, ReceiptRoute, ResumeRequest, StartedTurn, TerminalContinuationRule, ThreadState, TurnState
+from .archive import SQLiteThreadArchive
 from .journal import JsonlReceiptJournal, ReceiptJournal
 from .monitor import (
     DEFAULT_MONITOR_INTERVAL_SECONDS,
@@ -42,6 +43,7 @@ __all__ = [
     "ReceiptJournal",
     "ResumeRequest",
     "StartedTurn",
+    "SQLiteThreadArchive",
     "TerminalContinuationRule",
     "ThreadState",
     "ThreadTerminalMonitor",

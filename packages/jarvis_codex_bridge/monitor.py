@@ -19,7 +19,7 @@ from .contracts import (
     ThreadState,
     utc_now,
 )
-from .service import ExistingThreadBridge
+from .service import ExistingThreadBridge, ThreadArchive
 from .transport import ExistingThreadTransport
 
 
@@ -31,9 +31,15 @@ DEFAULT_MONITOR_MAX_DURATION_SECONDS = 24 * 60 * 60
 class ThreadTerminalMonitor:
     """Reports a new terminal transition, never a pre-existing terminal snapshot."""
 
-    def __init__(self, transport: ExistingThreadTransport, state_path: Path):
+    def __init__(
+        self,
+        transport: ExistingThreadTransport,
+        state_path: Path,
+        archive: ThreadArchive | None = None,
+    ):
         self.transport = transport
         self.state_path = state_path
+        self.archive = archive
 
     @staticmethod
     def _fingerprint(state: ThreadState) -> str:
@@ -52,6 +58,8 @@ class ThreadTerminalMonitor:
         state = self.transport.read_thread(thread_id)
         if state.thread_id != thread_id:
             raise RuntimeError("transport readback thread id does not match the receipt route")
+        if self.archive is not None:
+            self.archive.store(state)
         latest = state.turns[-1] if state.turns else None
         status = (latest.status if latest else state.status).strip().lower()
         fingerprint = self._fingerprint(state)
