@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from typing import Any
+from coo_dispatcher_store import iter_jsonl
 
 
 class CodexAppServerMonitorAdapter:
@@ -30,3 +31,7 @@ class CodexAppServerMonitorAdapter:
         record = result.get("record") if isinstance(result, dict) else {}
         return {"outbox_id": record.get("outbox_id") if isinstance(record, dict) else None,
                 "queued": bool(result.get("queued"))}
+
+    def read_bot_delivery(self, outbox_id: str) -> dict[str, object]:
+        rows=[row for row in iter_jsonl(self.dispatcher.delivery_log_path) if row.get("outbox_id")==outbox_id]
+        return rows[-1] if rows else {"delivery_status":"queued"}

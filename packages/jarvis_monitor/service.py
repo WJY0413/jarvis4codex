@@ -64,7 +64,7 @@ class MonitorStore:
             c.execute("INSERT INTO monitors VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(monitor_id,str(request.get("monitor_key") or "") or None,str(request.get("monitor_name") or "") or None,observed,source_thread,str(request.get("source_event_key") or f"monitor:{monitor_id}"),packed(outputs),interval,(datetime.now(timezone.utc)+timedelta(minutes=minutes)).isoformat(),str(request.get("model") or "") or None,str(request.get("reasoning_effort") or "") or None,"ACTIVE",None,created,created,created,None))
         return self.get(monitor_id)
     def due(self) -> list[dict[str, object]]:
-        with self.session() as c: ids=[r[0] for r in c.execute("SELECT monitor_id FROM monitors WHERE monitor_status='ACTIVE' AND next_observation_at<=?",(now(),))]
+        with self.session() as c: ids=[r[0] for r in c.execute("SELECT monitor_id FROM monitors WHERE monitor_status IN ('ACTIVE','OUTPUT_PENDING') AND next_observation_at<=?",(now(),))]
         return [self.get(x) for x in ids]
     def observation(self, monitor_id: str, event: str, fingerprint: str, thread: str, turn_id: str|None, turn: str|None, interval: int):
         at=now()
@@ -82,6 +82,8 @@ class MonitorStore:
         return self.delivery(monitor,fp,index,output,target,client_id)
     def complete_delivery(self, delivery: dict[str,object], status: str, **values: str|None):
         with self.session() as c: c.execute("UPDATE monitor_deliveries SET delivery_status=?,turn_id=?,outbox_id=?,error=?,updated_at=? WHERE delivery_id=?",(status,values.get("turn_id"),values.get("outbox_id"),values.get("error"),now(),delivery["delivery_id"]))
+    def queued_deliveries(self, monitor_id: str):
+        with self.session() as c: return [dict(row) for row in c.execute("SELECT * FROM monitor_deliveries WHERE monitor_id=? AND delivery_status='QUEUED'",(monitor_id,))]
 
 
 class MonitorService:
@@ -90,6 +92,14 @@ class MonitorService:
         results=[]
         for monitor in self.store.due():
             mid=str(monitor["monitor_id"])
+            if monitor["monitor_status"] == "OUTPUT_PENDING":
+                for delivery in self.store.queued_deliveries(mid):
+                    readback=self.adapter.read_bot_delivery(str(delivery.get("outbox_id") or ""))
+                    status=str(readback.get("delivery_status") or "queued").upper()
+                    if status in {"DELIVERED","FAILED","EXPIRED"}: self.store.complete_delivery(delivery,status,error=str(readback.get("error") or "") or None)
+                queued=self.store.queued_deliveries(mid)
+                self.store.status(mid,"OUTPUT_PENDING" if queued else "COMPLETED")
+                results.append({"monitor_id":mid,"outcome":"output_pending" if queued else "completed"}); continue
             if datetime.now(timezone.utc)>=datetime.fromisoformat(str(monitor["expires_at"])): self.store.status(mid,"EXPIRED"); results.append({"monitor_id":mid,"outcome":"expired"}); continue
             try:
                 state=self.adapter.read_thread(str(monitor["observed_thread_id"])); turns=state.get("turns") or []; latest=turns[-1] if isinstance(turns,list) and turns else {}

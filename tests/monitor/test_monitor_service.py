@@ -8,11 +8,12 @@ from jarvis_monitor import MonitorService, MonitorStore
 
 class FakeAdapter:
     def __init__(self):
-        self.state={"id":"child-1","status":"running","turns":[{"id":"turn-1","status":"inProgress"}]}; self.resumes=[]; self.notifications=[]
+        self.state={"id":"child-1","status":"running","turns":[{"id":"turn-1","status":"inProgress"}]}; self.resumes=[]; self.notifications=[]; self.bot_status="queued"
     def read_thread(self, thread_id): return self.state
     def resume_thread(self, thread_id, user_message_text, **kwargs):
         self.resumes.append((thread_id,user_message_text,kwargs)); return {"outcome":"turn_completed","turn_id":"turn-parent"}
     def enqueue_bot_notification(self, **kwargs): self.notifications.append(kwargs); return {"outbox_id":"outbox-1","queued":True}
+    def read_bot_delivery(self, outbox_id): return {"delivery_status":self.bot_status}
 
 
 class MonitorServiceTest(unittest.TestCase):
@@ -41,6 +42,15 @@ class MonitorServiceTest(unittest.TestCase):
             adapter=FakeAdapter(); adapter.state={"id":"child-1","status":"idle","turns":[{"id":"old","status":"completed"}]}; store=MonitorStore(Path(temp)/"monitor.sqlite"); service=MonitorService(store,adapter)
             monitor=store.start({"observed_thread_id":"child-1","outputs":[{"type":"resume_thread","target_thread_id":"parent-1"}]})
             self.assertEqual(service.run_once()[0]["outcome"],"baseline_terminal"); self.assertEqual(adapter.resumes,[])
+
+    def test_queued_bot_output_is_read_back_before_monitor_completes(self):
+        with tempfile.TemporaryDirectory() as temp:
+            adapter=FakeAdapter(); store=MonitorStore(Path(temp)/"monitor.sqlite"); service=MonitorService(store,adapter)
+            monitor=store.start({"observed_thread_id":"child-1","outputs":[{"type":"notify_jarvis_bot"}]})
+            service.run_once(); self.due_now(store,monitor["monitor_id"]); adapter.state={"id":"child-1","status":"idle","turns":[{"id":"turn-1","status":"completed"}]}; service.run_once()
+            self.assertEqual(store.get(monitor["monitor_id"])["monitor_status"],"OUTPUT_PENDING")
+            self.due_now(store,monitor["monitor_id"]); adapter.bot_status="delivered"; self.assertEqual(service.run_once()[0]["outcome"],"completed")
+            self.assertEqual(store.get(monitor["monitor_id"])["monitor_status"],"COMPLETED")
 
 
 if __name__ == "__main__": unittest.main()
