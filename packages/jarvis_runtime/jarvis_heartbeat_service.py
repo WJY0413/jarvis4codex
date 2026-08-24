@@ -495,20 +495,20 @@ class HeartbeatStore:
                     "overdue_grace_seconds": grace,
                 }
             elif probe_type in {"codex_thread_terminal", "codex_thread_terminal_continue"}:
-                parent_candidate = (
-                    request.get("parent_thread_id")
-                    or request.get("source_thread_id")
-                )
-                if not parent_candidate:
-                    raise HeartbeatError(
-                        "terminal probe requires parent_thread_id or source_thread_id"
-                    )
-                parent_thread_id = self.validate_thread_id(parent_candidate)
-                if parent_thread_id == thread_id:
-                    raise HeartbeatError("parent_thread_id must differ from target_thread_id")
+                parent_candidate = request.get("parent_thread_id") or request.get("source_thread_id")
+                if parent_candidate:
+                    parent_thread_id = self.validate_thread_id(parent_candidate)
+                    if parent_thread_id == thread_id:
+                        raise HeartbeatError("parent_thread_id must differ from target_thread_id")
                 receipt_target = str(probe_raw.get("receipt_target_thread_id") or "").strip()
                 if receipt_target:
                     receipt_target = self.validate_thread_id(receipt_target)
+                    if receipt_target == thread_id:
+                        raise HeartbeatError("receipt_target_thread_id must differ from target_thread_id")
+                if probe_type == "codex_thread_terminal" and not (parent_thread_id or receipt_target):
+                    raise HeartbeatError(
+                        "terminal notification requires receipt_target_thread_id or legacy parent_thread_id/source_thread_id"
+                    )
                 probe = {"type": probe_type}
                 if receipt_target:
                     probe["receipt_target_thread_id"] = receipt_target
@@ -1288,6 +1288,7 @@ class HeartbeatStore:
                     "probe_trigger_handoff", "probe_not_due",
                     "probe_notification_queued", "probe_thread_status",
                     "workbench_probe_progress", "workbench_probe_completed",
+                    "terminal_receipt_delivered",
                     "parent_terminal_receipt_delivered",
                     "terminal_continuation_completed",
                     "queue_continuation_released", "queue_no_change_silent",
@@ -1357,7 +1358,7 @@ class HeartbeatStore:
                 elif failures >= self.config.max_failures:
                     status = "FAILED"
                 next_epoch = heartbeat.get("next_run_epoch")
-                if outcome in {"probe_trigger_handoff", "parent_terminal_receipt_delivered"}:
+                if outcome in {"probe_trigger_handoff", "terminal_receipt_delivered", "parent_terminal_receipt_delivered"}:
                     next_epoch = None
                 queue_fingerprint = str(result.get("queue_fingerprint") or "")
                 queue_quiet_fingerprint = current["queue_quiet_fingerprint"]
@@ -2436,12 +2437,15 @@ class HeartbeatService:
             del self._recent_results[:-20]
 
     @staticmethod
-    def _terminal_receipt_prompt(heartbeat: dict[str, Any], probe_result: dict[str, Any]) -> str:
+    def _terminal_receipt_prompt(
+        heartbeat: dict[str, Any], probe_result: dict[str, Any], receipt_target_thread_id: str,
+    ) -> str:
         """Structured observer receipt.  This is the only monitor-originated turn."""
         receipt = {
             "heartbeat_id": heartbeat["heartbeat_id"],
             "child_thread_id": heartbeat["target_thread_id"],
-            "parent_thread_id": heartbeat["parent_thread_id"],
+            "receipt_target_thread_id": receipt_target_thread_id,
+            "legacy_parent_thread_id": heartbeat.get("parent_thread_id"),
             "status": probe_result.get("status"),
             "terminal_fingerprint": probe_result.get("terminal_fingerprint"),
             "child_turn_id": probe_result.get("last_turn_id"),
@@ -2704,31 +2708,40 @@ class HeartbeatService:
                             str(heartbeat["source_event_key"]),
                         ):
                             try:
-                                parent_result = self.controller.wake(
-                                    str(heartbeat["parent_thread_id"]),
-                                    self._terminal_receipt_prompt(heartbeat, probe_result),
+                                receipt_target = str(
+                                    probe_config.get("receipt_target_thread_id")
+                                    or heartbeat.get("parent_thread_id")
+                                    or ""
+                                )
+                                if not receipt_target:
+                                    raise HeartbeatError("terminal receipt target is missing")
+                                receipt_result = self.controller.wake(
+                                    receipt_target,
+                                    self._terminal_receipt_prompt(
+                                        heartbeat, probe_result, receipt_target,
+                                    ),
                                     source_event_key=heartbeat["source_event_key"],
                                     ensure_desktop=False,
                                     client_user_message_id=(
                                         f"jarvis-terminal-receipt-{heartbeat['heartbeat_id']}-{terminal_fingerprint[:12]}"
                                     ),
                                 )
-                                delivered = parent_result.get("outcome") == "turn_completed"
+                                delivered = receipt_result.get("outcome") == "turn_completed"
                                 self.store.finish_terminal_receipt(
                                     str(heartbeat["heartbeat_id"]), delivered=delivered,
-                                    turn_id=str(parent_result.get("turn_id") or "") or None,
+                                    turn_id=str(receipt_result.get("turn_id") or "") or None,
                                     source_event_key=str(heartbeat["source_event_key"]),
-                                    error=None if delivered else str(parent_result.get("outcome") or "parent wake failed"),
+                                    error=None if delivered else str(receipt_result.get("outcome") or "receipt delivery failed"),
                                 )
-                                result["outcome"] = "parent_terminal_receipt_delivered" if delivered else "parent_terminal_receipt_retry"
-                                result["parent_thread_id"] = heartbeat["parent_thread_id"]
-                                result["parent_turn_id"] = parent_result.get("turn_id")
+                                result["outcome"] = "terminal_receipt_delivered" if delivered else "terminal_receipt_retry"
+                                result["receipt_target_thread_id"] = receipt_target
+                                result["receipt_turn_id"] = receipt_result.get("turn_id")
                             except Exception as receipt_error:
                                 self.store.finish_terminal_receipt(
                                     str(heartbeat["heartbeat_id"]), delivered=False, turn_id=None,
                                     source_event_key=str(heartbeat["source_event_key"]), error=str(receipt_error),
                                 )
-                                result["outcome"] = "parent_terminal_receipt_retry"
+                                result["outcome"] = "terminal_receipt_retry"
                                 result["error"] = str(receipt_error)
                 else:
                     first = self.quota_probe.read_weekly_remaining()

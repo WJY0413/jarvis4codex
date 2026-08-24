@@ -21,6 +21,7 @@ CAPABILITY_RECEIPT_SCHEMA = "jarvis-capability-receipt/v1"
 
 CapabilityName = Literal[
     "monitor.observe",
+    "monitor.terminal_notify",
     "resume.existing",
     "monitor.terminal_resume",
     "heartbeat.create",
@@ -52,6 +53,11 @@ class CapabilityRequest:
         required = {
             "resume.existing": ("thread_id", "prompt"),
             "monitor.observe": ("monitor_id", "observed_thread_id", "receipt_target_thread_id"),
+            "monitor.terminal_notify": (
+                "monitor_id",
+                "observed_thread_id",
+                "receipt_target_thread_id",
+            ),
             "monitor.terminal_resume": (
                 "monitor_id",
                 "observed_thread_id",
@@ -126,6 +132,18 @@ class JarvisCapabilityPort:
         if request.capability == "monitor.observe":
             monitor_receipt = self._observe(request)
             return self._monitor_receipt(request, monitor_receipt)
+        if request.capability == "monitor.terminal_notify":
+            monitor_receipt = self._observe(request)
+            if monitor_receipt.state != "terminal_changed":
+                return self._monitor_receipt(request, monitor_receipt)
+            return self._bridge_receipt(
+                request,
+                self._monitor.receipt_delivery_request(
+                    monitor_receipt,
+                    source_ref=request.source_ref,
+                ),
+                monitor_receipt,
+            )
         if request.capability == "monitor.terminal_resume":
             monitor_receipt = self._observe(request)
             if monitor_receipt.state != "terminal_changed":

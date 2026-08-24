@@ -1,3 +1,16 @@
+# Jarvis 0.1.5
+
+## Parentless terminal notification
+
+- Added `monitor.terminal_notify`: a terminal observation can independently
+  deliver one idempotent structured receipt to an explicit target thread.
+- A `codex_thread_terminal` heartbeat now accepts
+  `receipt_target_thread_id` without a parent thread, retains parent routing
+  only as a legacy fallback, and records the exact receipt-delivery turn.
+- Notification remains separate from validation and same-thread continuation,
+  enabling counter/aggregation flows such as collecting 20 results before a
+  centralized acceptance pass.
+
 # Jarvis 0.1.4
 
 ## Desktop Host project catalog
