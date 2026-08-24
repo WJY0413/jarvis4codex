@@ -303,6 +303,67 @@ class CodexBridgeContractTest(unittest.TestCase):
             self.assertIn("monitor", receipt.data)
             self.assertEqual(transport.calls, 1)
 
+    def test_capability_port_notifies_a_distinct_thread_on_new_terminal_only(self):
+        class NotificationTransport(FakeTransport):
+            def __init__(self) -> None:
+                super().__init__(
+                    ThreadState("source-thread", "running", (TurnState("turn-1", "inProgress"),))
+                )
+                self.counter_state = ThreadState(
+                    "counter-thread", "idle", (TurnState("counter-turn-1", "completed"),)
+                )
+
+            def read_thread(self, thread_id):
+                if thread_id == "source-thread":
+                    return self.state
+                assert thread_id == "counter-thread"
+                return self.counter_state
+
+            def resume_existing(self, request):
+                assert request.thread_id == "counter-thread"
+                self.calls += 1
+                self.prompts.append(request.prompt)
+                self.counter_state = ThreadState(
+                    "counter-thread", "idle", (
+                        *self.counter_state.turns,
+                        TurnState("turn-2", "completed", (
+                            {"type": "agentMessage", "phase": "final_answer", "text": "receipt accepted"},
+                        )),
+                    ),
+                )
+                return StartedTurn("counter-thread", "turn-2", "completed")
+
+        transport = NotificationTransport()
+        with tempfile.TemporaryDirectory() as temp:
+            bridge = ExistingThreadBridge(transport, JsonlReceiptJournal(Path(temp) / "receipts.jsonl"))
+            port = JarvisCapabilityPort(
+                bridge,
+                ThreadTerminalMonitor(transport, Path(temp) / "monitor.json"),
+            )
+            request = CapabilityRequest(
+                request_id="notify-1",
+                capability="monitor.terminal_notify",
+                source_ref="contract-test",
+                arguments={
+                    "monitor_id": "monitor-notify-1",
+                    "observed_thread_id": "source-thread",
+                    "receipt_target_thread_id": "counter-thread",
+                },
+            )
+            self.assertEqual(port.invoke(request).status, "baseline_active")
+            self.assertEqual(transport.calls, 0)
+            transport.state = ThreadState(
+                "source-thread", "idle", (TurnState("turn-1", "completed"),)
+            )
+            receipt = port.invoke(request)
+            self.assertEqual(receipt.status, "completed")
+            self.assertEqual(receipt.target_thread_id, "counter-thread")
+            self.assertEqual(receipt.turn_id, "turn-2")
+            self.assertEqual(transport.calls, 1)
+            self.assertIn("JARVIS_THREAD_MONITOR_RECEIPT_V1", transport.prompts[0])
+            self.assertEqual(port.invoke(request).status, "no_change")
+            self.assertEqual(transport.calls, 1)
+
     def test_capability_port_rejects_missing_resume_prompt(self):
         with self.assertRaisesRegex(ValueError, "prompt"):
             CapabilityRequest(

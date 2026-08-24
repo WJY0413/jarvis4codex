@@ -436,6 +436,26 @@ class HeartbeatTestCase(unittest.TestCase):
 
         self.assertEqual(created["heartbeat"]["parent_thread_id"], THREAD_ID_2)
 
+    def test_terminal_probe_allows_parentless_delivery_to_an_explicit_receipt_thread(self) -> None:
+        request = self.request(
+            heartbeat_id="thread-terminal-explicit-target-v1",
+            prompt="Deliver an exact terminal receipt only.",
+            execution_mode="native_probe",
+            probe={
+                "type": "codex_thread_terminal",
+                "receipt_target_thread_id": THREAD_ID_2,
+            },
+        )
+        request.pop("parent_thread_id")
+
+        created = self.store.create(request)
+
+        self.assertIsNone(created["heartbeat"]["parent_thread_id"])
+        self.assertEqual(json.loads(created["heartbeat"]["probe_config_json"]), {
+            "type": "codex_thread_terminal",
+            "receipt_target_thread_id": THREAD_ID_2,
+        })
+
     def test_terminal_continue_probe_accepts_custom_resume_target_and_prompt(self) -> None:
         created = self.store.create(self.request(
             heartbeat_id="thread-terminal-continue-custom-v1",
@@ -1263,11 +1283,12 @@ class HeartbeatTestCase(unittest.TestCase):
         result = service.run_once()
         service.shutdown(wait=True)
 
-        self.assertEqual(result["results"][0]["outcome"], "parent_terminal_receipt_delivered")
+        self.assertEqual(result["results"][0]["outcome"], "terminal_receipt_delivered")
         self.assertEqual(thread_probe.calls, [THREAD_ID])
         self.assertEqual(len(controller.calls), 1)
         self.assertEqual(controller.calls[0]["target_thread_id"], THREAD_ID_2)
         self.assertTrue(controller.calls[0]["prompt"].startswith("JARVIS_TERMINAL_RECEIPT_V1"))
+        self.assertIn('"receipt_target_thread_id": "22222222-2222-4222-8222-222222222222"', controller.calls[0]["prompt"])
         heartbeat = self.store.get("thread-terminal-v1")
         self.assertEqual(heartbeat["status"], ACTIVE)
         self.assertEqual(heartbeat["run_count"], 1)
