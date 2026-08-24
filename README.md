@@ -1,6 +1,6 @@
 # Jarvis Control Plane
 
-`jarvis0.1.1` is the harness-neutral foundation for governed agent heartbeats and monitoring.
+`jarvis0.1.4` is the harness-neutral foundation for governed agent heartbeats and monitoring.
 
 It separates the stable runtime (engine, monitoring, contracts and adapters) from Codex control skills. The first adapter preserves the future integration point for Codex App Server; it does not operate the existing production scheduler.
 
@@ -22,3 +22,15 @@ HostBridge adapter or any external messaging implementation.
 
 No production scheduler, credential, or existing runtime state is migrated by
 installing this package.
+
+## Desktop Host project catalog
+
+Desktop-facing integrations can refresh a host-scoped snapshot of native
+`list_projects` results through `DesktopHostProjectCatalogAdapter`.  Each
+snapshot records its observation time and the exact Desktop project ID, Host ID
+and path.  A failed or empty refresh deliberately keeps the last good snapshot.
+
+Native task launchers can require this catalog to resolve a supplied project
+name before starting work.  Unknown or ambiguous names are rejected rather
+than silently routed to an unassigned project.  See
+`updates/current/HOST_PROJECT_CATALOG.md` for the integration contract.

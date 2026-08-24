@@ -14,6 +14,7 @@ TOOLS_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(TOOLS_DIR))
 
 from coo_dispatcher_store import DispatcherError, DispatcherStore, ProcessLock, iter_jsonl  # noqa: E402
+from jarvis_runtime.project_catalog import ProjectCatalog  # noqa: E402
 from jarvis_native_task_launcher import (  # noqa: E402
     AppServerClient,
     NativeTaskError,
@@ -81,7 +82,7 @@ class RecoveryAppClient:
 
 
 class LauncherTests(unittest.TestCase):
-    def make_queue(self, temp: str, *, live: bool = False):
+    def make_queue(self, temp: str, *, live: bool = False, config_overrides=None):
         base = Path(temp)
         root = base / "dispatcher"
         store = DispatcherStore(root)
@@ -97,19 +98,18 @@ class LauncherTests(unittest.TestCase):
             },
         )
         config_path = root / "native_task_launcher.config.json"
+        config_payload = {
+            "version": 1,
+            "dispatcher_thread_id": THREAD_ID,
+            "expected_codex_home": "",
+            "live_creation_enabled": live,
+            "max_attempts": 3,
+            "cooper_actor_ids": [COOPER_ID],
+            "allowed_projects": {"Chief of Staff": str(base)},
+        }
+        config_payload.update(config_overrides or {})
         config_path.write_text(
-            json.dumps(
-                {
-                    "version": 1,
-                    "dispatcher_thread_id": THREAD_ID,
-                    "expected_codex_home": "",
-                    "live_creation_enabled": live,
-                    "max_attempts": 3,
-                    "cooper_actor_ids": [COOPER_ID],
-                    "allowed_projects": {"Chief of Staff": str(base)},
-                },
-                ensure_ascii=False,
-            ),
+            json.dumps(config_payload, ensure_ascii=False),
             encoding="utf-8",
         )
         config = NativeTaskLauncherConfig(config_path)
@@ -138,6 +138,65 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(parsed["title"], "中文测试")
         self.assertIn("本地只读", parsed["prompt"])
         self.assertIsNone(parse_direct_task("普通消息"))
+
+    def test_catalog_required_resolves_name_to_exact_desktop_project_id(self):
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            catalog_path = base / "host-project-catalog.json"
+            snapshot = ProjectCatalog(catalog_path).refresh(
+                "local",
+                [{
+                    "projectKind": "local",
+                    "projectId": "desktop-project-chief",
+                    "label": "Chief of Staff",
+                    "path": str(base),
+                    "hostId": "local",
+                    "isGitRepository": True,
+                }],
+            )
+            task_queue, _, _ = self.make_queue(
+                temp,
+                config_overrides={
+                    "allowed_projects": {},
+                    "project_catalog_path": str(catalog_path),
+                    "project_catalog_host_id": "local",
+                    "project_catalog_required": True,
+                },
+            )
+            queued = task_queue.submit(self.direct_request())
+            record = queued["record"]
+            self.assertEqual(record["project_id"], "desktop-project-chief")
+            self.assertEqual(record["project_host_id"], "local")
+            self.assertEqual(record["project_catalog_observed_at"], snapshot.observed_at)
+            self.assertEqual(record["project_resolution_source"], "host_project_catalog")
+
+    def test_catalog_required_rejects_unknown_name_without_null_fallback(self):
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            catalog_path = base / "host-project-catalog.json"
+            ProjectCatalog(catalog_path).refresh(
+                "local",
+                [{
+                    "projectKind": "local",
+                    "projectId": "desktop-project-chief",
+                    "label": "Chief of Staff",
+                    "path": str(base),
+                    "hostId": "local",
+                }],
+            )
+            task_queue, _, _ = self.make_queue(
+                temp,
+                config_overrides={
+                    "allowed_projects": {},
+                    "project_catalog_path": str(catalog_path),
+                    "project_catalog_required": True,
+                },
+            )
+            request = self.direct_request()
+            request["project"] = "Unknown project"
+            with self.assertRaisesRegex(NativeTaskError, "not in the current host catalog"):
+                task_queue.submit(request)
+            self.assertEqual(list(iter_jsonl(task_queue.requests_path)), [])
 
     def test_concurrent_duplicate_submission_has_one_winner(self):
         with tempfile.TemporaryDirectory() as temp:
