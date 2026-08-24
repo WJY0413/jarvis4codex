@@ -1,3 +1,18 @@
+# Jarvis 0.1.4
+
+## Desktop Host project catalog
+
+- Added a durable, Host-scoped project catalog that stores the Desktop
+  `list_projects` snapshot with an UTC observation timestamp.
+- Added a lightweight Desktop Host adapter with startup and manual refresh
+  methods.  Failed, empty, or unavailable Host reads retain the last good
+  snapshot and expose an unchanged receipt instead of a frontend error.
+- Native task routing can now require catalog-based project-name resolution and
+  records the exact `projectId`, `hostId`, path, timestamp, and resolution
+  source in its request, dry-run plan, registration, and COO callback.
+- Unknown and ambiguous supplied project names are rejected; they never fall
+  back to a `null` project ID.
+
 # Jarvis 0.1.3
 
 ## Independent Monitor output layer

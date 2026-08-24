@@ -26,6 +26,7 @@ from coo_dispatcher_store import (
     read_json,
     utc_now,
 )
+from project_catalog import ProjectCatalog, ProjectCatalogError
 
 
 WORKSPACE_ROOT = Path(__file__).resolve().parents[1]
@@ -168,17 +169,51 @@ class NativeTaskLauncherConfig:
             for value in raw.get("cooper_actor_ids", [])
             if str(value).strip()
         }
-        projects = raw.get("allowed_projects")
-        if not isinstance(projects, dict) or not projects:
-            raise NativeTaskError("allowed_projects must be a non-empty JSON object")
+        catalog_value = str(raw.get("project_catalog_path") or "").strip()
+        self.project_catalog_path = (
+            Path(catalog_value)
+            if Path(catalog_value).is_absolute()
+            else self.path.parent / catalog_value
+        ) if catalog_value else None
+        self.project_catalog_host_id = str(
+            raw.get("project_catalog_host_id") or "local"
+        ).strip() or "local"
+        self.project_catalog_required = bool(raw.get("project_catalog_required", False))
+        projects = raw.get("allowed_projects") or {}
+        if not isinstance(projects, dict):
+            raise NativeTaskError("allowed_projects must be a JSON object")
         self.allowed_projects = {
             str(name).strip(): str(path_value).strip()
             for name, path_value in projects.items()
             if str(name).strip() and str(path_value).strip()
         }
+        if not self.allowed_projects and self.project_catalog_path is None:
+            raise NativeTaskError(
+                "configure allowed_projects or project_catalog_path"
+            )
 
-    def resolve_project(self, value: str) -> tuple[str, Path]:
+    def resolve_project_target(self, value: str) -> dict[str, str | None]:
         requested = _as_nonempty_string(value, "project")
+        if self.project_catalog_path is not None:
+            try:
+                resolution = ProjectCatalog(self.project_catalog_path).resolve(
+                    self.project_catalog_host_id,
+                    requested,
+                )
+                path = Path(resolution.project.path).resolve()
+                if not path.is_dir():
+                    raise NativeTaskError(f"project path does not exist: {path}")
+                return {
+                    "name": resolution.project.label,
+                    "path": str(path),
+                    "project_id": resolution.project.project_id,
+                    "host_id": resolution.project.host_id,
+                    "observed_at": resolution.observed_at,
+                    "source": "host_project_catalog",
+                }
+            except ProjectCatalogError as exc:
+                if self.project_catalog_required:
+                    raise NativeTaskError(str(exc)) from exc
         if requested in self.allowed_projects:
             name = requested
             path = Path(self.allowed_projects[requested]).resolve()
@@ -197,7 +232,19 @@ class NativeTaskLauncherConfig:
             name, path = match
         if not path.is_dir():
             raise NativeTaskError(f"project path does not exist: {path}")
-        return name, path
+        return {
+            "name": name,
+            "path": str(path),
+            "project_id": None,
+            "host_id": None,
+            "observed_at": None,
+            "source": "static_allowlist",
+        }
+
+    def resolve_project(self, value: str) -> tuple[str, Path]:
+        """Compatibility wrapper for callers that only need a project path."""
+        target = self.resolve_project_target(value)
+        return str(target["name"]), Path(str(target["path"]))
 
 
 class NativeTaskQueue:
@@ -261,9 +308,11 @@ class NativeTaskQueue:
                     "worker_delegated requires a confirmed parent packet"
                 )
 
-        project, project_path = self.config.resolve_project(
+        project_target = self.config.resolve_project_target(
             _as_nonempty_string(request.get("project"), "project")
         )
+        project = str(project_target["name"])
+        project_path = Path(str(project_target["path"]))
         title = _as_nonempty_string(request.get("title"), "title")[:120]
         prompt = append_result_contract(
             _as_nonempty_string(request.get("prompt"), "prompt")
@@ -296,6 +345,10 @@ class NativeTaskQueue:
             ),
             "project": project,
             "project_path": str(project_path),
+            "project_id": project_target["project_id"],
+            "project_host_id": project_target["host_id"],
+            "project_catalog_observed_at": project_target["observed_at"],
+            "project_resolution_source": project_target["source"],
             "title": title,
             "prompt": prompt,
             "model": str(request.get("model") or "").strip() or None,
@@ -323,6 +376,8 @@ class NativeTaskQueue:
                         "correlation_id": value["correlation_id"],
                         "origin": value["origin"],
                         "project": value["project"],
+                        "project_id": value["project_id"],
+                        "project_resolution_source": value["project_resolution_source"],
                     },
                 },
             )
@@ -373,6 +428,10 @@ class NativeTaskQueue:
             "request_id": request["request_id"],
             "project": request["project"],
             "project_path": request["project_path"],
+            "project_id": request.get("project_id"),
+            "project_host_id": request.get("project_host_id"),
+            "project_catalog_observed_at": request.get("project_catalog_observed_at"),
+            "project_resolution_source": request.get("project_resolution_source"),
             "title": request["title"],
             "thread_start": {
                 "cwd": request["project_path"],
@@ -411,6 +470,10 @@ class NativeTaskQueue:
                 "summary_for_cooper": summary_for_cooper or None,
                 "project": request["project"],
                 "project_path": request["project_path"],
+                "project_id": request.get("project_id"),
+                "project_host_id": request.get("project_host_id"),
+                "project_catalog_observed_at": request.get("project_catalog_observed_at"),
+                "project_resolution_source": request.get("project_resolution_source"),
                 "title": request["title"],
                 "source_channel": request["source_channel"],
                 "source_thread_id": request["source_thread_id"],
@@ -487,6 +550,10 @@ class NativeTaskQueue:
                     "error": error,
                     "project": request["project"],
                     "project_path": request["project_path"],
+                    "project_id": request.get("project_id"),
+                    "project_host_id": request.get("project_host_id"),
+                    "project_catalog_observed_at": request.get("project_catalog_observed_at"),
+                    "project_resolution_source": request.get("project_resolution_source"),
                     "title": request["title"],
                     "source_channel": request["source_channel"],
                     "source_thread_id": request["source_thread_id"],
