@@ -1,6 +1,6 @@
 """Public control facade used by harness-neutral entry points such as MCP."""
 
-from .provisioning import TaskProvisionReceipt, TaskProvisionRequest, TaskProvisioningPort
+from .provisioning import TaskMonitorResumeRequest, TaskProvisionReceipt, TaskProvisionRequest, TaskProvisioningPort
 from .service import JARVIS_MCP_RECEIPT_SCHEMA, JarvisControl
 
 __all__ = [
@@ -8,5 +8,6 @@ __all__ = [
     "JarvisControl",
     "TaskProvisionReceipt",
     "TaskProvisionRequest",
+    "TaskMonitorResumeRequest",
     "TaskProvisioningPort",
 ]

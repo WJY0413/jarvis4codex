@@ -19,10 +19,11 @@ class JarvisMcpServer:
         self.mcp = MCPServer(
             "jarvis-control",
             title="Jarvis Control Plane",
-            version="0.1.4",
+            version="0.1.5",
             instructions=(
                 "Use jarvis_read before a state-changing call when you need capability or thread context. "
-                "Treat every receipt status other than completed as not executed or not verified."
+                "Create and resume are hold-owned: a holding receipt verifies an exact turn held by Jarvis. "
+                "Use monitor or read for terminal state."
             ),
         )
         self._register_tools()
@@ -34,7 +35,7 @@ class JarvisMcpServer:
     def _register_tools(self) -> None:
         @self.mcp.tool(
             name="jarvis_create",
-            description="Create a Jarvis task. Currently reports unsupported until a verified task-creation adapter is supplied.",
+            description="Ask Jarvis to create and hold a task. Return only after hold owns the exact first turn.",
             annotations=ToolAnnotations(destructiveHint=False, idempotentHint=False, openWorldHint=False),
         )
         def jarvis_create(
@@ -45,6 +46,9 @@ class JarvisMcpServer:
             source_ref: str = "mcp:jarvis_create",
             model: str | None = None,
             reasoning_effort: str | None = None,
+            max_turns: int = 1,
+            auto_continue: bool = False,
+            continue_prompt: str = "继续",
         ) -> CallToolResult:
             return _tool_result(self.control.create(
                 request_id=request_id,
@@ -54,6 +58,9 @@ class JarvisMcpServer:
                 source_ref=source_ref,
                 model=model,
                 reasoning_effort=reasoning_effort,
+                max_turns=max_turns,
+                auto_continue=auto_continue,
+                continue_prompt=continue_prompt,
             ))
 
         @self.mcp.tool(
@@ -66,7 +73,7 @@ class JarvisMcpServer:
 
         @self.mcp.tool(
             name="jarvis_resume",
-            description="Resume one existing Jarvis-managed task and return its exact post-turn readback receipt.",
+            description="Ask Jarvis to resume and hold one existing task. Return only after hold owns the resumed turn.",
             annotations=ToolAnnotations(idempotentHint=True, openWorldHint=False),
         )
         def jarvis_resume(
@@ -76,10 +83,14 @@ class JarvisMcpServer:
             source_ref: str = "mcp:jarvis_resume",
             model: str | None = None,
             reasoning_effort: str | None = None,
+            hold_with_monitor: bool = True,
+            monitor_id: str | None = None,
+            max_turns: int = 1,
         ) -> CallToolResult:
             return _tool_result(self.control.resume(
                 request_id=request_id, task_id=task_id, prompt=prompt, source_ref=source_ref,
                 model=model, reasoning_effort=reasoning_effort,
+                hold_with_monitor=hold_with_monitor, monitor_id=monitor_id, max_turns=max_turns,
             ))
 
         @self.mcp.tool(
@@ -88,12 +99,12 @@ class JarvisMcpServer:
             annotations=ToolAnnotations(idempotentHint=True, openWorldHint=False),
         )
         def jarvis_monitor(
-            action: Literal["observe", "terminal_resume"],
+            action: Literal["observe", "terminal_resume", "status"],
             request_id: str,
             monitor_id: str,
-            observed_task_id: str,
-            receipt_task_id: str,
             source_ref: str = "mcp:jarvis_monitor",
+            observed_task_id: str | None = None,
+            receipt_task_id: str | None = None,
             resume_task_id: str | None = None,
             prompt: str | None = None,
             model: str | None = None,
@@ -101,8 +112,8 @@ class JarvisMcpServer:
         ) -> CallToolResult:
             return _tool_result(self.control.monitor(
                 action=action, request_id=request_id, monitor_id=monitor_id,
-                observed_task_id=observed_task_id, receipt_task_id=receipt_task_id,
-                source_ref=source_ref, resume_task_id=resume_task_id, prompt=prompt,
+                source_ref=source_ref, observed_task_id=observed_task_id,
+                receipt_task_id=receipt_task_id, resume_task_id=resume_task_id, prompt=prompt,
                 model=model, reasoning_effort=reasoning_effort,
             ))
 
@@ -136,7 +147,7 @@ class JarvisMcpServer:
 
 
 def _tool_result(receipt: dict[str, Any]) -> CallToolResult:
-    is_error = receipt["status"] in {"invalid_request", "unsupported", "failed", "partial"}
+    is_error = receipt["status"] in {"invalid_request", "unsupported", "failed", "partial", "requires_readback"}
     summary = json.dumps(receipt, ensure_ascii=False, sort_keys=True)
     return CallToolResult(
         content=[TextContent(type="text", text=summary)],

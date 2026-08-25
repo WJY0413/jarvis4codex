@@ -110,19 +110,43 @@ class JarvisMcpContractTest(unittest.TestCase):
         read_tool = next(tool for tool in result.tools if tool.name == "jarvis_read")
         self.assertTrue(read_tool.annotations.read_only_hint)
 
-    def test_resume_forwards_ai_parameters_and_returns_a_readback_receipt(self):
+    def test_resume_without_a_monitor_owned_adapter_reports_unsupported(self):
         result = self.call(
             "jarvis_resume",
             {"task_id": "thread-1", "prompt": "continue exactly once", "request_id": "resume-1"},
         )
-        self.assertFalse(result.is_error)
+        self.assertTrue(result.is_error)
         receipt = result.structured_content
         self.assertEqual(receipt["tool"], "jarvis_resume")
-        self.assertEqual(receipt["status"], "completed")
-        self.assertEqual(receipt["target_thread_id"], "thread-1")
-        self.assertEqual(receipt["turn_id"], "turn-2")
-        self.assertTrue(receipt["readback"]["verified"])
-        self.assertEqual(self.transport.prompts, ["continue exactly once"])
+        self.assertEqual(receipt["status"], "unsupported")
+        self.assertEqual(self.transport.prompts, [])
+
+    def test_resume_always_starts_a_monitor_owned_run(self):
+        class Provisioner:
+            def resume_with_monitor(self, request):
+                from jarvis_control import TaskProvisionReceipt
+                from jarvis_control.provisioning import observed_now
+                self.request = request
+                return TaskProvisionReceipt(
+                    request_id=request.request_id, status="holding", observed_at=observed_now(),
+                    thread_id=request.task_id, turn_id="turn-2", monitor_id="monitor-resume-1",
+                    turn_count=1, max_turns=2,
+                )
+
+        provisioner = Provisioner()
+        server = JarvisMcpServer(JarvisControl(self.capability_port, self.bridge, provisioner))
+
+        async def run():
+            async with Client(server.mcp) as client:
+                return await client.call_tool("jarvis_resume", {
+                    "task_id": "thread-1", "prompt": "继续", "request_id": "resume-1",
+                    "hold_with_monitor": False, "max_turns": 2,
+                })
+
+        result = asyncio.run(run())
+        self.assertFalse(result.is_error)
+        self.assertEqual(result.structured_content["status"], "holding")
+        self.assertEqual(provisioner.request.max_turns, 2)
 
     def test_invalid_resume_request_returns_a_structured_error_receipt(self):
         result = self.call(
@@ -139,7 +163,8 @@ class JarvisMcpContractTest(unittest.TestCase):
         receipt = result.structured_content
         self.assertFalse(result.is_error)
         self.assertEqual(receipt["status"], "completed")
-        self.assertTrue(receipt["data"]["jarvis_resume"]["available"])
+        self.assertFalse(receipt["data"]["jarvis_resume"]["available"])
+        self.assertTrue(receipt["data"]["jarvis_resume"]["requires_monitor"])
         self.assertFalse(receipt["data"]["jarvis_create"]["available"])
 
     def test_monitor_observe_returns_its_observation_receipt(self):
@@ -208,11 +233,13 @@ class JarvisMcpContractTest(unittest.TestCase):
                 self.request = request
                 return TaskProvisionReceipt(
                     request_id=request.request_id,
-                    status="completed",
+                    status="holding",
                     observed_at=observed_now(),
                     thread_id="thread-created-1",
                     turn_id="turn-created-1",
-                    output="hello complete",
+                    monitor_id="monitor-create-1",
+                    turn_count=1,
+                    max_turns=2,
                 )
 
         provisioner = Provisioner()
@@ -225,13 +252,35 @@ class JarvisMcpContractTest(unittest.TestCase):
                     "title": "TEST Worker",
                     "prompt": "hello",
                     "request_id": "create-1",
+                    "max_turns": 2,
                 })
 
         result = asyncio.run(run())
         self.assertFalse(result.is_error)
-        self.assertEqual(result.structured_content["status"], "completed")
+        self.assertEqual(result.structured_content["status"], "holding")
         self.assertEqual(result.structured_content["target_thread_id"], "thread-created-1")
         self.assertEqual(provisioner.request.title, "TEST Worker")
+        self.assertEqual(provisioner.request.max_turns, 2)
+
+    def test_monitor_status_reads_the_registered_turn_counter(self):
+        class Provisioner:
+            def monitor_status(self, monitor_id):
+                return {"monitor_id": monitor_id, "status": "running", "turn_count": 1, "max_turns": 2}
+
+        server = JarvisMcpServer(JarvisControl(self.capability_port, self.bridge, Provisioner()))
+
+        async def run():
+            async with Client(server.mcp) as client:
+                return await client.call_tool("jarvis_monitor", {
+                    "action": "status",
+                    "request_id": "monitor-status-1",
+                    "monitor_id": "monitor-create-1",
+                })
+
+        result = asyncio.run(run())
+        self.assertFalse(result.is_error)
+        self.assertEqual(result.structured_content["data"]["turn_count"], 1)
+        self.assertEqual(result.structured_content["data"]["max_turns"], 2)
 
 
 if __name__ == "__main__":

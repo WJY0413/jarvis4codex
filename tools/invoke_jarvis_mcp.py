@@ -16,6 +16,7 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--config", type=Path, required=True)
     value.add_argument("--tool", required=True)
     value.add_argument("--arguments-json", required=True)
+    value.add_argument("--receipt-path", type=Path)
     return value
 
 
@@ -39,7 +40,11 @@ def main() -> int:
     arguments = json.loads(args.arguments_json)
     if not isinstance(arguments, dict):
         raise SystemExit("--arguments-json must be an object")
-    print(json.dumps(asyncio.run(invoke(args.config, args.tool, arguments)), ensure_ascii=False))
+    receipt = json.dumps(asyncio.run(invoke(args.config, args.tool, arguments)), ensure_ascii=False)
+    if args.receipt_path:
+        args.receipt_path.parent.mkdir(parents=True, exist_ok=True)
+        args.receipt_path.write_text(receipt + "\n", encoding="utf-8")
+    print(receipt)
     return 0
 
 

@@ -17,6 +17,7 @@ def build_jarvis_control(
     config_path: Path,
     state_dir: Path,
     *,
+    launcher_config_path: Path,
     transport_factory: Callable[[Path], Any] | None = None,
 ) -> JarvisControl:
     """Wire deployed existing-thread and task-provisioning adapters into JarvisControl."""
@@ -30,7 +31,10 @@ def build_jarvis_control(
     return JarvisControl(
         capabilities,
         bridge,
-        provisioner=CodexAppServerTaskProvisioningAdapter(config_path),
+        provisioner=CodexAppServerTaskProvisioningAdapter(
+            launcher_config_path,
+            state_dir=state_dir,
+        ),
     )
 
 

@@ -6,7 +6,7 @@ from typing import Any, Mapping
 
 from jarvis_codex_bridge import CapabilityRequest, ExistingThreadBridge, JarvisCapabilityPort
 
-from .provisioning import TaskProvisionRequest, TaskProvisioningPort
+from .provisioning import TaskMonitorResumeRequest, TaskProvisionRequest, TaskProvisioningPort
 
 
 JARVIS_MCP_RECEIPT_SCHEMA = "jarvis-mcp-receipt/v1"
@@ -40,6 +40,9 @@ class JarvisControl:
         source_ref: str,
         model: str | None = None,
         reasoning_effort: str | None = None,
+        max_turns: int = 1,
+        auto_continue: bool = False,
+        continue_prompt: str = "继续",
     ) -> dict[str, Any]:
         if self._provisioner is None:
             return self.unsupported(
@@ -54,6 +57,9 @@ class JarvisControl:
                 source_ref=source_ref,
                 model=model,
                 reasoning_effort=reasoning_effort,
+                max_turns=max_turns,
+                auto_continue=auto_continue,
+                continue_prompt=continue_prompt,
             ))
         except ValueError as exc:
             return self._receipt("jarvis_create", "invalid_request", request_id=request_id, reason=str(exc))
@@ -65,7 +71,10 @@ class JarvisControl:
             turn_id=provision.turn_id,
             reason=provision.reason,
             data=provision.as_dict(),
-            readback={"verified": provision.status == "completed"},
+            readback={
+                "verified": provision.status in {"holding", "running", "completed"},
+                "terminal": provision.status == "completed",
+            },
         )
 
     def resume(
@@ -77,18 +86,32 @@ class JarvisControl:
         source_ref: str,
         model: str | None = None,
         reasoning_effort: str | None = None,
+        hold_with_monitor: bool = False,
+        monitor_id: str | None = None,
+        max_turns: int = 1,
     ) -> dict[str, Any]:
-        return self._invoke(
-            "jarvis_resume",
-            "resume.existing",
-            request_id=request_id,
-            source_ref=source_ref,
-            arguments={
-                "thread_id": task_id,
-                "prompt": prompt,
-                "model": model,
-                "reasoning_effort": reasoning_effort,
-            },
+        # Kept only for wire compatibility. All public resume calls are now monitor-owned.
+        del hold_with_monitor
+        try:
+            request = TaskMonitorResumeRequest(
+                request_id=request_id, task_id=task_id, prompt=prompt, source_ref=source_ref,
+                monitor_id=monitor_id, max_turns=max_turns, model=model,
+                reasoning_effort=reasoning_effort,
+            )
+        except ValueError as exc:
+            return self._receipt("jarvis_resume", "invalid_request", request_id=request_id, reason=str(exc))
+        starter = getattr(self._provisioner, "resume_with_monitor", None)
+        if not callable(starter):
+            return self.unsupported(tool="jarvis_resume", reason="no monitor-owned resume adapter is configured")
+        try:
+            provision = starter(request)
+        except ValueError as exc:
+            return self._receipt("jarvis_resume", "invalid_request", request_id=request_id, reason=str(exc))
+        return self._receipt(
+            "jarvis_resume", provision.status, request_id=provision.request_id,
+            target_thread_id=provision.thread_id, turn_id=provision.turn_id,
+            reason=provision.reason, data=provision.as_dict(),
+                readback={"verified": provision.status in {"holding", "running"}, "terminal": False},
         )
 
     def read(self, *, subject: str, task_id: str | None = None) -> dict[str, Any]:
@@ -102,7 +125,10 @@ class JarvisControl:
                         "reason": None if self._provisioner is not None else "no task-creation adapter is configured",
                     },
                     "jarvis_read": {"available": True, "read_only": True},
-                    "jarvis_resume": {"available": True},
+                    "jarvis_resume": {
+                        "available": callable(getattr(self._provisioner, "resume_with_monitor", None)),
+                        "requires_monitor": True,
+                    },
                     "jarvis_monitor": {"available": True},
                     "jarvis_heartbeat": {
                         "available": self._capabilities.heartbeat_available,
@@ -141,17 +167,28 @@ class JarvisControl:
         action: str,
         request_id: str,
         monitor_id: str,
-        observed_task_id: str,
-        receipt_task_id: str,
         source_ref: str,
+        observed_task_id: str | None = None,
+        receipt_task_id: str | None = None,
         resume_task_id: str | None = None,
         prompt: str | None = None,
         model: str | None = None,
         reasoning_effort: str | None = None,
     ) -> dict[str, Any]:
+        if action == "status":
+            status_reader = getattr(self._provisioner, "monitor_status", None)
+            if not callable(status_reader):
+                return self._receipt("jarvis_monitor", "unsupported", request_id=request_id, reason="no task monitor status adapter is configured")
+            try:
+                data = status_reader(monitor_id)
+            except Exception as exc:
+                return self._receipt("jarvis_monitor", "failed", request_id=request_id, reason=str(exc))
+            return self._receipt("jarvis_monitor", "completed", request_id=request_id, data=data)
         capability = {"observe": "monitor.observe", "terminal_resume": "monitor.terminal_resume"}.get(action)
         if capability is None:
-            return self._receipt("jarvis_monitor", "invalid_request", request_id=request_id, reason="action must be observe or terminal_resume")
+            return self._receipt("jarvis_monitor", "invalid_request", request_id=request_id, reason="action must be observe, terminal_resume, or status")
+        if not observed_task_id or not receipt_task_id:
+            return self._receipt("jarvis_monitor", "invalid_request", request_id=request_id, reason="observed_task_id and receipt_task_id are required")
         return self._invoke(
             "jarvis_monitor",
             capability,
@@ -201,6 +238,11 @@ class JarvisControl:
 
     def unsupported(self, *, tool: str, reason: str) -> dict[str, Any]:
         return self._receipt(tool, "unsupported", reason=reason)
+
+    def close(self) -> None:
+        close = getattr(self._provisioner, "close", None)
+        if callable(close):
+            close()
 
     def _invoke(
         self,

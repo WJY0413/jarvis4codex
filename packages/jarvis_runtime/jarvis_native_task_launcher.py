@@ -65,6 +65,12 @@ class NativeTaskCreationError(NativeTaskError):
         self.thread_id = thread_id
 
 
+class HostContextRequiredError(NativeTaskError):
+    """The App Server was launched from a context that cannot own Codex state."""
+
+    code = "JARVIS_HOST_CONTEXT_REQUIRED"
+
+
 def _background_subprocess_kwargs() -> dict[str, Any]:
     if os.name != "nt":
         return {}
@@ -81,6 +87,15 @@ def _as_nonempty_string(value: Any, field: str) -> str:
     if not text:
         raise NativeTaskError(f"{field} is required")
     return text
+
+
+def _report_phase(
+    callback: Callable[[str, dict[str, Any]], None] | None,
+    phase: str,
+    **details: Any,
+) -> None:
+    if callback is not None:
+        callback(phase, details)
 
 
 def append_result_contract(prompt: str) -> str:
@@ -647,17 +662,31 @@ class AppServerClient:
         )
         threading.Thread(target=self._read_stdout, daemon=True).start()
         threading.Thread(target=self._read_stderr, daemon=True).start()
-        result = self.request(
-            "initialize",
-            {
-                "clientInfo": {
-                    "name": "jarvis-native-task-launcher",
-                    "title": "Jarvis Native Task Launcher",
-                    "version": "0.1.0",
+        try:
+            result = self.request(
+                "initialize",
+                {
+                    "clientInfo": {
+                        "name": "jarvis-native-task-launcher",
+                        "title": "Jarvis Native Task Launcher",
+                        "version": "0.1.0",
+                    },
+                    "capabilities": {"experimentalApi": True},
                 },
-                "capabilities": {"experimentalApi": True},
-            },
-        )
+            )
+        except NativeTaskError as exc:
+            self.close()
+            detail = str(exc)
+            if (
+                "failed to initialize sqlite state runtime" in detail
+                or "failed to clean up stale arg0 temp dirs" in detail
+            ):
+                raise HostContextRequiredError(
+                    "JARVIS_HOST_CONTEXT_REQUIRED: App Server cannot initialize the configured "
+                    f"CODEX_HOME {self.config.expected_codex_home!r}; run hold from the normal "
+                    "Windows user host, not the MCP sandbox."
+                ) from exc
+            raise
         self.notify("initialized")
         codex_home = str(result.get("codexHome") or "")
         expected = self.config.expected_codex_home
@@ -802,31 +831,92 @@ class AppServerClient:
             selected_effort=reasoning_effort,
         )
 
-    def create_task(self, request: dict[str, Any]) -> dict[str, Any]:
-        """Create one durable thread, finish its first turn, then persist its title.
+    def start_turn_async(
+        self,
+        thread_id: str,
+        prompt: str,
+        *,
+        client_user_message_id: str,
+        model: str | None = None,
+        reasoning_effort: str | None = None,
+        on_phase: Callable[[str, dict[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
+        """Start one exact existing-thread turn without waiting for its terminal state."""
+        _report_phase(on_phase, "app_server_initializing")
+        self.start()
+        _report_phase(on_phase, "app_server_initialized")
+        _report_phase(on_phase, "model_selecting")
+        selected_model = self.select_model(model)
+        _report_phase(on_phase, "model_selected", model=selected_model)
+        _report_phase(on_phase, "turn_starting", thread_id=thread_id)
+        started = self._start_turn(
+            thread_id,
+            prompt,
+            client_user_message_id=client_user_message_id,
+            selected_model=selected_model,
+            selected_effort=reasoning_effort,
+        )
+        _report_phase(on_phase, "turn_started", thread_id=thread_id, turn_id=str(started["turn_id"]))
+        return started
 
-        Naming is intentionally after the first turn: current App Server builds
-        materialize the durable rollout during that turn, not at ``thread/start``.
-        """
+    def resume_turn_async(
+        self,
+        thread_id: str,
+        prompt: str,
+        *,
+        client_user_message_id: str,
+        model: str | None = None,
+        reasoning_effort: str | None = None,
+        on_phase: Callable[[str, dict[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
+        """Reattach one durable thread in this App Server before starting its turn."""
+        self.start()
+        _report_phase(on_phase, "thread_resuming", thread_id=thread_id)
+        self.request("thread/resume", {"threadId": thread_id})
+        _report_phase(on_phase, "thread_resumed", thread_id=thread_id)
+        return self.start_turn_async(
+            thread_id,
+            prompt,
+            client_user_message_id=client_user_message_id,
+            model=model,
+            reasoning_effort=reasoning_effort,
+            on_phase=on_phase,
+        )
+
+    def create_task(
+        self,
+        request: dict[str, Any],
+        *,
+        on_phase: Callable[[str, dict[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
+        """Create one durable thread and return as soon as its first turn starts."""
         project_path = _as_nonempty_string(request.get("project_path"), "project_path")
         title = _as_nonempty_string(request.get("title"), "title")
         prompt = _as_nonempty_string(request.get("prompt"), "prompt")
         request_id = _as_nonempty_string(request.get("request_id"), "request_id")
+        _report_phase(on_phase, "app_server_initializing")
         self.start()
+        _report_phase(on_phase, "app_server_initialized")
         try:
+            _report_phase(on_phase, "thread_starting")
             started = self.request("thread/start", {"cwd": project_path, "ephemeral": False})
             thread = started.get("thread")
             thread_id = str(thread.get("id") or "") if isinstance(thread, dict) else ""
             if not thread_id:
                 raise NativeTaskCreationError("thread/start response is missing thread.id")
-            created = self._start_turn_with_model(
+            _report_phase(on_phase, "thread_started", thread_id=thread_id)
+            _report_phase(on_phase, "model_selecting", thread_id=thread_id)
+            selected_model = self.select_model(request.get("model"))
+            _report_phase(on_phase, "model_selected", thread_id=thread_id, model=selected_model)
+            _report_phase(on_phase, "turn_starting", thread_id=thread_id)
+            created = self._start_turn(
                 thread_id,
                 prompt,
                 client_user_message_id=request_id,
-                selected_model=self.select_model(request.get("model")),
+                selected_model=selected_model,
                 selected_effort=request.get("reasoning_effort"),
             )
-            self.request("thread/name/set", {"threadId": thread_id, "name": title})
+            _report_phase(on_phase, "turn_started", thread_id=thread_id, turn_id=str(created["turn_id"]))
             return {**created, "thread_id": thread_id, "title": title}
         except NativeTaskCreationError:
             raise
@@ -834,6 +924,39 @@ class AppServerClient:
             raise NativeTaskCreationError(str(exc), thread_id=locals().get("thread_id")) from exc
 
     def _start_turn_with_model(
+        self,
+        thread_id: str,
+        prompt: str,
+        *,
+        client_user_message_id: str,
+        selected_model: str,
+        selected_effort: str | None = None,
+    ) -> dict[str, Any]:
+        started = self._start_turn(
+            thread_id,
+            prompt,
+            client_user_message_id=client_user_message_id,
+            selected_model=selected_model,
+            selected_effort=selected_effort,
+        )
+        turn_id = str(started["turn_id"])
+        completed = self.wait_for_turn_terminal(thread_id, turn_id)
+        turn_status = str(completed.get("status") or "")
+        if turn_status != "completed":
+            error = completed.get("error")
+            detail = (
+                json.dumps(error, ensure_ascii=False)
+                if error is not None
+                else "no error detail"
+            )
+            raise NativeTaskCreationError(
+                f"native task turn ended with status {turn_status!r}: {detail}",
+                thread_id=thread_id,
+            )
+        final_message = self.wait_for_turn_readback(thread_id, turn_id)
+        return {**started, "turn_status": turn_status, "final_message": final_message}
+
+    def _start_turn(
         self,
         thread_id: str,
         prompt: str,
@@ -861,27 +984,12 @@ class AppServerClient:
                 "turn/start response is missing turn.id",
                 thread_id=thread_id,
             )
-        completed = self.wait_for_turn_terminal(thread_id, turn_id)
-        turn_status = str(completed.get("status") or "")
-        if turn_status != "completed":
-            error = completed.get("error")
-            detail = (
-                json.dumps(error, ensure_ascii=False)
-                if error is not None
-                else "no error detail"
-            )
-            raise NativeTaskCreationError(
-                f"native task turn ended with status {turn_status!r}: {detail}",
-                thread_id=thread_id,
-            )
-        final_message = self.wait_for_turn_readback(thread_id, turn_id)
         return {
             "thread_id": thread_id,
             "turn_id": turn_id,
-            "turn_status": turn_status,
+            "turn_status": str(turn.get("status") or "inProgress"),
             "model": selected_model,
             "reasoning_effort": selected_effort,
-            "final_message": final_message,
         }
 
     def wait_for_turn_readback(self, thread_id: str, turn_id: str) -> str:
@@ -975,16 +1083,22 @@ class AppServerClient:
         self,
         thread_id: str,
         turn_id: str,
+        *,
+        wait_forever: bool = False,
     ) -> dict[str, Any]:
-        deadline = (
+        deadline = None if wait_forever else (
             time.monotonic() + self.config.turn_completion_timeout_seconds
         )
-        while time.monotonic() < deadline:
-            remaining = max(deadline - time.monotonic(), 0.05)
+        while deadline is None or time.monotonic() < deadline:
+            remaining = (
+                self.config.poll_seconds
+                if deadline is None
+                else max(deadline - time.monotonic(), 0.05)
+            )
             try:
                 item = self.notifications.get(timeout=remaining)
             except queue.Empty:
-                break
+                continue
             if item.get("method") != "turn/completed":
                 continue
             params = item.get("params")

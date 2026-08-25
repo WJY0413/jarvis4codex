@@ -199,7 +199,7 @@ class LauncherTests(unittest.TestCase):
     def test_app_server_client_exposes_task_creation_method(self):
         self.assertTrue(hasattr(AppServerClient, "create_task"))
 
-    def test_app_server_client_creates_then_names_after_the_first_exact_turn_readback(self):
+    def test_app_server_client_creates_and_returns_the_started_turn_without_waiting_for_terminal(self):
         with tempfile.TemporaryDirectory() as temp:
             _, _, config = self.make_queue(temp)
             client = AppServerClient.__new__(AppServerClient)
@@ -210,18 +210,15 @@ class LauncherTests(unittest.TestCase):
                 calls.append((method, params))
                 if method == "thread/start":
                     return {"thread": {"id": "thread-created-1"}}
-                if method == "thread/name/set":
-                    return {}
                 raise AssertionError(method)
 
             client.start = lambda: None
             client.request = request
             client.select_model = lambda _model: "gpt-test"
-            client._start_turn_with_model = lambda thread_id, prompt, **kwargs: {
+            client._start_turn = lambda thread_id, prompt, **kwargs: {
                 "thread_id": thread_id,
                 "turn_id": "turn-created-1",
-                "turn_status": "completed",
-                "final_message": "hello complete",
+                "turn_status": "inProgress",
                 "model": kwargs["selected_model"],
                 "reasoning_effort": kwargs["selected_effort"],
             }
@@ -235,10 +232,45 @@ class LauncherTests(unittest.TestCase):
 
         self.assertEqual(result["thread_id"], "thread-created-1")
         self.assertEqual(result["turn_id"], "turn-created-1")
+        self.assertEqual(result["turn_status"], "inProgress")
         self.assertEqual(calls, [
             ("thread/start", {"cwd": "C:/test/project", "ephemeral": False}),
-            ("thread/name/set", {"threadId": "thread-created-1", "name": "TEST Worker"}),
         ])
+
+    def test_app_server_client_resumes_the_persisted_thread_before_starting_a_new_turn(self):
+        with tempfile.TemporaryDirectory() as temp:
+            _, _, config = self.make_queue(temp)
+            client = AppServerClient.__new__(AppServerClient)
+            client.config = config
+            calls = []
+
+            def request(method, params):
+                calls.append((method, params))
+                if method == "thread/resume":
+                    return {"thread": {"id": "thread-existing-1"}}
+                raise AssertionError(method)
+
+            client.start = lambda: None
+            client.request = request
+            client.start_turn_async = lambda thread_id, prompt, **kwargs: {
+                "thread_id": thread_id,
+                "turn_id": "turn-resumed-1",
+                "prompt": prompt,
+                **kwargs,
+            }
+
+            result = client.resume_turn_async(
+                "thread-existing-1",
+                "继续",
+                client_user_message_id="resume-1",
+                model="gpt-test",
+                reasoning_effort="medium",
+            )
+
+        self.assertEqual(calls, [("thread/resume", {"threadId": "thread-existing-1"})])
+        self.assertEqual(result["thread_id"], "thread-existing-1")
+        self.assertEqual(result["prompt"], "继续")
+        self.assertEqual(result["client_user_message_id"], "resume-1")
 
     def test_invalid_reasoning_effort_is_rejected_before_queueing(self):
         with tempfile.TemporaryDirectory() as temp:

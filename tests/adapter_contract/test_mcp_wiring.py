@@ -24,12 +24,17 @@ class FakeTransport:
 class McpWiringContractTest(unittest.TestCase):
     def test_wiring_uses_the_supplied_existing_thread_transport(self):
         with tempfile.TemporaryDirectory() as temp:
+            launcher_config = Path(temp) / "launcher.json"
             control = build_jarvis_control(
-                Path("unused.json"), Path(temp), transport_factory=lambda _: FakeTransport()
+                Path("heartbeat.json"),
+                Path(temp),
+                launcher_config_path=launcher_config,
+                transport_factory=lambda _: FakeTransport(),
             )
             receipt = control.read(subject="thread", task_id="thread-1")
         self.assertEqual(receipt["status"], "completed")
         self.assertEqual(receipt["target_thread_id"], "thread-1")
+        self.assertEqual(control._provisioner._config_path, launcher_config)
 
 
 if __name__ == "__main__":

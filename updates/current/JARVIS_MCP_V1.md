@@ -16,9 +16,11 @@ The first MCP surface uses the official Python `mcp` SDK over stdio and exposes:
 ## Safety boundary
 
 The MCP server calls only `JarvisControl`. Its App Server provisioning adapter
-creates a durable thread, completes its first turn, reads that exact turn back,
-then sets its title. `jarvis_notify` and unconfigured heartbeat scheduling
-remain structured `unsupported` receipts; they never report a false action.
+queues a durable create or resume request for the normal-user Hold Host, then
+returns an `accepted` receipt. The Hold Host reports `holding` once it owns the
+exact turn and a terminal receipt only after exact-turn readback. `jarvis_notify`
+and unconfigured heartbeat scheduling remain structured `unsupported` receipts;
+they never report a false action.
 
 ## Verification
 

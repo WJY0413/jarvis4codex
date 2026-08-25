@@ -13,14 +13,28 @@ from .server import JarvisMcpServer
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, required=True, help="deployed Jarvis heartbeat-service config")
+    parser.add_argument(
+        "--launcher-config",
+        type=Path,
+        required=True,
+        help="deployed Jarvis native-task-launcher config for jarvis_create",
+    )
     parser.add_argument("--state-dir", type=Path, required=True, help="isolated MCP receipt and monitor state directory")
     return parser
 
 
 def main() -> int:
     args = build_parser().parse_args()
-    server = JarvisMcpServer(build_jarvis_control(args.config, args.state_dir))
-    server.run_stdio()
+    control = build_jarvis_control(
+        args.config,
+        args.state_dir,
+        launcher_config_path=args.launcher_config,
+    )
+    server = JarvisMcpServer(control)
+    try:
+        server.run_stdio()
+    finally:
+        control.close()
     return 0
 
 
