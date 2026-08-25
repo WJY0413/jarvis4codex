@@ -1,4 +1,7 @@
-# Jarvis MCP v1 (candidate)
+# Jarvis MCP v1
+
+The v0.1.7 release is archived at
+[`updates/history/JARVIS_MCP_V1_0.1.7.md`](../history/JARVIS_MCP_V1_0.1.7.md).
 
 ## Scope
 
