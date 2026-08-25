@@ -235,7 +235,11 @@ class HeartbeatService:
     def run_once(self) -> dict[str, Any]:
         results = []
         for heartbeat in self.store.claim_due():
-            receipt = self.function_runner(heartbeat["function_name"], json.loads(heartbeat["arguments_json"]), {"heartbeat_id": heartbeat["heartbeat_id"], **computer_time()})
+            receipt = self.function_runner(heartbeat["function_name"], json.loads(heartbeat["arguments_json"]), {
+                "heartbeat_id": heartbeat["heartbeat_id"],
+                "run_number": int(heartbeat["run_count"]) + 1,
+                **computer_time(),
+            })
             results.append(self.store.record(heartbeat, receipt))
         health = self.health()
         self.config.health_path.parent.mkdir(parents=True, exist_ok=True)

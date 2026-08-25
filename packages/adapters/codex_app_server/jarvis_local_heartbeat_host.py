@@ -28,8 +28,9 @@ class JarvisControlFunctionRunner:
     def __call__(
         self, function_name: str, arguments: Mapping[str, Any], context: Mapping[str, Any]
     ) -> Mapping[str, Any]:
-        request_id = f"heartbeat:{context['heartbeat_id']}"
-        source_ref = f"heartbeat:{context['heartbeat_id']}"
+        run_number = int(context.get("run_number") or 1)
+        request_id = f"heartbeat:{context['heartbeat_id']}:{run_number}"
+        source_ref = f"heartbeat:{context['heartbeat_id']}:{run_number}"
         if function_name == "JarvisControl.notify":
             return self._control.notify(
                 request_id=request_id, source_ref=source_ref,

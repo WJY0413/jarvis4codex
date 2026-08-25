@@ -43,16 +43,17 @@ class LocalHeartbeatTest(unittest.TestCase):
 
     def test_counter_calls_bound_function_once_then_completes_without_prompt(self) -> None:
         heartbeat = self.store.create(self.request())["heartbeat"]
-        calls: list[tuple[str, dict[str, object]]] = []
+        calls: list[tuple[str, dict[str, object], dict[str, object]]] = []
 
         service = HeartbeatService(
             self.config,
             store=self.store,
-            function_runner=lambda function, arguments, _context: calls.append((function, dict(arguments))) or {"status": "completed"},
+            function_runner=lambda function, arguments, context: calls.append((function, dict(arguments), dict(context))) or {"status": "completed"},
         )
         result = service.run_once()
 
-        self.assertEqual(calls, [("JarvisControl.monitor", {"monitor_id": "monitor-1"})])
+        self.assertEqual(calls[0][:2], ("JarvisControl.monitor", {"monitor_id": "monitor-1"}))
+        self.assertEqual(calls[0][2]["run_number"], 1)
         self.assertEqual(result["results"][0]["outcome"], "function_completed")
         self.assertIn("local_time", result["health"])
         stored = self.store.get(str(heartbeat["heartbeat_id"]))

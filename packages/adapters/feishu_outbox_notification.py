@@ -1,7 +1,7 @@
 """Verified Jarvis notification adapter backed by the existing Feishu bridge.
 
-The adapter owns no bot credentials.  It enqueues one outbox record through
-the established dispatcher and asks that bridge to deliver *that exact* record.
+The adapter owns no bot credentials. It enqueues one outbox record through the
+established dispatcher and waits for its existing bridge to record delivery.
 Only a delivery-log entry containing a Feishu ``message_id`` is a success.
 """
 
@@ -12,6 +12,7 @@ import json
 from pathlib import Path
 import subprocess
 import tempfile
+import time
 from typing import Any, Callable, Mapping
 
 
@@ -22,10 +23,10 @@ Runner = Callable[..., subprocess.CompletedProcess[str]]
 class FeishuOutboxNotificationConfig:
     python_executable: Path
     dispatcher_store_script: Path
-    bridge_script: Path
-    bridge_config: Path
     dispatcher_root: Path
     recipient: str
+    delivery_wait_seconds: float = 20.0
+    delivery_poll_seconds: float = 1.0
 
     @classmethod
     def load(cls, path: Path) -> "FeishuOutboxNotificationConfig":
@@ -44,10 +45,10 @@ class FeishuOutboxNotificationConfig:
         return cls(
             python_executable=file("python_executable"),
             dispatcher_store_script=file("dispatcher_store_script"),
-            bridge_script=file("bridge_script"),
-            bridge_config=file("bridge_config"),
             dispatcher_root=file("dispatcher_root"),
             recipient=recipient,
+            delivery_wait_seconds=max(float(raw.get("delivery_wait_seconds", 20)), 1.0),
+            delivery_poll_seconds=max(float(raw.get("delivery_poll_seconds", 1)), 0.1),
         )
 
 
@@ -75,11 +76,7 @@ class FeishuOutboxNotificationPort:
             queued = self._enqueue(request)
             record = dict(queued["result"]["record"])
             outbox_id = str(record["outbox_id"])
-            self._run([
-                str(self.config.python_executable), str(self.config.bridge_script),
-                "--config", str(self.config.bridge_config), "--send-outbox-id", outbox_id,
-            ])
-            delivery = self._delivery(outbox_id)
+            delivery = self._wait_for_delivery(outbox_id)
         except (OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
             return {"status": "failed", "reason": str(exc)}
         if delivery and delivery.get("delivery_status") == "delivered" and delivery.get("message_id"):
@@ -134,3 +131,15 @@ class FeishuOutboxNotificationPort:
             if value.get("outbox_id") == outbox_id:
                 latest = value
         return latest
+
+    def _wait_for_delivery(self, outbox_id: str) -> Mapping[str, Any] | None:
+        deadline = time.monotonic() + self.config.delivery_wait_seconds
+        while True:
+            delivery = self._delivery(outbox_id)
+            if delivery is not None and delivery.get("delivery_status") in {
+                "delivered", "expired", "unknown", "failed",
+            }:
+                return delivery
+            if time.monotonic() >= deadline:
+                return delivery
+            time.sleep(self.config.delivery_poll_seconds)
