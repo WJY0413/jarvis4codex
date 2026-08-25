@@ -6,8 +6,9 @@
   create, read, resume, monitor, heartbeat, and notify.
 - MCP tools call the harness-neutral `JarvisControl` facade and the existing
   versioned capability port; they do not embed a HostBridge implementation.
-- The unavailable create, notify, and unconfigured heartbeat paths return a
-  structured `unsupported` receipt rather than reporting a false action.
+- New thread creation uses the App Server's durable `thread/start`, exact first
+  `turn/start` readback, and `thread/name/set` sequence through a provisioning
+  adapter; unavailable notify and heartbeat paths return `unsupported`.
 
 # Jarvis 0.1.3
 

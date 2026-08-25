@@ -6,6 +6,8 @@ from typing import Any, Mapping
 
 from jarvis_codex_bridge import CapabilityRequest, ExistingThreadBridge, JarvisCapabilityPort
 
+from .provisioning import TaskProvisionRequest, TaskProvisioningPort
+
 
 JARVIS_MCP_RECEIPT_SCHEMA = "jarvis-mcp-receipt/v1"
 
@@ -18,9 +20,53 @@ class JarvisControl:
     an explicit unsupported receipt instead of a guessed implementation.
     """
 
-    def __init__(self, capabilities: JarvisCapabilityPort, bridge: ExistingThreadBridge) -> None:
+    def __init__(
+        self,
+        capabilities: JarvisCapabilityPort,
+        bridge: ExistingThreadBridge,
+        provisioner: TaskProvisioningPort | None = None,
+    ) -> None:
         self._capabilities = capabilities
         self._bridge = bridge
+        self._provisioner = provisioner
+
+    def create(
+        self,
+        *,
+        request_id: str,
+        project: str,
+        title: str,
+        prompt: str,
+        source_ref: str,
+        model: str | None = None,
+        reasoning_effort: str | None = None,
+    ) -> dict[str, Any]:
+        if self._provisioner is None:
+            return self.unsupported(
+                tool="jarvis_create", reason="no task-creation adapter is configured"
+            )
+        try:
+            provision = self._provisioner.provision(TaskProvisionRequest(
+                request_id=request_id,
+                project=project,
+                title=title,
+                prompt=prompt,
+                source_ref=source_ref,
+                model=model,
+                reasoning_effort=reasoning_effort,
+            ))
+        except ValueError as exc:
+            return self._receipt("jarvis_create", "invalid_request", request_id=request_id, reason=str(exc))
+        return self._receipt(
+            "jarvis_create",
+            provision.status,
+            request_id=provision.request_id,
+            target_thread_id=provision.thread_id,
+            turn_id=provision.turn_id,
+            reason=provision.reason,
+            data=provision.as_dict(),
+            readback={"verified": provision.status == "completed"},
+        )
 
     def resume(
         self,
@@ -51,7 +97,10 @@ class JarvisControl:
                 "jarvis_read",
                 "completed",
                 data={
-                    "jarvis_create": {"available": False, "reason": "no task-creation adapter is configured"},
+                    "jarvis_create": {
+                        "available": self._provisioner is not None,
+                        "reason": None if self._provisioner is not None else "no task-creation adapter is configured",
+                    },
                     "jarvis_read": {"available": True, "read_only": True},
                     "jarvis_resume": {"available": True},
                     "jarvis_monitor": {"available": True},

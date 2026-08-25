@@ -74,6 +74,8 @@ class JarvisMcpContractTest(unittest.TestCase):
             ThreadTerminalMonitor(self.transport, Path(self.temp.name) / "monitor.json"),
             self.heartbeat,
         )
+        self.bridge = bridge
+        self.capability_port = capability_port
         self.server = JarvisMcpServer(JarvisControl(capability_port, bridge))
 
     def tearDown(self) -> None:
@@ -189,12 +191,47 @@ class JarvisMcpContractTest(unittest.TestCase):
         self.assertEqual(result.structured_content["status"], "unsupported")
 
     def test_create_and_notify_report_unavailable_adapters_without_false_success(self):
-        create = self.call("jarvis_create", {"project": "Jarvis4codex", "title": "test", "prompt": "test"})
+        create = self.call("jarvis_create", {
+            "project": "Jarvis4codex", "title": "test", "prompt": "test", "request_id": "create-unsupported"
+        })
         notify = self.call("jarvis_notify", {"message": "internal test"})
         self.assertTrue(create.is_error)
         self.assertTrue(notify.is_error)
         self.assertEqual(create.structured_content["status"], "unsupported")
         self.assertEqual(notify.structured_content["status"], "unsupported")
+
+    def test_create_delegates_to_a_configured_provisioner_and_returns_exact_identity(self):
+        class Provisioner:
+            def provision(self, request):
+                from jarvis_control import TaskProvisionReceipt
+                from jarvis_control.provisioning import observed_now
+                self.request = request
+                return TaskProvisionReceipt(
+                    request_id=request.request_id,
+                    status="completed",
+                    observed_at=observed_now(),
+                    thread_id="thread-created-1",
+                    turn_id="turn-created-1",
+                    output="hello complete",
+                )
+
+        provisioner = Provisioner()
+        server = JarvisMcpServer(JarvisControl(self.capability_port, self.bridge, provisioner))
+
+        async def run():
+            async with Client(server.mcp) as client:
+                return await client.call_tool("jarvis_create", {
+                    "project": "Jarvis4codex",
+                    "title": "TEST Worker",
+                    "prompt": "hello",
+                    "request_id": "create-1",
+                })
+
+        result = asyncio.run(run())
+        self.assertFalse(result.is_error)
+        self.assertEqual(result.structured_content["status"], "completed")
+        self.assertEqual(result.structured_content["target_thread_id"], "thread-created-1")
+        self.assertEqual(provisioner.request.title, "TEST Worker")
 
 
 if __name__ == "__main__":

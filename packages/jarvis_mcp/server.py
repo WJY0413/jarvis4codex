@@ -37,10 +37,23 @@ class JarvisMcpServer:
             description="Create a Jarvis task. Currently reports unsupported until a verified task-creation adapter is supplied.",
             annotations=ToolAnnotations(destructiveHint=False, idempotentHint=False, openWorldHint=False),
         )
-        def jarvis_create(project: str, title: str, prompt: str) -> CallToolResult:
-            del project, title, prompt
-            return _tool_result(self.control.unsupported(
-                tool="jarvis_create", reason="no task-creation adapter is configured"
+        def jarvis_create(
+            project: str,
+            title: str,
+            prompt: str,
+            request_id: str,
+            source_ref: str = "mcp:jarvis_create",
+            model: str | None = None,
+            reasoning_effort: str | None = None,
+        ) -> CallToolResult:
+            return _tool_result(self.control.create(
+                request_id=request_id,
+                project=project,
+                title=title,
+                prompt=prompt,
+                source_ref=source_ref,
+                model=model,
+                reasoning_effort=reasoning_effort,
             ))
 
         @self.mcp.tool(
@@ -123,7 +136,7 @@ class JarvisMcpServer:
 
 
 def _tool_result(receipt: dict[str, Any]) -> CallToolResult:
-    is_error = receipt["status"] in {"invalid_request", "unsupported", "failed"}
+    is_error = receipt["status"] in {"invalid_request", "unsupported", "failed", "partial"}
     summary = json.dumps(receipt, ensure_ascii=False, sort_keys=True)
     return CallToolResult(
         content=[TextContent(type="text", text=summary)],

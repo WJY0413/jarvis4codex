@@ -802,6 +802,37 @@ class AppServerClient:
             selected_effort=reasoning_effort,
         )
 
+    def create_task(self, request: dict[str, Any]) -> dict[str, Any]:
+        """Create one durable thread, finish its first turn, then persist its title.
+
+        Naming is intentionally after the first turn: current App Server builds
+        materialize the durable rollout during that turn, not at ``thread/start``.
+        """
+        project_path = _as_nonempty_string(request.get("project_path"), "project_path")
+        title = _as_nonempty_string(request.get("title"), "title")
+        prompt = _as_nonempty_string(request.get("prompt"), "prompt")
+        request_id = _as_nonempty_string(request.get("request_id"), "request_id")
+        self.start()
+        try:
+            started = self.request("thread/start", {"cwd": project_path, "ephemeral": False})
+            thread = started.get("thread")
+            thread_id = str(thread.get("id") or "") if isinstance(thread, dict) else ""
+            if not thread_id:
+                raise NativeTaskCreationError("thread/start response is missing thread.id")
+            created = self._start_turn_with_model(
+                thread_id,
+                prompt,
+                client_user_message_id=request_id,
+                selected_model=self.select_model(request.get("model")),
+                selected_effort=request.get("reasoning_effort"),
+            )
+            self.request("thread/name/set", {"threadId": thread_id, "name": title})
+            return {**created, "thread_id": thread_id, "title": title}
+        except NativeTaskCreationError:
+            raise
+        except Exception as exc:
+            raise NativeTaskCreationError(str(exc), thread_id=locals().get("thread_id")) from exc
+
     def _start_turn_with_model(
         self,
         thread_id: str,

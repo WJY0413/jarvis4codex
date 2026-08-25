@@ -10,6 +10,8 @@ from typing import Any
 from jarvis_codex_bridge import ExistingThreadBridge, JarvisCapabilityPort, JsonlReceiptJournal, ThreadTerminalMonitor
 from jarvis_control import JarvisControl
 
+from .task_provisioning_adapter import CodexAppServerTaskProvisioningAdapter
+
 
 def build_jarvis_control(
     config_path: Path,
@@ -17,12 +19,7 @@ def build_jarvis_control(
     *,
     transport_factory: Callable[[Path], Any] | None = None,
 ) -> JarvisControl:
-    """Wire only the deployed existing-thread adapter into JarvisControl.
-
-    The process intentionally has no task-creation or notification adapter.
-    Those capabilities stay visibly unsupported until the Jarvis runtime exposes
-    their versioned, receipt-backed contracts.
-    """
+    """Wire deployed existing-thread and task-provisioning adapters into JarvisControl."""
     transport = (transport_factory or _standard_transport)(config_path)
     state_dir.mkdir(parents=True, exist_ok=True)
     bridge = ExistingThreadBridge(transport, JsonlReceiptJournal(state_dir / "resume-receipts.jsonl"))
@@ -30,7 +27,11 @@ def build_jarvis_control(
         bridge,
         ThreadTerminalMonitor(transport, state_dir / "monitor-state.json"),
     )
-    return JarvisControl(capabilities, bridge)
+    return JarvisControl(
+        capabilities,
+        bridge,
+        provisioner=CodexAppServerTaskProvisioningAdapter(config_path),
+    )
 
 
 def _standard_transport(config_path: Path) -> Any:

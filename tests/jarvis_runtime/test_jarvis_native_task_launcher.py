@@ -196,8 +196,49 @@ class LauncherTests(unittest.TestCase):
             "今天发送 230 封，队列与发件器均正常。",
         )
 
-    def test_app_server_client_exposes_no_thread_creation_method(self):
-        self.assertFalse(hasattr(AppServerClient, "create_task"))
+    def test_app_server_client_exposes_task_creation_method(self):
+        self.assertTrue(hasattr(AppServerClient, "create_task"))
+
+    def test_app_server_client_creates_then_names_after_the_first_exact_turn_readback(self):
+        with tempfile.TemporaryDirectory() as temp:
+            _, _, config = self.make_queue(temp)
+            client = AppServerClient.__new__(AppServerClient)
+            client.config = config
+            calls = []
+
+            def request(method, params):
+                calls.append((method, params))
+                if method == "thread/start":
+                    return {"thread": {"id": "thread-created-1"}}
+                if method == "thread/name/set":
+                    return {}
+                raise AssertionError(method)
+
+            client.start = lambda: None
+            client.request = request
+            client.select_model = lambda _model: "gpt-test"
+            client._start_turn_with_model = lambda thread_id, prompt, **kwargs: {
+                "thread_id": thread_id,
+                "turn_id": "turn-created-1",
+                "turn_status": "completed",
+                "final_message": "hello complete",
+                "model": kwargs["selected_model"],
+                "reasoning_effort": kwargs["selected_effort"],
+            }
+
+            result = client.create_task({
+                "request_id": "create-1",
+                "project_path": "C:/test/project",
+                "title": "TEST Worker",
+                "prompt": "hello",
+            })
+
+        self.assertEqual(result["thread_id"], "thread-created-1")
+        self.assertEqual(result["turn_id"], "turn-created-1")
+        self.assertEqual(calls, [
+            ("thread/start", {"cwd": "C:/test/project", "ephemeral": False}),
+            ("thread/name/set", {"threadId": "thread-created-1", "name": "TEST Worker"}),
+        ])
 
     def test_invalid_reasoning_effort_is_rejected_before_queueing(self):
         with tempfile.TemporaryDirectory() as temp:
