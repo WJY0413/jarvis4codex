@@ -1,0 +1,7 @@
+{
+  "db_path": "C:\\Users\\22524\\.codex\\jarvis-production\\local-heartbeats.sqlite",
+  "health_path": "C:\\Users\\22524\\.codex\\jarvis-production\\local-heartbeat-health.json",
+  "poll_seconds": 5,
+  "min_interval_seconds": 30,
+  "max_interval_seconds": 2592000
+}

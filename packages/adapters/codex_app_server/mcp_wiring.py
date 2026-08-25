@@ -11,6 +11,10 @@ from jarvis_codex_bridge import ExistingThreadBridge, JarvisCapabilityPort, Json
 from jarvis_control import JarvisControl
 
 from .task_provisioning_adapter import CodexAppServerTaskProvisioningAdapter
+from adapters.feishu_outbox_notification import (
+    FeishuOutboxNotificationConfig,
+    FeishuOutboxNotificationPort,
+)
 
 
 def build_jarvis_control(
@@ -18,15 +22,23 @@ def build_jarvis_control(
     state_dir: Path,
     *,
     launcher_config_path: Path,
+    local_heartbeat_config_path: Path | None = None,
+    notification_config_path: Path | None = None,
     transport_factory: Callable[[Path], Any] | None = None,
 ) -> JarvisControl:
     """Wire deployed existing-thread and task-provisioning adapters into JarvisControl."""
     transport = (transport_factory or _standard_transport)(config_path)
     state_dir.mkdir(parents=True, exist_ok=True)
+    runtime_dir = Path(__file__).resolve().parents[2] / "jarvis_runtime"
+    if str(runtime_dir) not in sys.path:
+        sys.path.insert(0, str(runtime_dir))
+    from jarvis_local_heartbeat import JarvisControlHeartbeat
+
     bridge = ExistingThreadBridge(transport, JsonlReceiptJournal(state_dir / "resume-receipts.jsonl"))
     capabilities = JarvisCapabilityPort(
         bridge,
         ThreadTerminalMonitor(transport, state_dir / "monitor-state.json"),
+        JarvisControlHeartbeat(local_heartbeat_config_path or config_path),
     )
     return JarvisControl(
         capabilities,
@@ -34,6 +46,10 @@ def build_jarvis_control(
         provisioner=CodexAppServerTaskProvisioningAdapter(
             launcher_config_path,
             state_dir=state_dir,
+        ),
+        notifier=(
+            FeishuOutboxNotificationPort(FeishuOutboxNotificationConfig.load(notification_config_path))
+            if notification_config_path is not None else None
         ),
     )
 

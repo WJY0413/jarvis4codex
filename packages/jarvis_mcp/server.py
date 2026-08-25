@@ -136,13 +136,16 @@ class JarvisMcpServer:
 
         @self.mcp.tool(
             name="jarvis_notify",
-            description="Deliver a Jarvis notification. Currently reports unsupported until a verified notification adapter is supplied.",
+            description="Deliver a Jarvis notification through its configured verified notification adapter.",
             annotations=ToolAnnotations(destructiveHint=False, idempotentHint=False, openWorldHint=False),
         )
-        def jarvis_notify(message: str) -> CallToolResult:
-            del message
-            return _tool_result(self.control.unsupported(
-                tool="jarvis_notify", reason="no notification adapter is configured"
+        def jarvis_notify(
+            message: str,
+            request_id: str = "mcp:jarvis_notify",
+            source_ref: str = "mcp:jarvis_notify",
+        ) -> CallToolResult:
+            return _tool_result(self.control.notify(
+                request_id=request_id, source_ref=source_ref, message=message,
             ))
 
 

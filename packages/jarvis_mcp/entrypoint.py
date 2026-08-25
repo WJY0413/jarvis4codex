@@ -20,6 +20,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="deployed Jarvis native-task-launcher config for jarvis_create",
     )
     parser.add_argument("--state-dir", type=Path, required=True, help="isolated MCP receipt and monitor state directory")
+    parser.add_argument("--local-heartbeat-config", type=Path, help="local scheduler config, kept separate from App Server transport")
+    parser.add_argument("--notification-config", type=Path, help="verified Jarvis notification adapter config")
     return parser
 
 
@@ -29,6 +31,8 @@ def main() -> int:
         args.config,
         args.state_dir,
         launcher_config_path=args.launcher_config,
+        local_heartbeat_config_path=args.local_heartbeat_config,
+        notification_config_path=args.notification_config,
     )
     server = JarvisMcpServer(control)
     try:

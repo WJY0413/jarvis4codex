@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Mapping
+from typing import Any, Mapping, Protocol
 
 from jarvis_codex_bridge import CapabilityRequest, ExistingThreadBridge, JarvisCapabilityPort
 
@@ -12,12 +12,14 @@ from .provisioning import TaskMonitorResumeRequest, TaskProvisionRequest, TaskPr
 JARVIS_MCP_RECEIPT_SCHEMA = "jarvis-mcp-receipt/v1"
 
 
+class NotificationPort(Protocol):
+    def notify(self, *, request_id: str, source_ref: str, message: str) -> Mapping[str, Any]: ...
+
+
 class JarvisControl:
     """Expose only supported Jarvis operations through stable receipt envelopes.
 
-    This class deliberately does not create tasks or deliver external messages.  Those
-    operations have no verified adapter in the current product source, so callers get
-    an explicit unsupported receipt instead of a guessed implementation.
+    External notification remains unavailable unless a verified adapter is supplied.
     """
 
     def __init__(
@@ -25,10 +27,12 @@ class JarvisControl:
         capabilities: JarvisCapabilityPort,
         bridge: ExistingThreadBridge,
         provisioner: TaskProvisioningPort | None = None,
+        notifier: NotificationPort | None = None,
     ) -> None:
         self._capabilities = capabilities
         self._bridge = bridge
         self._provisioner = provisioner
+        self._notifier = notifier
 
     def create(
         self,
@@ -134,7 +138,10 @@ class JarvisControl:
                         "available": self._capabilities.heartbeat_available,
                         "requires_scheduler": True,
                     },
-                    "jarvis_notify": {"available": False, "reason": "no notification adapter is configured"},
+                    "jarvis_notify": {
+                        "available": self._notifier is not None,
+                        "reason": None if self._notifier is not None else "no notification adapter is configured",
+                    },
                 },
             )
         if subject == "thread":
@@ -234,6 +241,19 @@ class JarvisControl:
             arguments["heartbeat_id"] = heartbeat_id
         return self._invoke(
             "jarvis_heartbeat", capability, request_id=request_id, source_ref=source_ref, arguments=arguments
+        )
+
+    def notify(self, *, request_id: str, source_ref: str, message: str) -> dict[str, Any]:
+        if self._notifier is None:
+            return self.unsupported(tool="jarvis_notify", reason="no notification adapter is configured")
+        try:
+            result = dict(self._notifier.notify(request_id=request_id, source_ref=source_ref, message=message))
+        except Exception as exc:
+            return self._receipt("jarvis_notify", "failed", request_id=request_id, reason=str(exc))
+        return self._receipt(
+            "jarvis_notify", str(result.get("status") or "failed"), request_id=request_id,
+            reason=result.get("reason"), data=result,
+            readback={"verified": result.get("delivery_status") == "delivered" and bool(result.get("message_id"))},
         )
 
     def unsupported(self, *, tool: str, reason: str) -> dict[str, Any]:
