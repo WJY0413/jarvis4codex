@@ -1,3 +1,14 @@
+# Jarvis 0.1.4
+
+## MCP control surface
+
+- Added an official Python SDK MCP server for the six first-priority Jarvis tools:
+  create, read, resume, monitor, heartbeat, and notify.
+- MCP tools call the harness-neutral `JarvisControl` facade and the existing
+  versioned capability port; they do not embed a HostBridge implementation.
+- The unavailable create, notify, and unconfigured heartbeat paths return a
+  structured `unsupported` receipt rather than reporting a false action.
+
 # Jarvis 0.1.3
 
 ## Independent Monitor output layer

@@ -1,0 +1,201 @@
+from __future__ import annotations
+
+import asyncio
+import tempfile
+import unittest
+from pathlib import Path
+
+from mcp import Client
+
+from jarvis_codex_bridge import (
+    ExistingThreadBridge,
+    JarvisCapabilityPort,
+    JsonlReceiptJournal,
+    StartedTurn,
+    ThreadState,
+    ThreadTerminalMonitor,
+    TurnState,
+)
+from jarvis_control import JarvisControl
+from jarvis_mcp import JarvisMcpServer
+
+
+class FakeTransport:
+    name = "fake-codex"
+
+    def __init__(self) -> None:
+        self.state = ThreadState("thread-1", "idle", (TurnState("turn-1", "completed"),))
+        self.prompts: list[str] = []
+
+    def health(self):
+        return {"adapter": self.name, "status": "ok"}
+
+    def read_thread(self, thread_id):
+        self.assert_thread(thread_id)
+        return self.state
+
+    def resume_existing(self, request):
+        self.assert_thread(request.thread_id)
+        self.prompts.append(request.prompt)
+        self.state = ThreadState(
+            request.thread_id,
+            "idle",
+            (*self.state.turns, TurnState("turn-2", "completed", (
+                {"type": "agentMessage", "phase": "final_answer", "text": "continued"},
+            ))),
+        )
+        return StartedTurn(request.thread_id, "turn-2", "completed")
+
+    @staticmethod
+    def assert_thread(thread_id):
+        if thread_id != "thread-1":
+            raise AssertionError(thread_id)
+
+
+class FakeHeartbeat:
+    def __init__(self) -> None:
+        self.calls = []
+
+    def invoke_heartbeat(self, request_id, capability, source_ref, arguments):
+        self.calls.append((request_id, capability, source_ref, dict(arguments)))
+        return {"status": "active", "heartbeat_id": arguments.get("heartbeat_id")}
+
+
+class JarvisMcpContractTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.transport = FakeTransport()
+        bridge = ExistingThreadBridge(
+            self.transport, JsonlReceiptJournal(Path(self.temp.name) / "receipts.jsonl")
+        )
+        self.heartbeat = FakeHeartbeat()
+        capability_port = JarvisCapabilityPort(
+            bridge,
+            ThreadTerminalMonitor(self.transport, Path(self.temp.name) / "monitor.json"),
+            self.heartbeat,
+        )
+        self.server = JarvisMcpServer(JarvisControl(capability_port, bridge))
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def list_tools(self):
+        async def run():
+            async with Client(self.server.mcp) as client:
+                return await client.list_tools()
+        return asyncio.run(run())
+
+    def call(self, name, arguments):
+        async def run():
+            async with Client(self.server.mcp) as client:
+                return await client.call_tool(name, arguments)
+        return asyncio.run(run())
+
+    def test_lists_the_six_public_jarvis_tools_with_sdk_generated_schema(self):
+        result = self.list_tools()
+        self.assertEqual(
+            [tool.name for tool in result.tools],
+            [
+                "jarvis_create",
+                "jarvis_read",
+                "jarvis_resume",
+                "jarvis_monitor",
+                "jarvis_heartbeat",
+                "jarvis_notify",
+            ],
+        )
+        self.assertTrue(all(tool.input_schema["type"] == "object" for tool in result.tools))
+        read_tool = next(tool for tool in result.tools if tool.name == "jarvis_read")
+        self.assertTrue(read_tool.annotations.read_only_hint)
+
+    def test_resume_forwards_ai_parameters_and_returns_a_readback_receipt(self):
+        result = self.call(
+            "jarvis_resume",
+            {"task_id": "thread-1", "prompt": "continue exactly once", "request_id": "resume-1"},
+        )
+        self.assertFalse(result.is_error)
+        receipt = result.structured_content
+        self.assertEqual(receipt["tool"], "jarvis_resume")
+        self.assertEqual(receipt["status"], "completed")
+        self.assertEqual(receipt["target_thread_id"], "thread-1")
+        self.assertEqual(receipt["turn_id"], "turn-2")
+        self.assertTrue(receipt["readback"]["verified"])
+        self.assertEqual(self.transport.prompts, ["continue exactly once"])
+
+    def test_invalid_resume_request_returns_a_structured_error_receipt(self):
+        result = self.call(
+            "jarvis_resume",
+            {"task_id": "thread-1", "prompt": "", "request_id": "resume-empty"},
+        )
+        self.assertTrue(result.is_error)
+        receipt = result.structured_content
+        self.assertEqual(receipt["status"], "invalid_request")
+        self.assertIn("prompt", receipt["reason"])
+
+    def test_read_capabilities_is_a_read_only_tool_result(self):
+        result = self.call("jarvis_read", {"subject": "capabilities"})
+        receipt = result.structured_content
+        self.assertFalse(result.is_error)
+        self.assertEqual(receipt["status"], "completed")
+        self.assertTrue(receipt["data"]["jarvis_resume"]["available"])
+        self.assertFalse(receipt["data"]["jarvis_create"]["available"])
+
+    def test_monitor_observe_returns_its_observation_receipt(self):
+        result = self.call(
+            "jarvis_monitor",
+            {
+                "action": "observe",
+                "request_id": "monitor-1",
+                "monitor_id": "monitor-1",
+                "observed_task_id": "thread-1",
+                "receipt_task_id": "thread-1",
+            },
+        )
+        receipt = result.structured_content
+        self.assertFalse(result.is_error)
+        self.assertEqual(receipt["status"], "baseline_terminal")
+        self.assertEqual(receipt["tool"], "jarvis_monitor")
+
+    def test_heartbeat_delegates_to_the_existing_heartbeat_port(self):
+        result = self.call(
+            "jarvis_heartbeat",
+            {"action": "create", "heartbeat_id": "daily-check", "request_id": "heartbeat-1"},
+        )
+        receipt = result.structured_content
+        self.assertFalse(result.is_error)
+        self.assertEqual(receipt["status"], "active")
+        self.assertEqual(self.heartbeat.calls[0][1], "heartbeat.create")
+
+    def test_heartbeat_without_a_scheduler_reports_unsupported(self):
+        bridge = ExistingThreadBridge(
+            self.transport, JsonlReceiptJournal(Path(self.temp.name) / "no-heartbeat.jsonl")
+        )
+        no_scheduler = JarvisMcpServer(JarvisControl(
+            JarvisCapabilityPort(
+                bridge,
+                ThreadTerminalMonitor(self.transport, Path(self.temp.name) / "no-heartbeat-monitor.json"),
+            ),
+            bridge,
+        ))
+
+        async def run():
+            async with Client(no_scheduler.mcp) as client:
+                return await client.call_tool(
+                    "jarvis_heartbeat", {"action": "health", "request_id": "no-scheduler"}
+                )
+
+        result = asyncio.run(run())
+        self.assertTrue(result.is_error)
+        self.assertEqual(result.structured_content["status"], "unsupported")
+
+    def test_create_and_notify_report_unavailable_adapters_without_false_success(self):
+        create = self.call("jarvis_create", {"project": "Jarvis4codex", "title": "test", "prompt": "test"})
+        notify = self.call("jarvis_notify", {"message": "internal test"})
+        self.assertTrue(create.is_error)
+        self.assertTrue(notify.is_error)
+        self.assertEqual(create.structured_content["status"], "unsupported")
+        self.assertEqual(notify.structured_content["status"], "unsupported")
+
+
+if __name__ == "__main__":
+    unittest.main()

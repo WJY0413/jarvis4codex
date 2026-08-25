@@ -120,6 +120,11 @@ class JarvisCapabilityPort:
         self._monitor = monitor
         self._heartbeat = heartbeat
 
+    @property
+    def heartbeat_available(self) -> bool:
+        """Whether this port was wired with a scheduler-owned heartbeat adapter."""
+        return self._heartbeat is not None
+
     def invoke(self, request: CapabilityRequest) -> CapabilityReceipt:
         if request.capability == "resume.existing":
             return self._bridge_receipt(request, self._resume_request(request))
