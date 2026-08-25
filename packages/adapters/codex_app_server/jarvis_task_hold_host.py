@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from jarvis_native_task_launcher import AppServerClient, NativeTaskLauncherConfig
+from jarvis_runtime.jarvis_native_task_launcher import AppServerClient, NativeTaskLauncherConfig
 
 
 def _now() -> str:

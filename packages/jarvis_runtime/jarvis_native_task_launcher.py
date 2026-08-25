@@ -16,16 +16,28 @@ import threading
 import time
 from typing import Any, Callable
 
-from coo_dispatcher_store import (
-    DEFAULT_ROOT,
-    DispatcherError,
-    DispatcherStore,
-    ProcessLock,
-    append_jsonl,
-    iter_jsonl,
-    read_json,
-    utc_now,
-)
+try:  # Supports installed package imports and direct runtime-script execution.
+    from .coo_dispatcher_store import (
+        DEFAULT_ROOT,
+        DispatcherError,
+        DispatcherStore,
+        ProcessLock,
+        append_jsonl,
+        iter_jsonl,
+        read_json,
+        utc_now,
+    )
+except ImportError:  # pragma: no cover - direct script execution
+    from coo_dispatcher_store import (
+        DEFAULT_ROOT,
+        DispatcherError,
+        DispatcherStore,
+        ProcessLock,
+        append_jsonl,
+        iter_jsonl,
+        read_json,
+        utc_now,
+    )
 
 
 WORKSPACE_ROOT = Path(__file__).resolve().parents[1]

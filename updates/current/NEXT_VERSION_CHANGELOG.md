@@ -1,4 +1,4 @@
-# Jarvis 0.1.5
+# Jarvis 0.1.6
 
 ## MCP control surface
 
@@ -11,6 +11,7 @@
   phase receipts from `accepted` through `holding` and exact-turn terminal
   readback; resume uses `thread/resume` before `turn/start`. Unavailable notify
   and heartbeat paths return `unsupported`.
+- Fixed the production-package import path used by the normal-user Hold Host.
 
 # Jarvis 0.1.3
 

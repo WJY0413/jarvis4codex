@@ -19,7 +19,7 @@ class JarvisMcpServer:
         self.mcp = MCPServer(
             "jarvis-control",
             title="Jarvis Control Plane",
-            version="0.1.5",
+            version="0.1.6",
             instructions=(
                 "Use jarvis_read before a state-changing call when you need capability or thread context. "
                 "Create and resume are hold-owned: a holding receipt verifies an exact turn held by Jarvis. "
