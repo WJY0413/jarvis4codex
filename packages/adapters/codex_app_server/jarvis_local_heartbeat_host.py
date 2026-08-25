@@ -5,9 +5,15 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import sys
 from typing import Any, Mapping
 
 from jarvis_control import JarvisControl
+
+_RUNTIME_DIR = Path(__file__).resolve().parents[2] / "jarvis_runtime"
+if str(_RUNTIME_DIR) not in sys.path:
+    sys.path.insert(0, str(_RUNTIME_DIR))
+
 from jarvis_local_heartbeat import HeartbeatService, LocalHeartbeatConfig
 
 from .mcp_wiring import build_jarvis_control
