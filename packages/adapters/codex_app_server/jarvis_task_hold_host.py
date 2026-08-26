@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from jarvis_monitor import HoldTurnMonitor, HoldTurnRequest, NotificationPolicy
 from jarvis_runtime.jarvis_native_task_launcher import AppServerClient, NativeTaskLauncherConfig
 
 
@@ -35,18 +36,66 @@ def _read_json(path: Path) -> dict[str, Any]:
     return value
 
 
+def _notification_policy(value: object) -> NotificationPolicy:
+    raw = value if isinstance(value, dict) else {}
+    milestones = raw.get("milestones") or []
+    if not isinstance(milestones, list):
+        raise RuntimeError("notifications.milestones must be a list")
+    try:
+        normalized = tuple(sorted({int(item) for item in milestones}))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("notifications.milestones must contain integers") from exc
+    terminal = raw.get("terminal", False)
+    if not isinstance(terminal, bool):
+        raise RuntimeError("notifications.terminal must be a boolean")
+    return NotificationPolicy(
+        milestone_turns=normalized,
+        terminal=terminal,
+    )
+
+
+def _append_monitor_events(path: Path, decision: object) -> None:
+    events = getattr(decision, "notification_events", ())
+    if not events:
+        return
+    with path.open("a", encoding="utf-8") as handle:
+        for event in events:
+            handle.write(json.dumps({
+                "event_id": event.event_id,
+                "event_type": event.event_type,
+                "hold_id": event.hold_id,
+                "thread_id": event.thread_id,
+                "turn_id": event.turn_id,
+                "turn_count": event.turn_count,
+                "status": event.status,
+                "message": event.message,
+                "observed_at": _now(),
+            }, ensure_ascii=False) + "\n")
+
+
+def _validate_monitor_command(decision: object, *, hold_id: str, turn_id: str) -> None:
+    if getattr(decision, "hold_id", None) != hold_id:
+        raise RuntimeError("monitor command hold_id does not match active hold")
+    if getattr(decision, "expected_turn_id", None) != turn_id:
+        raise RuntimeError("monitor command expected_turn_id does not match active turn")
+    if not str(getattr(decision, "command_id", "")).strip():
+        raise RuntimeError("monitor command_id is required")
+
+
 def hold_task(
     launcher_config_path: Path,
     request_path: Path,
     ack_path: Path,
     result_path: Path,
+    *,
+    monitor: HoldTurnMonitor | None = None,
 ) -> int:
     request = _read_json(request_path)
     request_id = str(request.get("request_id") or "").strip()
     max_turns = max(int(request.get("max_turns") or 1), 1)
     auto_continue = bool(request.get("auto_continue", False))
     continue_prompt = str(request.get("continue_prompt") or "继续").strip() or "继续"
-    monitor_id = str(request.get("monitor_id") or f"monitor-{request_id}")
+    hold_id = str(request.get("hold_id") or request.get("monitor_id") or f"hold-{request_id}")
     initial_turn_count = max(int(request.get("initial_turn_count") or 1), 1)
     initial_total_turn_count = max(int(request.get("initial_total_turn_count") or initial_turn_count), 1)
     client: AppServerClient | None = None
@@ -60,7 +109,7 @@ def hold_task(
             "status": "accepted",
             "phase": phase,
             "pid": os.getpid(),
-            "monitor_id": monitor_id,
+            "hold_id": hold_id,
             "turn_count": initial_turn_count,
             "session_turn_count": initial_turn_count,
             "total_turn_count": initial_total_turn_count,
@@ -76,7 +125,7 @@ def hold_task(
         if str(request.get("mode") or "create") == "resume":
             thread_id = str(request.get("thread_id") or "").strip()
             if not thread_id:
-                raise RuntimeError("monitor resume requires thread_id")
+                raise RuntimeError("hold resume requires thread_id")
             created = client.resume_turn_async(
                 thread_id,
                 str(request.get("prompt") or "").strip(),
@@ -98,7 +147,7 @@ def hold_task(
             "pid": os.getpid(),
             "thread_id": thread_id,
             "turn_id": turn_id,
-            "monitor_id": monitor_id,
+            "hold_id": hold_id,
             "turn_count": initial_turn_count,
             "session_turn_count": initial_turn_count,
             "total_turn_count": initial_total_turn_count,
@@ -107,29 +156,57 @@ def hold_task(
         })
         turn_count = initial_turn_count
         total_turn_count = initial_total_turn_count
+        turn_monitor = monitor or HoldTurnMonitor()
+        policy = _notification_policy(request.get("notifications"))
+        events_path = result_path.with_name("monitor-events.jsonl")
         while True:
-            terminal = client.wait_for_turn_terminal(thread_id, turn_id, wait_forever=True)
-            terminal_status = str(terminal.get("status") or "unknown")
-            if terminal_status != "completed":
-                final_message = ""
-                break
-            final_message = client.wait_for_turn_readback(thread_id, turn_id)
-            if turn_count >= max_turns:
-                terminal_status = "turn_limit_reached"
-                break
-            if not auto_continue:
+            decision = turn_monitor.observe(client, HoldTurnRequest(
+                hold_id=hold_id,
+                thread_id=thread_id,
+                turn_id=turn_id,
+                turn_count=turn_count,
+                max_turns=max_turns,
+                continuation_enabled=auto_continue,
+                continue_prompt=continue_prompt,
+                notification_policy=policy,
+            ))
+            _validate_monitor_command(decision, hold_id=hold_id, turn_id=turn_id)
+            _append_monitor_events(events_path, decision)
+            final_message = decision.final_message
+            terminal_status = decision.result_status
+            _write_json(ack_path, {
+                "request_id": request_id,
+                "status": "holding" if decision.action == "CONTINUE" else terminal_status,
+                "phase": "monitor_decision",
+                "pid": os.getpid(),
+                "hold_id": hold_id,
+                "thread_id": thread_id,
+                "turn_id": turn_id,
+                "turn_count": turn_count,
+                "session_turn_count": turn_count,
+                "total_turn_count": total_turn_count,
+                "max_turns": max_turns,
+                "monitor_command": {
+                    "action": decision.action,
+                    "command_id": decision.command_id,
+                    "expected_turn_id": decision.expected_turn_id,
+                    "reason": decision.reason,
+                },
+                "observed_at": _now(),
+            })
+            if decision.action != "CONTINUE":
                 break
             started = client.start_turn_async(
                 thread_id,
-                continue_prompt,
-                client_user_message_id=f"{request_id}:continue:{turn_count + 1}",
+                str(decision.continue_prompt or continue_prompt),
+                client_user_message_id=decision.command_id,
                 model=request.get("model"),
                 reasoning_effort=request.get("reasoning_effort"),
                 on_phase=report,
             )
             turn_id = str(started.get("turn_id") or "").strip()
             if not turn_id:
-                raise RuntimeError("monitor continuation did not return turn_id")
+                raise RuntimeError("monitor continuation command did not return turn_id")
             turn_count += 1
             total_turn_count += 1
             _write_json(ack_path, {
@@ -139,7 +216,7 @@ def hold_task(
                 "pid": os.getpid(),
                 "thread_id": thread_id,
                 "turn_id": turn_id,
-                "monitor_id": monitor_id,
+                "hold_id": hold_id,
                 "turn_count": turn_count,
                 "session_turn_count": turn_count,
                 "total_turn_count": total_turn_count,
@@ -153,7 +230,7 @@ def hold_task(
             "pid": os.getpid(),
             "thread_id": thread_id,
             "turn_id": turn_id,
-            "monitor_id": monitor_id,
+            "hold_id": hold_id,
             "turn_count": turn_count,
             "session_turn_count": turn_count,
             "total_turn_count": total_turn_count,

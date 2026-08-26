@@ -1,4 +1,18 @@
-# Jarvis 0.1.6
+# Jarvis 0.1.8
+
+## Managed Hold lifecycle
+
+- Added `jarvis_hold` as the public lifecycle entry. It can create a task or
+  resume an existing task while retaining one explicit `hold_id`.
+- Moved continuation authority out of Hold. For each exact held turn, Monitor
+  reads terminal status and content before emitting one bound `CONTINUE` or
+  `STOP` command; Hold validates the command's hold and turn identity before it
+  starts another turn.
+- Added opt-in milestone and terminal notification events. They are persisted
+  locally and can be delivered only through a configured verified notifier with
+  a saved delivery readback; no notification is enabled by default.
+- New work is stored under `task-holds/`. Status reads and the user-host runner
+  retain compatibility with legacy `task-monitors/` state.
 
 ## MCP control surface
 

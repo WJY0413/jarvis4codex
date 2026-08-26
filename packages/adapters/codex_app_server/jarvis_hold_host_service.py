@@ -45,35 +45,36 @@ class JarvisHoldHost:
     def __init__(self, *, state_dir: Path, launcher_config: Path) -> None:
         self.state_dir = state_dir
         self.launcher_config = launcher_config
-        self.requests_root = state_dir / "task-monitors"
+        self.requests_roots = (state_dir / "task-holds", state_dir / "task-monitors")
         self.health_path = state_dir / "hold-host.json"
 
     def run_once(self) -> bool:
         self._write_health("ready")
-        if not self.requests_root.is_dir():
-            return False
-        for root in sorted(path for path in self.requests_root.iterdir() if path.is_dir()):
-            request_path = root / "request.json"
-            ack_path = root / "ack.json"
-            result_path = root / "result.json"
-            request = _read_json(request_path)
-            ack = _read_json(ack_path)
-            if request is None or ack is None or result_path.exists():
+        for requests_root in self.requests_roots:
+            if not requests_root.is_dir():
                 continue
-            if str(ack.get("status") or "") != "accepted":
-                continue
-            if str(ack.get("phase") or "") != "queued_for_user_host":
-                continue
-            _write_json(ack_path, {
-                **ack,
-                "phase": "claimed_by_user_host",
-                "host_pid": os.getpid(),
-                "observed_at": _now(),
-            })
-            self._write_health("holding", request_id=str(request.get("request_id") or ""))
-            hold_task(self.launcher_config, request_path, ack_path, result_path)
-            self._write_health("ready")
-            return True
+            for root in sorted(path for path in requests_root.iterdir() if path.is_dir()):
+                request_path = root / "request.json"
+                ack_path = root / "ack.json"
+                result_path = root / "result.json"
+                request = _read_json(request_path)
+                ack = _read_json(ack_path)
+                if request is None or ack is None or result_path.exists():
+                    continue
+                if str(ack.get("status") or "") != "accepted":
+                    continue
+                if str(ack.get("phase") or "") != "queued_for_user_host":
+                    continue
+                _write_json(ack_path, {
+                    **ack,
+                    "phase": "claimed_by_user_host",
+                    "host_pid": os.getpid(),
+                    "observed_at": _now(),
+                })
+                self._write_health("holding", request_id=str(request.get("request_id") or ""))
+                hold_task(self.launcher_config, request_path, ack_path, result_path)
+                self._write_health("ready")
+                return True
         return False
 
     def run_forever(self, *, poll_seconds: float) -> None:

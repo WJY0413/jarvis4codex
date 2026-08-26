@@ -1,13 +1,11 @@
-# Jarvis MCP v1
-
-The v0.1.7 release is archived at
-[`updates/history/JARVIS_MCP_V1_0.1.7.md`](../history/JARVIS_MCP_V1_0.1.7.md).
+# Jarvis MCP v0.1.8 (in progress)
 
 ## Scope
 
 The first MCP surface uses the official Python `mcp` SDK over stdio and exposes:
 
 - `jarvis_create`
+- `jarvis_hold`
 - `jarvis_read`
 - `jarvis_resume`
 - `jarvis_monitor`
@@ -20,8 +18,17 @@ The first MCP surface uses the official Python `mcp` SDK over stdio and exposes:
 
 The MCP server calls only `JarvisControl`. Its App Server provisioning adapter
 queues a durable create or resume request for the normal-user Hold Host, then
-returns an `accepted` receipt. The Hold Host reports `holding` once it owns the
-exact turn and a terminal receipt only after exact-turn readback.
+returns an `accepted` receipt. `jarvis_hold` is the managed lifecycle entry:
+Hold owns App Server execution while Monitor reads exact terminal status and
+content, then returns the sole `CONTINUE` or `STOP` command that Hold may
+execute. The Hold Host reports `holding` once it owns the exact turn and a
+terminal receipt only after that exact-turn readback.
+
+Managed holds persist under `task-holds/`; the Hold Host and readback adapter
+also accept legacy `task-monitors/` state so accepted work is not stranded.
+Milestone and terminal events are durable but disabled by default. If a verified
+notification adapter is configured, `jarvis_monitor` can deliver pending events
+and records the returned delivery receipt before marking an event sent.
 
 `jarvis_heartbeat` uses a separate local scheduler database and the computer's
 clock; it accepts only bounded structured calls to `JarvisControl.monitor`,

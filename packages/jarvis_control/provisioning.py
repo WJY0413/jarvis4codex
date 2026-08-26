@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
-from typing import Literal, Protocol
+from typing import Any, Literal, Mapping, Protocol
 
 
 ProvisionStatus = Literal["accepted", "holding", "running", "completed", "failed", "requires_readback", "partial"]
@@ -22,6 +22,8 @@ class TaskProvisionRequest:
     max_turns: int = 1
     auto_continue: bool = False
     continue_prompt: str = "继续"
+    hold_id: str | None = None
+    notifications: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         required = {
@@ -38,6 +40,19 @@ class TaskProvisionRequest:
             raise ValueError("max_turns must be a positive integer")
         if not self.continue_prompt.strip():
             raise ValueError("continue_prompt is required")
+        if self.hold_id is not None and not self.hold_id.strip():
+            raise ValueError("hold_id cannot be blank")
+        notifications = dict(self.notifications or {})
+        milestones = notifications.get("milestones") or []
+        if not isinstance(milestones, list):
+            raise ValueError("notifications.milestones must be a list")
+        try:
+            if any(int(turn) < 1 for turn in milestones):
+                raise ValueError("notifications.milestones must be positive")
+        except (TypeError, ValueError) as exc:
+            raise ValueError("notifications.milestones must contain positive integers") from exc
+        if "terminal" in notifications and not isinstance(notifications["terminal"], bool):
+            raise ValueError("notifications.terminal must be a boolean")
 
 
 @dataclass(frozen=True)
@@ -47,9 +62,13 @@ class TaskMonitorResumeRequest:
     prompt: str
     source_ref: str
     monitor_id: str | None = None
+    hold_id: str | None = None
     max_turns: int = 1
     model: str | None = None
     reasoning_effort: str | None = None
+    auto_continue: bool = False
+    continue_prompt: str = "继续"
+    notifications: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         required = {
@@ -63,6 +82,21 @@ class TaskMonitorResumeRequest:
             raise ValueError("required monitor-resume fields: " + ", ".join(missing))
         if not isinstance(self.max_turns, int) or self.max_turns < 1:
             raise ValueError("max_turns must be a positive integer")
+        if self.hold_id is not None and not self.hold_id.strip():
+            raise ValueError("hold_id cannot be blank")
+        if not self.continue_prompt.strip():
+            raise ValueError("continue_prompt is required")
+        notifications = dict(self.notifications or {})
+        milestones = notifications.get("milestones") or []
+        if not isinstance(milestones, list):
+            raise ValueError("notifications.milestones must be a list")
+        try:
+            if any(int(turn) < 1 for turn in milestones):
+                raise ValueError("notifications.milestones must be positive")
+        except (TypeError, ValueError) as exc:
+            raise ValueError("notifications.milestones must contain positive integers") from exc
+        if "terminal" in notifications and not isinstance(notifications["terminal"], bool):
+            raise ValueError("notifications.terminal must be a boolean")
 
 
 @dataclass(frozen=True)
@@ -77,6 +111,7 @@ class TaskProvisionReceipt:
     error_code: str | None = None
     phase: str | None = None
     monitor_id: str | None = None
+    hold_id: str | None = None
     turn_count: int | None = None
     total_turn_count: int | None = None
     max_turns: int | None = None

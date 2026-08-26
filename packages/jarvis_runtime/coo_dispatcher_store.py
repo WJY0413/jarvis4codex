@@ -699,9 +699,24 @@ class DispatcherStore:
         ).encode("utf-8")
         idempotency_key = "jarvis-" + hashlib.sha256(stable).hexdigest()[:32]
         with ProcessLock(self.lock_path):
-            for record in iter_jsonl(self.outbox_path):
-                if record.get("idempotency_key") == idempotency_key:
-                    return {"queued": False, "duplicate": True, "record": record}
+            records = list(iter_jsonl(self.outbox_path))
+            repeated = 0
+            for record in reversed(records):
+                if (
+                    str(record.get("recipient") or "") == str(request["recipient"])
+                    and str(record.get("content") or "") == str(request["content"])
+                ):
+                    repeated += 1
+                    continue
+                break
+            if repeated >= 5:
+                return {
+                    "queued": False,
+                    "duplicate": True,
+                    "reason": "consecutive_identical_message_limit",
+                    "record": records[-1] if records else None,
+                }
+            idempotency_key = f"{idempotency_key}:repeat:{repeated + 1}"
             record = dict(request)
             record.update(
                 {

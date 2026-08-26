@@ -47,6 +47,8 @@ class JarvisControl:
         max_turns: int = 1,
         auto_continue: bool = False,
         continue_prompt: str = "继续",
+        hold_id: str | None = None,
+        notifications: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         if self._provisioner is None:
             return self.unsupported(
@@ -64,6 +66,8 @@ class JarvisControl:
                 max_turns=max_turns,
                 auto_continue=auto_continue,
                 continue_prompt=continue_prompt,
+                hold_id=hold_id,
+                notifications=notifications,
             ))
         except ValueError as exc:
             return self._receipt("jarvis_create", "invalid_request", request_id=request_id, reason=str(exc))
@@ -81,6 +85,62 @@ class JarvisControl:
             },
         )
 
+    def hold(
+        self,
+        *,
+        request_id: str,
+        prompt: str,
+        source_ref: str,
+        task_id: str | None = None,
+        project: str | None = None,
+        title: str | None = None,
+        hold_id: str | None = None,
+        model: str | None = None,
+        reasoning_effort: str | None = None,
+        max_turns: int = 1,
+        auto_continue: bool = False,
+        continue_prompt: str = "继续",
+        notifications: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Start or resume a lifecycle: Hold executes and Monitor controls continuation."""
+        if task_id:
+            receipt = self.resume(
+                request_id=request_id,
+                task_id=task_id,
+                prompt=prompt,
+                source_ref=source_ref,
+                model=model,
+                reasoning_effort=reasoning_effort,
+                hold_id=hold_id,
+                max_turns=max_turns,
+                auto_continue=auto_continue,
+                continue_prompt=continue_prompt,
+                notifications=notifications,
+            )
+            receipt["tool"] = "jarvis_hold"
+            return receipt
+        if project is None or title is None:
+            return self._receipt(
+                "jarvis_hold", "invalid_request", request_id=request_id,
+                reason="project and title are required when task_id is omitted",
+            )
+        receipt = self.create(
+            request_id=request_id,
+            project=project,
+            title=title,
+            prompt=prompt,
+            source_ref=source_ref,
+            model=model,
+            reasoning_effort=reasoning_effort,
+            max_turns=max_turns,
+            auto_continue=auto_continue,
+            continue_prompt=continue_prompt,
+            hold_id=hold_id,
+            notifications=notifications,
+        )
+        receipt["tool"] = "jarvis_hold"
+        return receipt
+
     def resume(
         self,
         *,
@@ -92,15 +152,20 @@ class JarvisControl:
         reasoning_effort: str | None = None,
         hold_with_monitor: bool = False,
         monitor_id: str | None = None,
+        hold_id: str | None = None,
         max_turns: int = 1,
+        auto_continue: bool = False,
+        continue_prompt: str = "继续",
+        notifications: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         # Kept only for wire compatibility. All public resume calls are now monitor-owned.
         del hold_with_monitor
         try:
             request = TaskMonitorResumeRequest(
                 request_id=request_id, task_id=task_id, prompt=prompt, source_ref=source_ref,
-                monitor_id=monitor_id, max_turns=max_turns, model=model,
-                reasoning_effort=reasoning_effort,
+                monitor_id=monitor_id, hold_id=hold_id, max_turns=max_turns, model=model,
+                reasoning_effort=reasoning_effort, auto_continue=auto_continue,
+                continue_prompt=continue_prompt, notifications=notifications,
             )
         except ValueError as exc:
             return self._receipt("jarvis_resume", "invalid_request", request_id=request_id, reason=str(exc))
@@ -118,7 +183,9 @@ class JarvisControl:
                 readback={"verified": provision.status in {"holding", "running"}, "terminal": False},
         )
 
-    def read(self, *, subject: str, task_id: str | None = None) -> dict[str, Any]:
+    def read(
+        self, *, subject: str, task_id: str | None = None, hold_id: str | None = None
+    ) -> dict[str, Any]:
         if subject == "capabilities":
             return self._receipt(
                 "jarvis_read",
@@ -127,6 +194,11 @@ class JarvisControl:
                     "jarvis_create": {
                         "available": self._provisioner is not None,
                         "reason": None if self._provisioner is not None else "no task-creation adapter is configured",
+                    },
+                    "jarvis_hold": {
+                        "available": self._provisioner is not None,
+                        "owns_execution": True,
+                        "monitor_controls_continuation": True,
                     },
                     "jarvis_read": {"available": True, "read_only": True},
                     "jarvis_resume": {
@@ -166,14 +238,25 @@ class JarvisControl:
                     ],
                 },
             )
-        return self._receipt("jarvis_read", "invalid_request", reason="subject must be capabilities or thread")
+        if subject == "hold":
+            if not hold_id or not hold_id.strip():
+                return self._receipt("jarvis_read", "invalid_request", reason="hold_id is required for subject=hold")
+            status_reader = getattr(self._provisioner, "hold_status", None)
+            if not callable(status_reader):
+                return self._receipt("jarvis_read", "unsupported", reason="no managed-hold status adapter is configured")
+            try:
+                data = status_reader(hold_id)
+            except Exception as exc:
+                return self._receipt("jarvis_read", "failed", reason=str(exc))
+            return self._receipt("jarvis_read", "completed", data=data)
+        return self._receipt("jarvis_read", "invalid_request", reason="subject must be capabilities, thread, or hold")
 
     def monitor(
         self,
         *,
         action: str,
         request_id: str,
-        monitor_id: str,
+        monitor_id: str | None = None,
         source_ref: str,
         observed_task_id: str | None = None,
         receipt_task_id: str | None = None,
@@ -181,19 +264,69 @@ class JarvisControl:
         prompt: str | None = None,
         model: str | None = None,
         reasoning_effort: str | None = None,
+        hold_id: str | None = None,
     ) -> dict[str, Any]:
         if action == "status":
-            status_reader = getattr(self._provisioner, "monitor_status", None)
+            status_reader = getattr(self._provisioner, "hold_status", None)
+            if not callable(status_reader):
+                status_reader = getattr(self._provisioner, "monitor_status", None)
             if not callable(status_reader):
                 return self._receipt("jarvis_monitor", "unsupported", request_id=request_id, reason="no task monitor status adapter is configured")
             try:
-                data = status_reader(monitor_id)
+                target_hold_id = hold_id or monitor_id
+                if not target_hold_id:
+                    return self._receipt(
+                        "jarvis_monitor", "invalid_request", request_id=request_id,
+                        reason="hold_id is required for action=status",
+                    )
+                data = status_reader(target_hold_id)
             except Exception as exc:
                 return self._receipt("jarvis_monitor", "failed", request_id=request_id, reason=str(exc))
             return self._receipt("jarvis_monitor", "completed", request_id=request_id, data=data)
+        if action == "deliver_hold_notifications":
+            if not hold_id:
+                return self._receipt(
+                    "jarvis_monitor", "invalid_request", request_id=request_id,
+                    reason="hold_id is required for action=deliver_hold_notifications",
+                )
+            if self._notifier is None:
+                return self.unsupported(
+                    tool="jarvis_monitor", reason="no verified notification adapter is configured"
+                )
+            pending_reader = getattr(self._provisioner, "pending_hold_notifications", None)
+            recorder = getattr(self._provisioner, "record_hold_notification_delivery", None)
+            if not callable(pending_reader) or not callable(recorder):
+                return self._receipt(
+                    "jarvis_monitor", "unsupported", request_id=request_id,
+                    reason="no managed-hold notification event adapter is configured",
+                )
+            deliveries: list[dict[str, Any]] = []
+            for event in pending_reader(hold_id):
+                event_id = str(event.get("event_id") or "").strip()
+                if not event_id:
+                    continue
+                delivery = dict(self._notifier.notify(
+                    request_id=f"{request_id}:{event_id}",
+                    source_ref=source_ref,
+                    message=str(event.get("message") or ""),
+                ))
+                recorder(hold_id, event_id, delivery)
+                deliveries.append({"event_id": event_id, **delivery})
+            verified = bool(deliveries) and all(
+                item.get("delivery_status") == "delivered" and item.get("message_id")
+                for item in deliveries
+            )
+            return self._receipt(
+                "jarvis_monitor", "completed" if verified else "requires_readback",
+                request_id=request_id,
+                data={"hold_id": hold_id, "deliveries": deliveries},
+                readback={"verified": verified, "terminal": False},
+            )
         capability = {"observe": "monitor.observe", "terminal_resume": "monitor.terminal_resume"}.get(action)
         if capability is None:
-            return self._receipt("jarvis_monitor", "invalid_request", request_id=request_id, reason="action must be observe, terminal_resume, or status")
+            return self._receipt("jarvis_monitor", "invalid_request", request_id=request_id, reason="action must be observe, terminal_resume, status, or deliver_hold_notifications")
+        if not monitor_id or not monitor_id.strip():
+            return self._receipt("jarvis_monitor", "invalid_request", request_id=request_id, reason="monitor_id is required for action=" + action)
         if not observed_task_id or not receipt_task_id:
             return self._receipt("jarvis_monitor", "invalid_request", request_id=request_id, reason="observed_task_id and receipt_task_id are required")
         return self._invoke(

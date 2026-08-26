@@ -27,11 +27,12 @@ class TaskProvisioningAdapterContractTest(unittest.TestCase):
                 request_id="create-1", project="Jarvis4codex", title="TEST Worker",
                 prompt="hello", source_ref="mcp:test", max_turns=2,
             ))
-            state = adapter.monitor_status("monitor-create-1")
+            state = adapter.hold_status("hold-create-1")
 
         self.assertEqual(receipt.status, "accepted")
         self.assertEqual(receipt.phase, "queued_for_user_host")
-        self.assertEqual(receipt.monitor_id, "monitor-create-1")
+        self.assertEqual(receipt.hold_id, "hold-create-1")
+        self.assertEqual(receipt.monitor_id, "hold-create-1")
         self.assertEqual(state["status"], "accepted")
         self.assertEqual(state["phase"], "queued_for_user_host")
         self.assertEqual(config.project, "Jarvis4codex")
@@ -39,7 +40,7 @@ class TaskProvisioningAdapterContractTest(unittest.TestCase):
     def test_existing_active_hold_cannot_be_resumed_a_second_time(self):
         config = FakeConfig()
         with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp) / "task-monitors" / "monitor-create-1"
+            root = Path(temp) / "task-holds" / "hold-create-1"
             root.mkdir(parents=True)
             (root / "ack.json").write_text(json.dumps({
                 "status": "holding", "turn_count": 1, "total_turn_count": 4, "max_turns": 3,
@@ -49,7 +50,7 @@ class TaskProvisioningAdapterContractTest(unittest.TestCase):
             )
             receipt = adapter.resume_with_monitor(TaskMonitorResumeRequest(
                 request_id="resume-2", task_id="thread-created-1", prompt="继续",
-                source_ref="mcp:test", monitor_id="monitor-create-1",
+                source_ref="mcp:test", hold_id="hold-create-1",
             ))
 
         self.assertEqual(receipt.status, "failed")
@@ -58,7 +59,7 @@ class TaskProvisioningAdapterContractTest(unittest.TestCase):
     def test_resume_archives_the_previous_terminal_receipt_before_queueing(self):
         config = FakeConfig()
         with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp) / "task-monitors" / "monitor-create-1"
+            root = Path(temp) / "task-holds" / "hold-create-1"
             root.mkdir(parents=True)
             (root / "result.json").write_text(json.dumps({
                 "request_id": "create-1", "status": "turn_limit_reached",
@@ -69,9 +70,9 @@ class TaskProvisioningAdapterContractTest(unittest.TestCase):
             )
             receipt = adapter.resume_with_monitor(TaskMonitorResumeRequest(
                 request_id="resume-2", task_id="thread-created-1", prompt="继续",
-                source_ref="mcp:test", monitor_id="monitor-create-1",
+                source_ref="mcp:test", hold_id="hold-create-1",
             ))
-            queued = adapter.monitor_status("monitor-create-1")
+            queued = adapter.hold_status("hold-create-1")
             archived = root / "history" / "create-1.result.json"
             archived_exists = archived.is_file()
 
@@ -79,6 +80,21 @@ class TaskProvisioningAdapterContractTest(unittest.TestCase):
         self.assertEqual(receipt.total_turn_count, 3)
         self.assertEqual(queued["request_id"], "resume-2")
         self.assertTrue(archived_exists)
+
+    def test_status_reads_a_legacy_task_monitor_directory_without_migration(self):
+        config = FakeConfig()
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "task-monitors" / "monitor-legacy-1"
+            root.mkdir(parents=True)
+            (root / "result.json").write_text(json.dumps({
+                "request_id": "legacy-1", "status": "completed",
+            }), encoding="utf-8")
+            adapter = CodexAppServerTaskProvisioningAdapter(
+                "unused.json", state_dir=Path(temp), config_loader=lambda _: config
+            )
+            state = adapter.hold_status("monitor-legacy-1")
+
+        self.assertEqual(state["request_id"], "legacy-1")
 
 
 if __name__ == "__main__":

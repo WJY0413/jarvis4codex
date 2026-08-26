@@ -93,12 +93,13 @@ class JarvisMcpContractTest(unittest.TestCase):
                 return await client.call_tool(name, arguments)
         return asyncio.run(run())
 
-    def test_lists_the_six_public_jarvis_tools_with_sdk_generated_schema(self):
+    def test_lists_the_seven_public_jarvis_tools_with_sdk_generated_schema(self):
         result = self.list_tools()
         self.assertEqual(
             [tool.name for tool in result.tools],
             [
                 "jarvis_create",
+                "jarvis_hold",
                 "jarvis_read",
                 "jarvis_resume",
                 "jarvis_monitor",
@@ -225,6 +226,35 @@ class JarvisMcpContractTest(unittest.TestCase):
         self.assertEqual(create.structured_content["status"], "unsupported")
         self.assertEqual(notify.structured_content["status"], "unsupported")
 
+    def test_hold_is_the_public_managed_lifecycle_entry(self):
+        class Provisioner:
+            def provision(self, request):
+                from jarvis_control import TaskProvisionReceipt
+                from jarvis_control.provisioning import observed_now
+                self.request = request
+                return TaskProvisionReceipt(
+                    request_id=request.request_id, status="accepted", observed_at=observed_now(),
+                    hold_id=request.hold_id or "hold-create-1", monitor_id=request.hold_id or "hold-create-1",
+                )
+
+        provisioner = Provisioner()
+        server = JarvisMcpServer(JarvisControl(self.capability_port, self.bridge, provisioner))
+
+        async def run():
+            async with Client(server.mcp) as client:
+                return await client.call_tool("jarvis_hold", {
+                    "project": "Jarvis4codex", "title": "TEST Worker", "prompt": "hello",
+                    "request_id": "hold-1", "hold_id": "hold-contract-1",
+                    "auto_continue": True, "notifications": {"milestones": [2], "terminal": True},
+                })
+
+        result = asyncio.run(run())
+        self.assertFalse(result.is_error)
+        self.assertEqual(result.structured_content["tool"], "jarvis_hold")
+        self.assertEqual(provisioner.request.hold_id, "hold-contract-1")
+        self.assertTrue(provisioner.request.auto_continue)
+        self.assertEqual(provisioner.request.notifications, {"milestones": [2], "terminal": True})
+
     def test_create_delegates_to_a_configured_provisioner_and_returns_exact_identity(self):
         class Provisioner:
             def provision(self, request):
@@ -281,6 +311,39 @@ class JarvisMcpContractTest(unittest.TestCase):
         self.assertFalse(result.is_error)
         self.assertEqual(result.structured_content["data"]["turn_count"], 1)
         self.assertEqual(result.structured_content["data"]["max_turns"], 2)
+
+    def test_monitor_delivers_pending_hold_notifications_with_saved_readback(self):
+        class Provisioner:
+            def __init__(self):
+                self.recorded = []
+
+            def pending_hold_notifications(self, hold_id):
+                self.hold_id = hold_id
+                return [{
+                    "event_id": "terminal:turn-1",
+                    "message": "JARVIS_HOLD_TERMINAL_V1 hold-1 completed",
+                }]
+
+            def record_hold_notification_delivery(self, hold_id, event_id, delivery):
+                self.recorded.append((hold_id, event_id, delivery))
+
+        class Notifier:
+            def notify(self, **kwargs):
+                self.kwargs = kwargs
+                return {"delivery_status": "delivered", "message_id": "feishu-1"}
+
+        provisioner = Provisioner()
+        notifier = Notifier()
+        control = JarvisControl(self.capability_port, self.bridge, provisioner, notifier)
+        receipt = control.monitor(
+            action="deliver_hold_notifications", request_id="notify-1", source_ref="mcp:test",
+            hold_id="hold-1",
+        )
+
+        self.assertEqual(receipt["status"], "completed")
+        self.assertTrue(receipt["readback"]["verified"])
+        self.assertEqual(provisioner.recorded[0][0:2], ("hold-1", "terminal:turn-1"))
+        self.assertEqual(notifier.kwargs["request_id"], "notify-1:terminal:turn-1")
 
 
 if __name__ == "__main__":

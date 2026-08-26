@@ -12,18 +12,19 @@ from jarvis_control import JarvisControl
 
 
 class JarvisMcpServer:
-    """Register the six first-priority Jarvis tools on the official MCP SDK."""
+    """Register the public Jarvis control tools on the official MCP SDK."""
 
     def __init__(self, control: JarvisControl) -> None:
         self.control = control
         self.mcp = MCPServer(
             "jarvis-control",
             title="Jarvis Control Plane",
-            version="0.1.6",
+            version="0.1.8",
             instructions=(
                 "Use jarvis_read before a state-changing call when you need capability or thread context. "
-                "Create and resume are hold-owned: a holding receipt verifies an exact turn held by Jarvis. "
-                "Use monitor or read for terminal state."
+                "Use jarvis_hold for a managed lifecycle: Hold executes turns and Monitor issues a verified "
+                "CONTINUE or STOP command only after exact terminal and content readback. "
+                "Use jarvis_read subject=hold for lifecycle state and jarvis_monitor only for status or notification delivery."
             ),
         )
         self._register_tools()
@@ -49,6 +50,8 @@ class JarvisMcpServer:
             max_turns: int = 1,
             auto_continue: bool = False,
             continue_prompt: str = "继续",
+            hold_id: str | None = None,
+            notifications: dict[str, Any] | None = None,
         ) -> CallToolResult:
             return _tool_result(self.control.create(
                 request_id=request_id,
@@ -61,6 +64,44 @@ class JarvisMcpServer:
                 max_turns=max_turns,
                 auto_continue=auto_continue,
                 continue_prompt=continue_prompt,
+                hold_id=hold_id,
+                notifications=notifications,
+            ))
+
+        @self.mcp.tool(
+            name="jarvis_hold",
+            description="Start one managed lifecycle. Hold executes turns; Monitor issues CONTINUE or STOP only after exact terminal and content readback.",
+            annotations=ToolAnnotations(destructiveHint=False, idempotentHint=False, openWorldHint=False),
+        )
+        def jarvis_hold(
+            request_id: str,
+            prompt: str,
+            source_ref: str = "mcp:jarvis_hold",
+            task_id: str | None = None,
+            project: str | None = None,
+            title: str | None = None,
+            hold_id: str | None = None,
+            model: str | None = None,
+            reasoning_effort: str | None = None,
+            max_turns: int = 1,
+            auto_continue: bool = False,
+            continue_prompt: str = "继续",
+            notifications: dict[str, Any] | None = None,
+        ) -> CallToolResult:
+            return _tool_result(self.control.hold(
+                request_id=request_id,
+                prompt=prompt,
+                source_ref=source_ref,
+                task_id=task_id,
+                project=project,
+                title=title,
+                hold_id=hold_id,
+                model=model,
+                reasoning_effort=reasoning_effort,
+                max_turns=max_turns,
+                auto_continue=auto_continue,
+                continue_prompt=continue_prompt,
+                notifications=notifications,
             ))
 
         @self.mcp.tool(
@@ -68,8 +109,12 @@ class JarvisMcpServer:
             description="Read Jarvis capability availability or a known existing task. This tool does not change state.",
             annotations=ToolAnnotations(readOnlyHint=True, idempotentHint=True, openWorldHint=False),
         )
-        def jarvis_read(subject: Literal["capabilities", "thread"], task_id: str | None = None) -> CallToolResult:
-            return _tool_result(self.control.read(subject=subject, task_id=task_id))
+        def jarvis_read(
+            subject: Literal["capabilities", "thread", "hold"],
+            task_id: str | None = None,
+            hold_id: str | None = None,
+        ) -> CallToolResult:
+            return _tool_result(self.control.read(subject=subject, task_id=task_id, hold_id=hold_id))
 
         @self.mcp.tool(
             name="jarvis_resume",
@@ -85,12 +130,18 @@ class JarvisMcpServer:
             reasoning_effort: str | None = None,
             hold_with_monitor: bool = True,
             monitor_id: str | None = None,
+            hold_id: str | None = None,
             max_turns: int = 1,
+            auto_continue: bool = False,
+            continue_prompt: str = "继续",
+            notifications: dict[str, Any] | None = None,
         ) -> CallToolResult:
             return _tool_result(self.control.resume(
                 request_id=request_id, task_id=task_id, prompt=prompt, source_ref=source_ref,
                 model=model, reasoning_effort=reasoning_effort,
-                hold_with_monitor=hold_with_monitor, monitor_id=monitor_id, max_turns=max_turns,
+                hold_with_monitor=hold_with_monitor, monitor_id=monitor_id, hold_id=hold_id,
+                max_turns=max_turns, auto_continue=auto_continue,
+                continue_prompt=continue_prompt, notifications=notifications,
             ))
 
         @self.mcp.tool(
@@ -99,22 +150,23 @@ class JarvisMcpServer:
             annotations=ToolAnnotations(idempotentHint=True, openWorldHint=False),
         )
         def jarvis_monitor(
-            action: Literal["observe", "terminal_resume", "status"],
+            action: Literal["observe", "terminal_resume", "status", "deliver_hold_notifications"],
             request_id: str,
-            monitor_id: str,
             source_ref: str = "mcp:jarvis_monitor",
+            monitor_id: str | None = None,
             observed_task_id: str | None = None,
             receipt_task_id: str | None = None,
             resume_task_id: str | None = None,
             prompt: str | None = None,
             model: str | None = None,
             reasoning_effort: str | None = None,
+            hold_id: str | None = None,
         ) -> CallToolResult:
             return _tool_result(self.control.monitor(
                 action=action, request_id=request_id, monitor_id=monitor_id,
                 source_ref=source_ref, observed_task_id=observed_task_id,
                 receipt_task_id=receipt_task_id, resume_task_id=resume_task_id, prompt=prompt,
-                model=model, reasoning_effort=reasoning_effort,
+                model=model, reasoning_effort=reasoning_effort, hold_id=hold_id,
             ))
 
         @self.mcp.tool(
