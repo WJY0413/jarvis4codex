@@ -93,13 +93,14 @@ class JarvisMcpContractTest(unittest.TestCase):
                 return await client.call_tool(name, arguments)
         return asyncio.run(run())
 
-    def test_lists_the_seven_public_jarvis_tools_with_sdk_generated_schema(self):
+    def test_lists_the_eight_public_jarvis_tools_with_sdk_generated_schema(self):
         result = self.list_tools()
         self.assertEqual(
             [tool.name for tool in result.tools],
             [
                 "jarvis_create",
                 "jarvis_hold",
+                "jarvis_loop",
                 "jarvis_read",
                 "jarvis_resume",
                 "jarvis_monitor",

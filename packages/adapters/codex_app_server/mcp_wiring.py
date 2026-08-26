@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from jarvis_codex_bridge import ExistingThreadBridge, JarvisCapabilityPort, JsonlReceiptJournal, ThreadTerminalMonitor
-from jarvis_control import JarvisControl
+from jarvis_control import JarvisControl, LoopController, LoopStore
 
 from .task_provisioning_adapter import CodexAppServerTaskProvisioningAdapter
 from adapters.feishu_outbox_notification import (
@@ -47,6 +47,7 @@ def build_jarvis_control(
             launcher_config_path,
             state_dir=state_dir,
         ),
+        loop_controller=LoopController(LoopStore(state_dir / "loops")),
         notifier=(
             FeishuOutboxNotificationPort(FeishuOutboxNotificationConfig.load(notification_config_path))
             if notification_config_path is not None else None

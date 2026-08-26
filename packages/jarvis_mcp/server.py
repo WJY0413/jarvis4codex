@@ -105,6 +105,35 @@ class JarvisMcpServer:
             ))
 
         @self.mcp.tool(
+            name="jarvis_loop",
+            description="Start, inspect, or stop one bounded Jarvis loop using the existing Hold, Monitor, and heartbeat contracts.",
+            annotations=ToolAnnotations(destructiveHint=False, idempotentHint=False, openWorldHint=False),
+        )
+        def jarvis_loop(
+            action: Literal["start", "status", "stop"] = "start",
+            loop_id: str | None = None,
+            request_id: str | None = None,
+            project: str | None = None,
+            title: str | None = None,
+            prompt: str | None = None,
+            target_thread_count: int | None = None,
+            threads: list[dict[str, Any]] | None = None,
+            max_rounds: int | None = None,
+            max_turns: int | None = None,
+            auto_continue: bool = False,
+            interval_seconds: int | None = None,
+            expires_at: str | None = None,
+            continue_prompt: str = "继续",
+        ) -> CallToolResult:
+            return _tool_result(self.control.loop(
+                action=action, loop_id=loop_id, request_id=request_id, project=project,
+                title=title, prompt=prompt, target_thread_count=target_thread_count,
+                threads=threads, max_rounds=max_rounds, max_turns=max_turns,
+                auto_continue=auto_continue, interval_seconds=interval_seconds,
+                expires_at=expires_at, continue_prompt=continue_prompt,
+            ))
+
+        @self.mcp.tool(
             name="jarvis_read",
             description="Read Jarvis capability availability or a known existing task. This tool does not change state.",
             annotations=ToolAnnotations(readOnlyHint=True, idempotentHint=True, openWorldHint=False),

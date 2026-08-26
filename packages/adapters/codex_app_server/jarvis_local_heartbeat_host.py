@@ -52,6 +52,8 @@ class JarvisControlFunctionRunner:
                 resume_task_id=arguments.get("resume_task_id"), prompt=arguments.get("prompt"),
                 model=arguments.get("model"), reasoning_effort=arguments.get("reasoning_effort"),
             )
+        if function_name == "JarvisControl.loop_tick":
+            return self._control.loop(action="tick", loop_id=str(arguments.get("loop_id") or ""))
         return {"status": "failed", "reason": f"unsupported heartbeat function: {function_name}"}
 
 

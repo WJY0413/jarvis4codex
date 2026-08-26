@@ -23,6 +23,7 @@ ALLOWED_FUNCTIONS = {
     "JarvisControl.monitor",
     "JarvisControl.resume",
     "JarvisControl.notify",
+    "JarvisControl.loop_tick",
 }
 
 

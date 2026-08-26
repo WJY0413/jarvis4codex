@@ -74,6 +74,11 @@ class LocalHeartbeatTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "prompt"):
             self.store.create(invalid)
 
+    def test_loop_tick_is_an_allowed_scheduler_function(self) -> None:
+        request = {**self.request(), "function": "JarvisControl.loop_tick", "arguments": {"loop_id": "loop-1"}}
+        heartbeat = self.store.create(request)["heartbeat"]
+        self.assertEqual(heartbeat["function_name"], "JarvisControl.loop_tick")
+
 
 if __name__ == "__main__":
     unittest.main()

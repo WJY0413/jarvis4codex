@@ -6,6 +6,7 @@ from typing import Any, Mapping, Protocol
 
 from jarvis_codex_bridge import CapabilityRequest, ExistingThreadBridge, JarvisCapabilityPort
 
+from .loop import LoopController
 from .provisioning import TaskMonitorResumeRequest, TaskProvisionRequest, TaskProvisioningPort
 
 
@@ -28,11 +29,33 @@ class JarvisControl:
         bridge: ExistingThreadBridge,
         provisioner: TaskProvisioningPort | None = None,
         notifier: NotificationPort | None = None,
+        loop_controller: LoopController | None = None,
     ) -> None:
         self._capabilities = capabilities
         self._bridge = bridge
         self._provisioner = provisioner
         self._notifier = notifier
+        self._loop_controller = loop_controller
+
+    def loop(self, *, action: str, loop_id: str | None = None, **options: Any) -> dict[str, Any]:
+        """Use the existing Hold, Monitor and heartbeat ports as one bounded loop."""
+        if self._loop_controller is None:
+            return self.unsupported(tool="jarvis_loop", reason="no loop controller is configured")
+        if action == "start":
+            result = self._loop_controller.start(self, **options)
+        elif action == "tick":
+            result = self._loop_controller.tick(self, loop_id=str(loop_id or ""))
+        elif action == "status":
+            result = self._loop_controller.status(loop_id=str(loop_id or ""))
+        elif action == "stop":
+            result = self._loop_controller.stop(self, loop_id=str(loop_id or ""))
+        else:
+            return self._receipt("jarvis_loop", "invalid_request", reason="action must be start, status, or stop")
+        return self._receipt(
+            "jarvis_loop", result.status, request_id=options.get("request_id"),
+            reason=result.reason, data=result.data,
+            readback={"verified": result.status not in {"invalid_request", "blocked"}, "terminal": result.status in {"completed", "stopped", "expired"}},
+        )
 
     def create(
         self,
@@ -199,6 +222,10 @@ class JarvisControl:
                         "available": self._provisioner is not None,
                         "owns_execution": True,
                         "monitor_controls_continuation": True,
+                    },
+                    "jarvis_loop": {
+                        "available": self._loop_controller is not None,
+                        "requires_hold_monitor_and_heartbeat": True,
                     },
                     "jarvis_read": {"available": True, "read_only": True},
                     "jarvis_resume": {
