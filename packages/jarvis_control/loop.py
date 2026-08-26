@@ -95,6 +95,8 @@ class LoopController:
             "schema": "jarvis-loop-state/v1", "loop_id": loop_id, "request_id": request["request_id"],
             "project": request["project"], "max_rounds": request["max_rounds"], "max_turns": request["max_turns"],
             "auto_continue": request["auto_continue"], "continue_prompt": request["continue_prompt"],
+            "model": request["model"], "reasoning_effort": request["reasoning_effort"],
+            "notifications": request["notifications"],
             "interval_seconds": request["interval_seconds"], "expires_at": request["expires_at"],
             "target_thread_count": request["target_thread_count"], "status": "acquiring",
             "heartbeat_id": f"heartbeat-{loop_id}", "heartbeat": None, "children": [],
@@ -107,8 +109,9 @@ class LoopController:
                 source_ref=f"jarvis_loop:{loop_id}:{child['slot']}", task_id=child.get("task_id"),
                 project=request["project"] if child["acquire"] == "create" else None,
                 title=child.get("title"), hold_id=f"{loop_id}:{child['slot']}",
+                model=request["model"], reasoning_effort=request["reasoning_effort"],
                 max_turns=request["max_turns"], auto_continue=request["auto_continue"],
-                continue_prompt=request["continue_prompt"],
+                continue_prompt=request["continue_prompt"], notifications=request["notifications"],
             )
             child["last_receipt"] = receipt
             child["hold_id"] = _nested_text(receipt, "data", "monitor_id") or _nested_text(receipt, "data", "hold_id")
@@ -165,8 +168,9 @@ class LoopController:
             receipt = runtime.hold(
                 request_id=f"{loop_id}:{child['slot']}:round-{next_round}", task_id=child["thread_id"],
                 prompt=state["continue_prompt"], source_ref=f"jarvis_loop:{loop_id}:{child['slot']}",
+                model=state["model"], reasoning_effort=state["reasoning_effort"],
                 hold_id=child["hold_id"], max_turns=state["max_turns"], auto_continue=state["auto_continue"],
-                continue_prompt=state["continue_prompt"],
+                continue_prompt=state["continue_prompt"], notifications=state["notifications"],
             )
             child["last_receipt"] = receipt
             if receipt.get("status") in ACTIVE:
@@ -232,7 +236,7 @@ class LoopController:
 
     @staticmethod
     def _result(state: Mapping[str, Any]) -> LoopResult:
-        data = {key: state.get(key) for key in ("loop_id", "project", "status", "target_thread_count", "heartbeat_id", "heartbeat", "max_rounds", "max_turns", "interval_seconds", "expires_at", "children")}
+        data = {key: state.get(key) for key in ("loop_id", "project", "status", "target_thread_count", "heartbeat_id", "heartbeat", "max_rounds", "max_turns", "auto_continue", "continue_prompt", "model", "reasoning_effort", "notifications", "interval_seconds", "expires_at", "children")}
         return LoopResult(str(state["status"]), str(state["loop_id"]), data)
 
 
@@ -246,13 +250,20 @@ def _validate_start(raw: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError("target_thread_count must be a positive integer")
     if not isinstance(max_rounds, int) or max_rounds < 1:
         raise ValueError("max_rounds must be a positive integer")
-    max_turns = raw.get("max_turns", 1)
+    max_turns = raw.get("max_turns", 999)
     interval = raw.get("interval_seconds", 1800)
+    if max_turns is None:
+        max_turns = 999
+    if interval is None:
+        interval = 1800
     if not isinstance(max_turns, int) or max_turns < 1:
         raise ValueError("max_turns must be a positive integer")
     if not isinstance(interval, int) or interval < 1:
         raise ValueError("interval_seconds must be a positive integer")
-    if not isinstance(raw.get("auto_continue", False), bool):
+    auto_continue = raw.get("auto_continue", True)
+    if auto_continue is None:
+        auto_continue = True
+    if not isinstance(auto_continue, bool):
         raise ValueError("auto_continue must be a boolean")
     expires = _parse_time(raw["expires_at"])
     if expires <= datetime.now(timezone.utc):
@@ -287,10 +298,21 @@ def _validate_start(raw: Mapping[str, Any]) -> dict[str, Any]:
             if not child["task_id"]:
                 raise ValueError("resume thread requires task_id")
         normalized.append(child)
+    notifications = raw.get("notifications", True)
+    if notifications is None:
+        notifications = True
+    if isinstance(notifications, bool):
+        notifications = {"milestones": [], "terminal": notifications}
+    elif isinstance(notifications, Mapping):
+        notifications = dict(notifications)
+    else:
+        raise ValueError("notifications must be a boolean or object")
     return {"request_id": str(raw["request_id"]).strip(), "project": str(raw["project"]).strip(), "threads": normalized,
             "target_thread_count": target_count, "max_rounds": max_rounds, "max_turns": max_turns,
-            "auto_continue": raw.get("auto_continue", False), "continue_prompt": str(raw.get("continue_prompt") or "继续").strip() or "继续",
-            "interval_seconds": interval, "expires_at": expires.isoformat()}
+            "auto_continue": auto_continue, "continue_prompt": str(raw.get("continue_prompt") or "继续").strip() or "继续",
+            "model": str(raw.get("model") or "gpt-5.6-luna").strip() or "gpt-5.6-luna",
+            "reasoning_effort": str(raw.get("reasoning_effort") or "max").strip() or "max",
+            "notifications": notifications, "interval_seconds": interval, "expires_at": expires.isoformat()}
 
 
 def _nested_text(value: Mapping[str, Any], *keys: str) -> str | None:

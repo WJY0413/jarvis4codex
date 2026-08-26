@@ -62,6 +62,43 @@ class JarvisLoopContractTest(unittest.TestCase):
         self.assertEqual(completed.status, "completed")
         self.assertEqual(self.runtime.heartbeat_calls[-1]["action"], "cancel")
 
+    def test_confirmed_defaults_create_every_omitted_thread_and_reach_hold(self):
+        started = self.controller.start(
+            self.runtime, request_id="defaults", project="Jarvis4codex", title="Worker",
+            prompt="work", target_thread_count=2, max_rounds=1,
+            expires_at="2099-01-01T00:00:00+00:00",
+        )
+
+        self.assertEqual(started.data["interval_seconds"], 1800)
+        self.assertEqual(started.data["model"], "gpt-5.6-luna")
+        self.assertEqual(started.data["reasoning_effort"], "max")
+        self.assertEqual(started.data["max_turns"], 999)
+        self.assertTrue(started.data["auto_continue"])
+        self.assertEqual(started.data["notifications"], {"milestones": [], "terminal": True})
+        self.assertEqual([child["acquire"] for child in started.data["children"]], ["create", "create"])
+        for call in self.runtime.hold_calls:
+            self.assertEqual(call["model"], "gpt-5.6-luna")
+            self.assertEqual(call["reasoning_effort"], "max")
+            self.assertEqual(call["max_turns"], 999)
+            self.assertTrue(call["auto_continue"])
+            self.assertEqual(call["notifications"], {"milestones": [], "terminal": True})
+
+    def test_explicit_loop_fields_pass_unchanged_to_hold(self):
+        notifications = {"milestones": [3], "terminal": False}
+        self.controller.start(
+            self.runtime, request_id="override", project="Jarvis4codex", title="Worker",
+            prompt="work", target_thread_count=1, max_rounds=1, max_turns=7,
+            model="gpt-5.6-terra", reasoning_effort="high", auto_continue=False,
+            notifications=notifications, expires_at="2099-01-01T00:00:00+00:00",
+        )
+
+        call = self.runtime.hold_calls[0]
+        self.assertEqual(call["model"], "gpt-5.6-terra")
+        self.assertEqual(call["reasoning_effort"], "high")
+        self.assertEqual(call["max_turns"], 7)
+        self.assertFalse(call["auto_continue"])
+        self.assertEqual(call["notifications"], notifications)
+
     def test_control_reports_loop_unavailable_without_a_configured_controller(self):
         control = JarvisControl(object(), object())
         receipt = control.loop(action="start", request_id="no-loop")
@@ -92,6 +129,13 @@ class JarvisLoopContractTest(unittest.TestCase):
         names = [keyword.value.value for decorator in decorators if isinstance(decorator, ast.Call)
                  for keyword in decorator.keywords if keyword.arg == "name" and isinstance(keyword.value, ast.Constant)]
         self.assertEqual(names, ["jarvis_loop"])
+        arguments = {argument.arg for argument in functions[0].args.args}
+        self.assertTrue({"model", "reasoning_effort", "notifications"}.issubset(arguments))
+        loop_calls = [node for node in ast.walk(functions[0]) if isinstance(node, ast.Call)
+                      and isinstance(node.func, ast.Attribute) and node.func.attr == "loop"]
+        self.assertEqual(len(loop_calls), 1)
+        forwarded = {keyword.arg for keyword in loop_calls[0].keywords}
+        self.assertTrue({"model", "reasoning_effort", "notifications"}.issubset(forwarded))
 
 
 if __name__ == "__main__":

@@ -120,17 +120,21 @@ class JarvisMcpServer:
             threads: list[dict[str, Any]] | None = None,
             max_rounds: int | None = None,
             max_turns: int | None = None,
-            auto_continue: bool = False,
+            auto_continue: bool | None = None,
             interval_seconds: int | None = None,
             expires_at: str | None = None,
+            model: str | None = None,
+            reasoning_effort: str | None = None,
             continue_prompt: str = "继续",
+            notifications: dict[str, Any] | bool | None = None,
         ) -> CallToolResult:
             return _tool_result(self.control.loop(
                 action=action, loop_id=loop_id, request_id=request_id, project=project,
                 title=title, prompt=prompt, target_thread_count=target_thread_count,
                 threads=threads, max_rounds=max_rounds, max_turns=max_turns,
                 auto_continue=auto_continue, interval_seconds=interval_seconds,
-                expires_at=expires_at, continue_prompt=continue_prompt,
+                expires_at=expires_at, model=model, reasoning_effort=reasoning_effort,
+                continue_prompt=continue_prompt, notifications=notifications,
             ))
 
         @self.mcp.tool(
