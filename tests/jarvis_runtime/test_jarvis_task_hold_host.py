@@ -6,6 +6,7 @@ import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+from unittest.mock import ANY
 
 from adapters.codex_app_server.jarvis_hold_host_service import JarvisHoldHost
 from jarvis_native_task_launcher import HostContextRequiredError
@@ -19,6 +20,7 @@ class FakeConfig:
 class FakeClient:
     def __init__(self, _config):
         self.started_prompts: list[str] = []
+        self.started_turns: list[dict] = []
         self.waited: list[str] = []
         self.closed = False
 
@@ -37,6 +39,7 @@ class FakeClient:
 
     def start_turn_async(self, _thread_id, prompt, **_kwargs):
         self.started_prompts.append(prompt)
+        self.started_turns.append(_kwargs)
         return {"turn_id": "turn-2", "model": "gpt-test"}
 
     def resume_turn_async(self, thread_id, prompt, **kwargs):
@@ -108,6 +111,7 @@ class TaskMonitorHostTest(unittest.TestCase):
                 "max_turns": 2,
                 "auto_continue": True,
                 "continue_prompt": "继续",
+                "input_binding": {"candidate_ids": [7]},
             }), encoding="utf-8")
             with patch("adapters.codex_app_server.jarvis_task_hold_host.NativeTaskLauncherConfig", return_value=FakeConfig()), patch(
                 "adapters.codex_app_server.jarvis_task_hold_host.AppServerClient", return_value=client
@@ -118,6 +122,7 @@ class TaskMonitorHostTest(unittest.TestCase):
 
         self.assertEqual(exit_code, 0)
         self.assertEqual(client.started_prompts, ["继续"])
+        self.assertEqual(client.started_turns, [{"client_user_message_id": "monitor:hold-create-1:turn-1:1", "model": None, "reasoning_effort": None, "input_binding": {"candidate_ids": [7]}, "on_phase": ANY}])
         self.assertEqual(client.waited, ["turn-1", "turn-2"])
         self.assertEqual(final["status"], "turn_limit_reached")
         self.assertEqual(final["turn_count"], 2)
@@ -157,6 +162,7 @@ class TaskMonitorHostTest(unittest.TestCase):
                 "thread_id": "thread-created-1",
                 "prompt": "继续",
                 "max_turns": 1,
+                "input_binding": {"candidate_ids": [7]},
             }), encoding="utf-8")
             with patch("adapters.codex_app_server.jarvis_task_hold_host.NativeTaskLauncherConfig", return_value=FakeConfig()), patch(
                 "adapters.codex_app_server.jarvis_task_hold_host.AppServerClient", return_value=client
@@ -167,6 +173,7 @@ class TaskMonitorHostTest(unittest.TestCase):
         self.assertEqual(client.resumed[0], "thread-created-1")
         self.assertEqual(client.resumed[1], "继续")
         self.assertEqual(client.resumed[2]["client_user_message_id"], "resume-1")
+        self.assertEqual(client.resumed[2]["input_binding"], {"candidate_ids": [7]})
 
     def test_normal_user_host_claims_a_queued_request(self):
         with tempfile.TemporaryDirectory() as temp:

@@ -53,6 +53,7 @@ class CodexAppServerTaskProvisioningAdapter:
                 "auto_continue": request.auto_continue,
                 "continue_prompt": request.continue_prompt,
                 "notifications": dict(request.notifications or {}),
+                "input_binding": dict(request.input_binding or {}),
                 "initial_turn_count": 1,
                 "initial_total_turn_count": 1,
             })
@@ -118,6 +119,7 @@ class CodexAppServerTaskProvisioningAdapter:
                 "auto_continue": request.auto_continue,
                 "continue_prompt": request.continue_prompt,
                 "notifications": dict(request.notifications or {}),
+                "input_binding": dict(request.input_binding or {}),
                 "initial_turn_count": initial_turn_count,
                 "initial_total_turn_count": initial_total_turn_count,
             })

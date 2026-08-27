@@ -85,6 +85,7 @@ class JarvisControl:
         continue_prompt: str = "继续",
         hold_id: str | None = None,
         notifications: Mapping[str, Any] | None = None,
+        input_binding: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         if self._provisioner is None:
             return self.unsupported(
@@ -104,6 +105,7 @@ class JarvisControl:
                 continue_prompt=continue_prompt,
                 hold_id=hold_id,
                 notifications=notifications,
+                input_binding=input_binding,
             ))
         except ValueError as exc:
             return self._receipt("jarvis_create", "invalid_request", request_id=request_id, reason=str(exc))
@@ -137,6 +139,7 @@ class JarvisControl:
         auto_continue: bool = False,
         continue_prompt: str = "继续",
         notifications: Mapping[str, Any] | None = None,
+        input_binding: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Start or resume a lifecycle: Hold executes and Monitor controls continuation."""
         if task_id:
@@ -152,6 +155,7 @@ class JarvisControl:
                 auto_continue=auto_continue,
                 continue_prompt=continue_prompt,
                 notifications=notifications,
+                input_binding=input_binding,
             )
             receipt["tool"] = "jarvis_hold"
             return receipt
@@ -173,6 +177,7 @@ class JarvisControl:
             continue_prompt=continue_prompt,
             hold_id=hold_id,
             notifications=notifications,
+            input_binding=input_binding,
         )
         receipt["tool"] = "jarvis_hold"
         return receipt
@@ -193,6 +198,7 @@ class JarvisControl:
         auto_continue: bool = False,
         continue_prompt: str = "继续",
         notifications: Mapping[str, Any] | None = None,
+        input_binding: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         # Kept only for wire compatibility. All public resume calls are now monitor-owned.
         del hold_with_monitor
@@ -202,6 +208,7 @@ class JarvisControl:
                 monitor_id=monitor_id, hold_id=hold_id, max_turns=max_turns, model=model,
                 reasoning_effort=reasoning_effort, auto_continue=auto_continue,
                 continue_prompt=continue_prompt, notifications=notifications,
+                input_binding=input_binding,
             )
         except ValueError as exc:
             return self._receipt("jarvis_resume", "invalid_request", request_id=request_id, reason=str(exc))

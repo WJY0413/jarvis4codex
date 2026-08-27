@@ -237,6 +237,46 @@ class LauncherTests(unittest.TestCase):
             ("thread/start", {"cwd": "C:/test/project", "ephemeral": False}),
         ])
 
+    def test_app_server_client_sends_a_lane_binding_with_the_worker_turn(self):
+        with tempfile.TemporaryDirectory() as temp:
+            _, _, config = self.make_queue(temp)
+            client = AppServerClient.__new__(AppServerClient)
+            client.config = config
+            client.start = lambda: None
+            client.request = lambda method, _params: (
+                {"thread": {"id": "thread-created-1"}}
+                if method == "thread/start"
+                else (_ for _ in ()).throw(AssertionError(method))
+            )
+            client.select_model = lambda _model: "gpt-test"
+            observed = {}
+            client._start_turn = lambda thread_id, prompt, **kwargs: observed.update(
+                thread_id=thread_id, prompt=prompt, **kwargs
+            ) or {
+                "thread_id": thread_id,
+                "turn_id": "turn-created-1",
+                "turn_status": "inProgress",
+                "model": kwargs["selected_model"],
+                "reasoning_effort": kwargs["selected_effort"],
+            }
+
+            client.create_task({
+                "request_id": "create-lane-1",
+                "project_path": "C:/test/project",
+                "title": "TEST Worker",
+                "prompt": "固定 Worker 提示词",
+                "input_binding": {
+                    "candidate_ids": [7, 9],
+                    "database_path": "C:/collection.sqlite",
+                    "output_boundary": "C:/outputs/worker-1",
+                },
+            })
+
+        self.assertEqual(observed["thread_id"], "thread-created-1")
+        self.assertIn("[Jarvis lane binding v1]", observed["prompt"])
+        self.assertIn('"candidate_ids":[7,9]', observed["prompt"])
+        self.assertIn('"database_path":"C:/collection.sqlite"', observed["prompt"])
+
     def test_app_server_client_resumes_the_persisted_thread_before_starting_a_new_turn(self):
         with tempfile.TemporaryDirectory() as temp:
             _, _, config = self.make_queue(temp)

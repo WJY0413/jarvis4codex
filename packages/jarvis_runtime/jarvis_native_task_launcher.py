@@ -14,7 +14,7 @@ import shutil
 import subprocess
 import threading
 import time
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 try:  # Supports installed package imports and direct runtime-script execution.
     from .coo_dispatcher_store import (
@@ -53,6 +53,7 @@ TERMINAL_RESULT_STATUSES = {
 }
 SAFE_ID = re.compile(r"^[A-Za-z0-9._:-]{1,200}$")
 RESULT_CONTRACT_MARKER = "[Jarvis result contract v1]"
+LANE_BINDING_MARKER = "[Jarvis lane binding v1]"
 RESULT_CONTRACT = f"""
 {RESULT_CONTRACT_MARKER}
 最终回复必须可直接转发给 Cooper：
@@ -116,6 +117,20 @@ def append_result_contract(prompt: str) -> str:
     if RESULT_CONTRACT_MARKER in text:
         return text
     return f"{text}\n\n{RESULT_CONTRACT}"
+
+
+def append_lane_binding(prompt: str, input_binding: Mapping[str, Any] | None) -> str:
+    """Attach one validated Loop lane to the Worker-visible turn input."""
+    text = str(prompt or "").strip()
+    if not input_binding or LANE_BINDING_MARKER in text:
+        return text
+    binding = json.dumps(dict(input_binding), ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    return (
+        f"{text}\n\n{LANE_BINDING_MARKER}\n"
+        "以下 JSON 是本线程唯一允许处理的任务范围；仅处理其中的 candidate_ids，"
+        "仅按 database_path 和 output_boundary 执行。\n"
+        f"{binding}"
+    )
 
 
 def summarize_final_message(value: Any, limit: int = 240) -> str:
@@ -851,6 +866,7 @@ class AppServerClient:
         client_user_message_id: str,
         model: str | None = None,
         reasoning_effort: str | None = None,
+        input_binding: Mapping[str, Any] | None = None,
         on_phase: Callable[[str, dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         """Start one exact existing-thread turn without waiting for its terminal state."""
@@ -863,7 +879,7 @@ class AppServerClient:
         _report_phase(on_phase, "turn_starting", thread_id=thread_id)
         started = self._start_turn(
             thread_id,
-            prompt,
+            append_lane_binding(prompt, input_binding),
             client_user_message_id=client_user_message_id,
             selected_model=selected_model,
             selected_effort=reasoning_effort,
@@ -879,6 +895,7 @@ class AppServerClient:
         client_user_message_id: str,
         model: str | None = None,
         reasoning_effort: str | None = None,
+        input_binding: Mapping[str, Any] | None = None,
         on_phase: Callable[[str, dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         """Reattach one durable thread in this App Server before starting its turn."""
@@ -892,6 +909,7 @@ class AppServerClient:
             client_user_message_id=client_user_message_id,
             model=model,
             reasoning_effort=reasoning_effort,
+            input_binding=input_binding,
             on_phase=on_phase,
         )
 
@@ -923,7 +941,7 @@ class AppServerClient:
             _report_phase(on_phase, "turn_starting", thread_id=thread_id)
             created = self._start_turn(
                 thread_id,
-                prompt,
+                append_lane_binding(prompt, request.get("input_binding")),
                 client_user_message_id=request_id,
                 selected_model=selected_model,
                 selected_effort=request.get("reasoning_effort"),

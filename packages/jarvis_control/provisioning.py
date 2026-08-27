@@ -24,6 +24,7 @@ class TaskProvisionRequest:
     continue_prompt: str = "继续"
     hold_id: str | None = None
     notifications: Mapping[str, Any] | None = None
+    input_binding: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         required = {
@@ -43,6 +44,8 @@ class TaskProvisionRequest:
         if self.hold_id is not None and not self.hold_id.strip():
             raise ValueError("hold_id cannot be blank")
         notifications = dict(self.notifications or {})
+        if self.input_binding is not None and not isinstance(self.input_binding, Mapping):
+            raise ValueError("input_binding must be an object")
         milestones = notifications.get("milestones") or []
         if not isinstance(milestones, list):
             raise ValueError("notifications.milestones must be a list")
@@ -69,6 +72,7 @@ class TaskMonitorResumeRequest:
     auto_continue: bool = False
     continue_prompt: str = "继续"
     notifications: Mapping[str, Any] | None = None
+    input_binding: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         required = {
@@ -87,6 +91,8 @@ class TaskMonitorResumeRequest:
         if not self.continue_prompt.strip():
             raise ValueError("continue_prompt is required")
         notifications = dict(self.notifications or {})
+        if self.input_binding is not None and not isinstance(self.input_binding, Mapping):
+            raise ValueError("input_binding must be an object")
         milestones = notifications.get("milestones") or []
         if not isinstance(milestones, list):
             raise ValueError("notifications.milestones must be a list")

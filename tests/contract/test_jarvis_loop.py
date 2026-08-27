@@ -86,6 +86,35 @@ class JarvisLoopContractTest(unittest.TestCase):
 
         self.assertEqual(self.runtime.hold_calls[1]["prompt"], prompt.replace("jarvis-run-controller", "company-run-controller"))
 
+    def test_loop_persists_and_reuses_a_validated_lane_without_changing_worker_prompt(self):
+        lane = {"candidate_ids": [7, 9], "database_path": "C:/collection.sqlite", "output_boundary": "C:/outputs/worker-1"}
+        started = self.controller.start(
+            self.runtime, request_id="lane", project="Jarvis4codex", title="Worker",
+            business_skill="marketing-collection-mining", target_thread_count=1, max_rounds=2,
+            threads=[{"slot": "worker-1", "acquire": "create", "title": "Worker", "lane": lane}],
+            expires_at="2099-01-01T00:00:00+00:00",
+        )
+        self.assertEqual(self.runtime.hold_calls[0]["input_binding"], lane)
+        self.assertEqual(started.data["children"][0]["lane"], lane)
+        self.assertEqual(self.runtime.hold_calls[0]["prompt"], (
+            "你是本次 Jarvis Worker。\n\n执行、续跑和回执规则，必须严格遵守 $jarvis-run-controller。\n"
+            "处理公司和完成本次业务工作，必须严格遵守 $marketing-collection-mining。"
+        ))
+        hold_id = started.data["children"][0]["hold_id"]
+        self.runtime.states[hold_id] = {"status": "completed", "thread_id": "thread-1"}
+        self.controller.tick(self.runtime, loop_id=started.loop_id)
+        self.assertEqual(self.runtime.hold_calls[1]["input_binding"], lane)
+
+    def test_loop_rejects_malformed_lane(self):
+        result = self.controller.start(
+            self.runtime, request_id="bad-lane", project="Jarvis4codex", title="Worker",
+            business_skill="marketing-collection-mining", target_thread_count=1, max_rounds=1,
+            threads=[{"slot": "worker-1", "acquire": "create", "title": "Worker", "lane": {"candidate_ids": [1, 1]}}],
+            expires_at="2099-01-01T00:00:00+00:00",
+        )
+        self.assertEqual(result.status, "invalid_request")
+        self.assertEqual(result.reason, "thread lane requires unique positive candidate_ids, database_path, and output_boundary")
+
     def test_loop_rejects_missing_business_skill(self):
         result = self.controller.start(
             self.runtime, request_id="missing-business-skill", project="Jarvis4codex", title="Worker",

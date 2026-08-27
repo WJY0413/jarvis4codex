@@ -113,6 +113,7 @@ class LoopController:
                 model=request["model"], reasoning_effort=request["reasoning_effort"],
                 max_turns=request["max_turns"], auto_continue=request["auto_continue"],
                 continue_prompt=request["continue_prompt"], notifications=request["notifications"],
+                input_binding=child.get("lane"),
             )
             child["last_receipt"] = receipt
             child["hold_id"] = _nested_text(receipt, "data", "monitor_id") or _nested_text(receipt, "data", "hold_id")
@@ -172,6 +173,7 @@ class LoopController:
                 model=state["model"], reasoning_effort=state["reasoning_effort"],
                 hold_id=child["hold_id"], max_turns=state["max_turns"], auto_continue=state["auto_continue"],
                 continue_prompt=state["continue_prompt"], notifications=state["notifications"],
+                input_binding=child.get("lane"),
             )
             child["last_receipt"] = receipt
             if receipt.get("status") in ACTIVE:
@@ -323,6 +325,20 @@ def _validate_start(raw: Mapping[str, Any]) -> dict[str, Any]:
             raise ValueError("each thread requires a unique slot and acquire=create|resume")
         slots.add(slot)
         child: dict[str, Any] = {"slot": slot, "acquire": acquire, "prompt": prompt}
+        lane = raw_child.get("lane")
+        if lane is not None:
+            if not isinstance(lane, Mapping):
+                raise ValueError("thread lane must be an object")
+            candidate_ids = lane.get("candidate_ids")
+            database_path = str(lane.get("database_path") or "").strip()
+            output_boundary = str(lane.get("output_boundary") or "").strip()
+            if (not isinstance(candidate_ids, list) or not candidate_ids
+                    or any(not isinstance(value, int) or value < 1 for value in candidate_ids)
+                    or len(set(candidate_ids)) != len(candidate_ids)
+                    or not database_path or not output_boundary):
+                raise ValueError("thread lane requires unique positive candidate_ids, database_path, and output_boundary")
+            child["lane"] = {"candidate_ids": list(candidate_ids), "database_path": database_path,
+                             "output_boundary": output_boundary}
         if acquire == "create":
             child["title"] = str(raw_child.get("title") or raw.get("title") or "").strip()
             if not child["title"]:

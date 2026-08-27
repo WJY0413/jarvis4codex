@@ -132,6 +132,7 @@ def hold_task(
                 client_user_message_id=request_id,
                 model=request.get("model"),
                 reasoning_effort=request.get("reasoning_effort"),
+                input_binding=request.get("input_binding"),
                 on_phase=report,
             )
         else:
@@ -202,6 +203,7 @@ def hold_task(
                 client_user_message_id=decision.command_id,
                 model=request.get("model"),
                 reasoning_effort=request.get("reasoning_effort"),
+                input_binding=request.get("input_binding"),
                 on_phase=report,
             )
             turn_id = str(started.get("turn_id") or "").strip()
