@@ -47,6 +47,7 @@ class JarvisLoopContractTest(unittest.TestCase):
         self.assertEqual(started.status, "running")
         self.assertEqual(self.runtime.heartbeat_calls[0]["options"]["function"], "JarvisControl.loop_tick")
         self.assertFalse(self.runtime.heartbeat_calls[0]["options"]["start_immediately"])
+        self.assertFalse(self.runtime.hold_calls[0]["auto_continue"])
         hold_id = started.data["children"][0]["hold_id"]
         self.runtime.states[hold_id] = {"status": "completed", "thread_id": "thread-1"}
 
@@ -56,11 +57,26 @@ class JarvisLoopContractTest(unittest.TestCase):
         self.assertEqual(len(self.runtime.hold_calls), 2)
         self.assertEqual(self.runtime.hold_calls[1]["task_id"], "thread-1")
         self.assertEqual(self.runtime.hold_calls[1]["prompt"], self.runtime.hold_calls[0]["prompt"])
+        self.assertFalse(self.runtime.hold_calls[1]["auto_continue"])
 
         self.runtime.states[hold_id] = {"status": "completed", "thread_id": "thread-1"}
         completed = self.controller.tick(self.runtime, loop_id=started.loop_id)
         self.assertEqual(completed.status, "completed")
         self.assertEqual(self.runtime.heartbeat_calls[-1]["action"], "cancel")
+
+    def test_loop_does_not_resume_after_one_terminal_turn_when_auto_continue_is_false(self):
+        started = self.controller.start(
+            self.runtime, request_id="no-auto", project="Jarvis4codex", title="Worker",
+            business_skill="bd-search-stage6-research", target_thread_count=1, max_rounds=9,
+            auto_continue=False, expires_at="2099-01-01T00:00:00+00:00",
+        )
+        hold_id = started.data["children"][0]["hold_id"]
+        self.runtime.states[hold_id] = {"status": "completed", "thread_id": "thread-1"}
+
+        completed = self.controller.tick(self.runtime, loop_id=started.loop_id)
+
+        self.assertEqual(completed.status, "completed")
+        self.assertEqual(len(self.runtime.hold_calls), 1)
 
     def test_loop_renders_the_worker_skill_prompt_for_create_and_resume(self):
         prompt = (
@@ -162,7 +178,7 @@ class JarvisLoopContractTest(unittest.TestCase):
             self.assertEqual(call["model"], "gpt-5.6-luna")
             self.assertEqual(call["reasoning_effort"], "max")
             self.assertEqual(call["max_turns"], 999)
-            self.assertTrue(call["auto_continue"])
+            self.assertFalse(call["auto_continue"])
             self.assertEqual(call["notifications"], {"milestones": [], "terminal": True})
 
     def test_explicit_loop_fields_pass_unchanged_to_hold(self):

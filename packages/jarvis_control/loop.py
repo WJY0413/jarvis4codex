@@ -111,7 +111,7 @@ class LoopController:
                 project=request["project"] if child["acquire"] == "create" else None,
                 title=child.get("title"), hold_id=f"{loop_id}:{child['slot']}",
                 model=request["model"], reasoning_effort=request["reasoning_effort"],
-                max_turns=request["max_turns"], auto_continue=request["auto_continue"],
+                max_turns=request["max_turns"], auto_continue=False,
                 continue_prompt=request["continue_prompt"], notifications=request["notifications"],
                 input_binding=child.get("lane"),
             )
@@ -162,6 +162,8 @@ class LoopController:
                 continue
             if child.get("lifecycle") not in {"completed", "turn_limit_reached"}:
                 child["phase"] = "blocked"; state["status"] = "blocked"; continue
+            if not state["auto_continue"]:
+                child["phase"] = "completed"; continue
             if int(child["round"]) >= int(state["max_rounds"]):
                 child["phase"] = "completed"; continue
             if not child.get("thread_id") or not child.get("hold_id"):
@@ -171,7 +173,7 @@ class LoopController:
                 request_id=f"{loop_id}:{child['slot']}:round-{next_round}", task_id=child["thread_id"],
                 prompt=state["continue_prompt"], source_ref=f"jarvis_loop:{loop_id}:{child['slot']}",
                 model=state["model"], reasoning_effort=state["reasoning_effort"],
-                hold_id=child["hold_id"], max_turns=state["max_turns"], auto_continue=state["auto_continue"],
+                hold_id=child["hold_id"], max_turns=state["max_turns"], auto_continue=False,
                 continue_prompt=state["continue_prompt"], notifications=state["notifications"],
                 input_binding=child.get("lane"),
             )
