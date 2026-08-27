@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from mcp.server import MCPServer
 from mcp.types import CallToolResult, TextContent, ToolAnnotations
+from pydantic import Field
 
 from jarvis_control import JarvisControl
 
@@ -106,7 +107,7 @@ class JarvisMcpServer:
 
         @self.mcp.tool(
             name="jarvis_loop",
-            description="Start, inspect, or stop one bounded Jarvis loop using the existing Hold, Monitor, and heartbeat contracts.",
+            description="Start, inspect, or stop one bounded Jarvis loop. action=start requires business_skill; controller_skill defaults to jarvis-run-controller.",
             annotations=ToolAnnotations(destructiveHint=False, idempotentHint=False, openWorldHint=False),
         )
         def jarvis_loop(
@@ -115,7 +116,8 @@ class JarvisMcpServer:
             request_id: str | None = None,
             project: str | None = None,
             title: str | None = None,
-            prompt: str | None = None,
+            business_skill: Annotated[str | None, Field(description="Required when action=start.")] = None,
+            controller_skill: Annotated[str | None, Field(description="Optional when action=start; defaults to jarvis-run-controller.")] = None,
             target_thread_count: int | None = None,
             threads: list[dict[str, Any]] | None = None,
             max_rounds: int | None = None,
@@ -125,16 +127,15 @@ class JarvisMcpServer:
             expires_at: str | None = None,
             model: str | None = None,
             reasoning_effort: str | None = None,
-            continue_prompt: str = "继续",
             notifications: dict[str, Any] | bool | None = None,
         ) -> CallToolResult:
             return _tool_result(self.control.loop(
                 action=action, loop_id=loop_id, request_id=request_id, project=project,
-                title=title, prompt=prompt, target_thread_count=target_thread_count,
+                title=title, business_skill=business_skill, controller_skill=controller_skill, target_thread_count=target_thread_count,
                 threads=threads, max_rounds=max_rounds, max_turns=max_turns,
                 auto_continue=auto_continue, interval_seconds=interval_seconds,
                 expires_at=expires_at, model=model, reasoning_effort=reasoning_effort,
-                continue_prompt=continue_prompt, notifications=notifications,
+                notifications=notifications,
             ))
 
         @self.mcp.tool(

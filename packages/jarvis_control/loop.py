@@ -95,6 +95,7 @@ class LoopController:
             "schema": "jarvis-loop-state/v1", "loop_id": loop_id, "request_id": request["request_id"],
             "project": request["project"], "max_rounds": request["max_rounds"], "max_turns": request["max_turns"],
             "auto_continue": request["auto_continue"], "continue_prompt": request["continue_prompt"],
+            "controller_skill": request["controller_skill"], "business_skill": request["business_skill"],
             "model": request["model"], "reasoning_effort": request["reasoning_effort"],
             "notifications": request["notifications"],
             "interval_seconds": request["interval_seconds"], "expires_at": request["expires_at"],
@@ -236,12 +237,12 @@ class LoopController:
 
     @staticmethod
     def _result(state: Mapping[str, Any]) -> LoopResult:
-        data = {key: state.get(key) for key in ("loop_id", "project", "status", "target_thread_count", "heartbeat_id", "heartbeat", "max_rounds", "max_turns", "auto_continue", "continue_prompt", "model", "reasoning_effort", "notifications", "interval_seconds", "expires_at", "children")}
+        data = {key: state.get(key) for key in ("loop_id", "project", "status", "target_thread_count", "heartbeat_id", "heartbeat", "max_rounds", "max_turns", "auto_continue", "continue_prompt", "controller_skill", "business_skill", "model", "reasoning_effort", "notifications", "interval_seconds", "expires_at", "children")}
         return LoopResult(str(state["status"]), str(state["loop_id"]), data)
 
 
 def _validate_start(raw: Mapping[str, Any]) -> dict[str, Any]:
-    required = ("request_id", "project", "prompt", "target_thread_count", "max_rounds", "expires_at")
+    required = ("request_id", "project", "business_skill", "target_thread_count", "max_rounds", "expires_at")
     missing = [name for name in required if raw.get(name) in (None, "")]
     if missing:
         raise ValueError("required loop fields: " + ", ".join(missing))
@@ -268,13 +269,15 @@ def _validate_start(raw: Mapping[str, Any]) -> dict[str, Any]:
     expires = _parse_time(raw["expires_at"])
     if expires <= datetime.now(timezone.utc):
         raise ValueError("expires_at must be in the future")
-    prompt = str(raw["prompt"]).strip()
-    if not prompt:
-        raise ValueError("prompt is required")
+    controller_skill = str(raw.get("controller_skill") or "jarvis-run-controller").strip() or "jarvis-run-controller"
+    business_skill = str(raw["business_skill"]).strip()
+    if not business_skill:
+        raise ValueError("business_skill is required")
+    prompt = _worker_prompt(controller_skill, business_skill)
     threads = raw.get("threads")
     if threads is None:
         title = str(raw.get("title") or f"Jarvis loop {raw['request_id']}").strip()
-        threads = [{"slot": f"worker-{number}", "acquire": "create", "title": title, "prompt": prompt}
+        threads = [{"slot": f"worker-{number}", "acquire": "create", "title": title}
                    for number in range(1, target_count + 1)]
     if not isinstance(threads, list) or len(threads) != target_count:
         raise ValueError("threads must exactly match target_thread_count")
@@ -284,11 +287,12 @@ def _validate_start(raw: Mapping[str, Any]) -> dict[str, Any]:
         if not isinstance(raw_child, Mapping):
             raise ValueError("each thread must be an object")
         slot, acquire = str(raw_child.get("slot") or "").strip(), str(raw_child.get("acquire") or "create").strip()
-        child_prompt = str(raw_child.get("prompt") or prompt).strip()
-        if not slot or slot in slots or acquire not in {"create", "resume"} or not child_prompt:
-            raise ValueError("each thread requires a unique slot, acquire=create|resume, and prompt")
+        if "prompt" in raw_child:
+            raise ValueError("thread prompt is not supported; use business_skill")
+        if not slot or slot in slots or acquire not in {"create", "resume"}:
+            raise ValueError("each thread requires a unique slot and acquire=create|resume")
         slots.add(slot)
-        child: dict[str, Any] = {"slot": slot, "acquire": acquire, "prompt": child_prompt}
+        child: dict[str, Any] = {"slot": slot, "acquire": acquire, "prompt": prompt}
         if acquire == "create":
             child["title"] = str(raw_child.get("title") or raw.get("title") or "").strip()
             if not child["title"]:
@@ -309,10 +313,19 @@ def _validate_start(raw: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError("notifications must be a boolean or object")
     return {"request_id": str(raw["request_id"]).strip(), "project": str(raw["project"]).strip(), "threads": normalized,
             "target_thread_count": target_count, "max_rounds": max_rounds, "max_turns": max_turns,
-            "auto_continue": auto_continue, "continue_prompt": str(raw.get("continue_prompt") or "继续").strip() or "继续",
+            "auto_continue": auto_continue, "continue_prompt": prompt,
+            "controller_skill": controller_skill, "business_skill": business_skill,
             "model": str(raw.get("model") or "gpt-5.6-luna").strip() or "gpt-5.6-luna",
             "reasoning_effort": str(raw.get("reasoning_effort") or "max").strip() or "max",
             "notifications": notifications, "interval_seconds": interval, "expires_at": expires.isoformat()}
+
+
+def _worker_prompt(controller_skill: str, business_skill: str) -> str:
+    return (
+        "你是本次 Jarvis Worker。\n\n"
+        f"执行、续跑和回执规则，必须严格遵守 ${controller_skill}。\n"
+        f"处理公司和完成本次业务工作，必须严格遵守 ${business_skill}。"
+    )
 
 
 def _nested_text(value: Mapping[str, Any], *keys: str) -> str | None:

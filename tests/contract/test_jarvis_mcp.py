@@ -111,6 +111,12 @@ class JarvisMcpContractTest(unittest.TestCase):
         self.assertTrue(all(tool.input_schema["type"] == "object" for tool in result.tools))
         read_tool = next(tool for tool in result.tools if tool.name == "jarvis_read")
         self.assertTrue(read_tool.annotations.read_only_hint)
+        loop_tool = next(tool for tool in result.tools if tool.name == "jarvis_loop")
+        self.assertTrue({"business_skill", "controller_skill"}.issubset(loop_tool.input_schema["properties"]))
+        self.assertNotIn("prompt", loop_tool.input_schema["properties"])
+        self.assertNotIn("continue_prompt", loop_tool.input_schema["properties"])
+        self.assertIn("Required when action=start", loop_tool.input_schema["properties"]["business_skill"]["description"])
+        self.assertIn("action=start requires business_skill", loop_tool.description)
 
     def test_resume_without_a_monitor_owned_adapter_reports_unsupported(self):
         result = self.call(

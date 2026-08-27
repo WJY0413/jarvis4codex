@@ -41,7 +41,7 @@ class JarvisLoopContractTest(unittest.TestCase):
     def test_loop_observes_hold_then_resumes_only_after_terminal_readback(self):
         started = self.controller.start(
             self.runtime, request_id="contract-1", project="Jarvis4codex", title="Worker",
-            prompt="work", target_thread_count=1, max_rounds=2, max_turns=3,
+            business_skill="bd-search-stage6-research", target_thread_count=1, max_rounds=2, max_turns=3,
             expires_at="2099-01-01T00:00:00+00:00",
         )
         self.assertEqual(started.status, "running")
@@ -55,17 +55,69 @@ class JarvisLoopContractTest(unittest.TestCase):
         self.assertEqual(resumed.status, "running")
         self.assertEqual(len(self.runtime.hold_calls), 2)
         self.assertEqual(self.runtime.hold_calls[1]["task_id"], "thread-1")
-        self.assertEqual(self.runtime.hold_calls[1]["prompt"], "继续")
+        self.assertEqual(self.runtime.hold_calls[1]["prompt"], self.runtime.hold_calls[0]["prompt"])
 
         self.runtime.states[hold_id] = {"status": "completed", "thread_id": "thread-1"}
         completed = self.controller.tick(self.runtime, loop_id=started.loop_id)
         self.assertEqual(completed.status, "completed")
         self.assertEqual(self.runtime.heartbeat_calls[-1]["action"], "cancel")
 
+    def test_loop_renders_the_worker_skill_prompt_for_create_and_resume(self):
+        prompt = (
+            "你是本次 Jarvis Worker。\n\n"
+            "执行、续跑和回执规则，必须严格遵守 $jarvis-run-controller。\n"
+            "处理公司和完成本次业务工作，必须严格遵守 $bd-search-stage6-research。"
+        )
+        started = self.controller.start(
+            self.runtime, request_id="skills", project="Jarvis4codex", title="Worker",
+            business_skill="bd-search-stage6-research", controller_skill="company-run-controller",
+            target_thread_count=1, max_rounds=2,
+            expires_at="2099-01-01T00:00:00+00:00",
+        )
+
+        self.assertEqual(started.status, "running")
+        self.assertEqual(started.data["controller_skill"], "company-run-controller")
+        self.assertEqual(started.data["business_skill"], "bd-search-stage6-research")
+        self.assertEqual(self.runtime.hold_calls[0]["prompt"], prompt.replace("jarvis-run-controller", "company-run-controller"))
+        hold_id = started.data["children"][0]["hold_id"]
+        self.runtime.states[hold_id] = {"status": "completed", "thread_id": "thread-1"}
+
+        self.controller.tick(self.runtime, loop_id=started.loop_id)
+
+        self.assertEqual(self.runtime.hold_calls[1]["prompt"], prompt.replace("jarvis-run-controller", "company-run-controller"))
+
+    def test_loop_rejects_missing_business_skill(self):
+        result = self.controller.start(
+            self.runtime, request_id="missing-business-skill", project="Jarvis4codex", title="Worker",
+            target_thread_count=1, max_rounds=1, expires_at="2099-01-01T00:00:00+00:00",
+        )
+
+        self.assertEqual(result.status, "invalid_request")
+        self.assertEqual(result.reason, "required loop fields: business_skill")
+
+        blank = self.controller.start(
+            self.runtime, request_id="blank-business-skill", project="Jarvis4codex", title="Worker",
+            business_skill="   ", target_thread_count=1, max_rounds=1,
+            expires_at="2099-01-01T00:00:00+00:00",
+        )
+
+        self.assertEqual(blank.status, "invalid_request")
+        self.assertEqual(blank.reason, "business_skill is required")
+
+        overridden = self.controller.start(
+            self.runtime, request_id="thread-prompt", project="Jarvis4codex", title="Worker",
+            business_skill="bd-search-stage6-research", target_thread_count=1, max_rounds=1,
+            threads=[{"slot": "worker-1", "acquire": "create", "title": "Worker", "prompt": "override"}],
+            expires_at="2099-01-01T00:00:00+00:00",
+        )
+
+        self.assertEqual(overridden.status, "invalid_request")
+        self.assertEqual(overridden.reason, "thread prompt is not supported; use business_skill")
+
     def test_confirmed_defaults_create_every_omitted_thread_and_reach_hold(self):
         started = self.controller.start(
             self.runtime, request_id="defaults", project="Jarvis4codex", title="Worker",
-            prompt="work", target_thread_count=2, max_rounds=1,
+            business_skill="bd-search-stage6-research", target_thread_count=2, max_rounds=1,
             expires_at="2099-01-01T00:00:00+00:00",
         )
 
@@ -75,6 +127,7 @@ class JarvisLoopContractTest(unittest.TestCase):
         self.assertEqual(started.data["max_turns"], 999)
         self.assertTrue(started.data["auto_continue"])
         self.assertEqual(started.data["notifications"], {"milestones": [], "terminal": True})
+        self.assertEqual(started.data["controller_skill"], "jarvis-run-controller")
         self.assertEqual([child["acquire"] for child in started.data["children"]], ["create", "create"])
         for call in self.runtime.hold_calls:
             self.assertEqual(call["model"], "gpt-5.6-luna")
@@ -87,7 +140,7 @@ class JarvisLoopContractTest(unittest.TestCase):
         notifications = {"milestones": [3], "terminal": False}
         self.controller.start(
             self.runtime, request_id="override", project="Jarvis4codex", title="Worker",
-            prompt="work", target_thread_count=1, max_rounds=1, max_turns=7,
+            business_skill="bd-search-stage6-research", target_thread_count=1, max_rounds=1, max_turns=7,
             model="gpt-5.6-terra", reasoning_effort="high", auto_continue=False,
             notifications=notifications, expires_at="2099-01-01T00:00:00+00:00",
         )
@@ -113,7 +166,7 @@ class JarvisLoopContractTest(unittest.TestCase):
 
         result = self.controller.start(
             self.runtime, request_id="corrupt", project="Jarvis4codex", title="Worker",
-            prompt="work", target_thread_count=1, max_rounds=1,
+            business_skill="bd-search-stage6-research", target_thread_count=1, max_rounds=1,
             expires_at="2099-01-01T00:00:00+00:00",
         )
 
@@ -130,12 +183,14 @@ class JarvisLoopContractTest(unittest.TestCase):
                  for keyword in decorator.keywords if keyword.arg == "name" and isinstance(keyword.value, ast.Constant)]
         self.assertEqual(names, ["jarvis_loop"])
         arguments = {argument.arg for argument in functions[0].args.args}
-        self.assertTrue({"model", "reasoning_effort", "notifications"}.issubset(arguments))
+        self.assertTrue({"model", "reasoning_effort", "notifications", "business_skill", "controller_skill"}.issubset(arguments))
+        self.assertNotIn("prompt", arguments)
+        self.assertNotIn("continue_prompt", arguments)
         loop_calls = [node for node in ast.walk(functions[0]) if isinstance(node, ast.Call)
                       and isinstance(node.func, ast.Attribute) and node.func.attr == "loop"]
         self.assertEqual(len(loop_calls), 1)
         forwarded = {keyword.arg for keyword in loop_calls[0].keywords}
-        self.assertTrue({"model", "reasoning_effort", "notifications"}.issubset(forwarded))
+        self.assertTrue({"model", "reasoning_effort", "notifications", "business_skill", "controller_skill"}.issubset(forwarded))
 
 
 if __name__ == "__main__":
