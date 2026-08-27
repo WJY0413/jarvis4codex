@@ -41,6 +41,19 @@ class JarvisControl:
         """Use the existing Hold, Monitor and heartbeat ports as one bounded loop."""
         if self._loop_controller is None:
             return self.unsupported(tool="jarvis_loop", reason="no loop controller is configured")
+        if action == "preflight":
+            project_reader = getattr(self._provisioner, "preflight_projects", None)
+            if not callable(project_reader):
+                return self.unsupported(tool="jarvis_loop", reason="no loop preflight adapter is configured")
+            try:
+                projects = project_reader()
+            except Exception as exc:
+                return self._receipt("jarvis_loop", "failed", request_id=options.get("request_id"), reason=str(exc))
+            return self._receipt(
+                "jarvis_loop", "completed", request_id=options.get("request_id"),
+                data=self._loop_controller.preflight_contract(allowed_projects=list(projects)),
+                readback={"verified": True, "terminal": False},
+            )
         if action == "start":
             result = self._loop_controller.start(self, **options)
         elif action == "tick":
@@ -50,7 +63,7 @@ class JarvisControl:
         elif action == "stop":
             result = self._loop_controller.stop(self, loop_id=str(loop_id or ""))
         else:
-            return self._receipt("jarvis_loop", "invalid_request", reason="action must be start, status, or stop")
+            return self._receipt("jarvis_loop", "invalid_request", reason="action must be preflight, start, status, or stop")
         return self._receipt(
             "jarvis_loop", result.status, request_id=options.get("request_id"),
             reason=result.reason, data=result.data,

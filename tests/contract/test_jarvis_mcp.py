@@ -113,6 +113,7 @@ class JarvisMcpContractTest(unittest.TestCase):
         self.assertTrue(read_tool.annotations.read_only_hint)
         loop_tool = next(tool for tool in result.tools if tool.name == "jarvis_loop")
         self.assertTrue({"business_skill", "controller_skill"}.issubset(loop_tool.input_schema["properties"]))
+        self.assertIn("preflight", loop_tool.input_schema["properties"]["action"]["enum"])
         self.assertNotIn("prompt", loop_tool.input_schema["properties"])
         self.assertNotIn("continue_prompt", loop_tool.input_schema["properties"])
         self.assertIn("Required when action=start", loop_tool.input_schema["properties"]["business_skill"]["description"])

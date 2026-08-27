@@ -191,6 +191,36 @@ class LoopController:
         except ValueError as exc:
             return LoopResult("invalid_request", loop_id, {}, str(exc))
 
+    @staticmethod
+    def preflight_contract(*, allowed_projects: list[str]) -> dict[str, Any]:
+        """Describe start inputs without creating Loop, Hold, or heartbeat state."""
+        return {
+            "allowed_projects": sorted(allowed_projects),
+            "start_contract": {
+                "required": [
+                    "request_id", "project", "business_skill", "target_thread_count", "max_rounds", "expires_at",
+                ],
+                "defaults": {
+                    "controller_skill": "jarvis-run-controller",
+                    "max_turns": 999,
+                    "auto_continue": True,
+                    "interval_seconds": 1800,
+                    "model": "gpt-5.6-luna",
+                    "reasoning_effort": "max",
+                    "notifications": True,
+                },
+                "threads": {
+                    "item": {
+                        "slot": "non-empty unique string",
+                        "acquire": "create|resume (default create)",
+                        "create_requires": ["title"],
+                        "resume_requires": ["task_id"],
+                    },
+                    "count": "must equal target_thread_count when supplied",
+                },
+            },
+        }
+
     def stop(self, runtime: LoopRuntime, *, loop_id: str) -> LoopResult:
         try:
             state = self._store.load(loop_id)

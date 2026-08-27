@@ -83,6 +83,11 @@ class CodexAppServerTaskProvisioningAdapter:
             phase="queued_for_user_host",
         )
 
+    def preflight_projects(self) -> list[str]:
+        """Return configured public project identifiers without writing a task request."""
+        config = self._config_loader(self._config_path)
+        return sorted(config.allowed_projects)
+
     def resume_with_monitor(self, request: TaskMonitorResumeRequest) -> TaskProvisionReceipt:
         try:
             config = self._config_loader(self._config_path)

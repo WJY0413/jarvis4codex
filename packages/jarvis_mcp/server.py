@@ -107,11 +107,11 @@ class JarvisMcpServer:
 
         @self.mcp.tool(
             name="jarvis_loop",
-            description="Start, inspect, or stop one bounded Jarvis loop. action=start requires business_skill; controller_skill defaults to jarvis-run-controller.",
+            description="Preflight, start, inspect, or stop one bounded Jarvis loop. action=preflight is read-only; action=start requires business_skill; controller_skill defaults to jarvis-run-controller.",
             annotations=ToolAnnotations(destructiveHint=False, idempotentHint=False, openWorldHint=False),
         )
         def jarvis_loop(
-            action: Literal["start", "status", "stop"] = "start",
+            action: Literal["preflight", "start", "status", "stop"] = "start",
             loop_id: str | None = None,
             request_id: str | None = None,
             project: str | None = None,

@@ -158,6 +158,33 @@ class JarvisLoopContractTest(unittest.TestCase):
         self.assertEqual(receipt["tool"], "jarvis_loop")
         self.assertEqual(receipt["status"], "unsupported")
 
+    def test_loop_preflight_returns_start_contract_without_starting_any_hold(self):
+        class Provisioner:
+            def preflight_projects(self):
+                return ["BD Search Worker", "Jarvis4codex"]
+
+        control = JarvisControl(object(), object(), Provisioner(), loop_controller=self.controller)
+        receipt = control.loop(action="preflight")
+
+        self.assertEqual(receipt["status"], "completed")
+        self.assertTrue(receipt["readback"]["verified"])
+        self.assertEqual(receipt["data"]["allowed_projects"], ["BD Search Worker", "Jarvis4codex"])
+        self.assertEqual(
+            receipt["data"]["start_contract"]["required"],
+            ["request_id", "project", "business_skill", "target_thread_count", "max_rounds", "expires_at"],
+        )
+        self.assertEqual(receipt["data"]["start_contract"]["threads"], {
+            "item": {
+                "slot": "non-empty unique string",
+                "acquire": "create|resume (default create)",
+                "create_requires": ["title"],
+                "resume_requires": ["task_id"],
+            },
+            "count": "must equal target_thread_count when supplied",
+        })
+        self.assertEqual(self.runtime.hold_calls, [])
+        self.assertEqual(self.runtime.heartbeat_calls, [])
+
     def test_invalid_existing_state_is_blocked_without_replacing_it(self):
         loop_id = "loop-corrupt"
         path = Path(self.temp.name) / "loops" / loop_id / "state.json"
