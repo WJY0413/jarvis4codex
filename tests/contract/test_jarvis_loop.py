@@ -82,6 +82,8 @@ class JarvisLoopContractTest(unittest.TestCase):
         prompt = (
             "你是本次 Jarvis Worker。\n\n"
             "执行、续跑和回执规则，必须严格遵守 $jarvis-run-controller。\n"
+            "每个 Worker 回合仅处理 binding 中的一家公司；安全写回后输出结构化单公司回执并等待下一回合，"
+            "不得遍历、预取、并行处理或宣称整条 lane 已完成。\n"
             "处理公司和完成本次业务工作，必须严格遵守 $bd-search-stage6-research。"
         )
         started = self.controller.start(
@@ -102,7 +104,7 @@ class JarvisLoopContractTest(unittest.TestCase):
 
         self.assertEqual(self.runtime.hold_calls[1]["prompt"], prompt.replace("jarvis-run-controller", "company-run-controller"))
 
-    def test_loop_persists_and_reuses_a_validated_lane_without_changing_worker_prompt(self):
+    def test_loop_exposes_one_stable_lane_candidate_per_worker_turn(self):
         lane = {"candidate_ids": [7, 9], "database_path": "C:/collection.sqlite", "output_boundary": "C:/outputs/worker-1"}
         started = self.controller.start(
             self.runtime, request_id="lane", project="Jarvis4codex", title="Worker",
@@ -110,16 +112,66 @@ class JarvisLoopContractTest(unittest.TestCase):
             threads=[{"slot": "worker-1", "acquire": "create", "title": "Worker", "lane": lane}],
             expires_at="2099-01-01T00:00:00+00:00",
         )
-        self.assertEqual(self.runtime.hold_calls[0]["input_binding"], lane)
+        self.assertEqual(self.runtime.hold_calls[0]["input_binding"], {
+            **lane, "candidate_ids": [7],
+        })
         self.assertEqual(started.data["children"][0]["lane"], lane)
-        self.assertEqual(self.runtime.hold_calls[0]["prompt"], (
-            "你是本次 Jarvis Worker。\n\n执行、续跑和回执规则，必须严格遵守 $jarvis-run-controller。\n"
-            "处理公司和完成本次业务工作，必须严格遵守 $marketing-collection-mining。"
-        ))
+        self.assertIn("每个 Worker 回合仅处理 binding 中的一家公司", self.runtime.hold_calls[0]["prompt"])
         hold_id = started.data["children"][0]["hold_id"]
         self.runtime.states[hold_id] = {"status": "completed", "thread_id": "thread-1"}
         self.controller.tick(self.runtime, loop_id=started.loop_id)
-        self.assertEqual(self.runtime.hold_calls[1]["input_binding"], lane)
+        self.assertEqual(self.runtime.hold_calls[1]["input_binding"], {
+            **lane, "candidate_ids": [9],
+        })
+
+    def test_loop_completes_uneven_lanes_without_an_unbound_extra_turn(self):
+        lanes = [
+            list(range(1, 58)),
+            list(range(101, 157)),
+            list(range(201, 257)),
+        ]
+        started = self.controller.start(
+            self.runtime, request_id="uneven-lanes", project="Jarvis4codex", title="Worker",
+            business_skill="marketing-collection-mining", target_thread_count=3, max_rounds=57,
+            threads=[
+                {"slot": f"worker-{number}", "acquire": "create", "title": "Worker", "lane": {
+                    "candidate_ids": lane, "database_path": "C:/collection.sqlite",
+                    "output_boundary": f"C:/outputs/worker-{number}",
+                }}
+                for number, lane in enumerate(lanes, 1)
+            ],
+            expires_at="2099-01-01T00:00:00+00:00",
+        )
+        hold_ids = [child["hold_id"] for child in started.data["children"]]
+        result = started
+        for round_number in range(1, 58):
+            for hold_id, lane in zip(hold_ids, lanes):
+                if round_number <= len(lane):
+                    self.runtime.states[hold_id] = {"status": "completed", "thread_id": "thread-1"}
+            result = self.controller.tick(self.runtime, loop_id=started.loop_id)
+
+        self.assertEqual(result.status, "completed")
+        self.assertTrue(all(child["phase"] == "completed" for child in result.data["children"]))
+        for number, lane in enumerate(lanes, 1):
+            bindings = [
+                call["input_binding"] for call in self.runtime.hold_calls
+                if call["source_ref"].endswith(f"worker-{number}")
+            ]
+            self.assertEqual([binding["candidate_ids"] for binding in bindings], [[value] for value in lane])
+            self.assertTrue(all(binding is not None for binding in bindings))
+
+    def test_loop_rejects_lane_that_exceeds_its_round_budget(self):
+        result = self.controller.start(
+            self.runtime, request_id="lane-budget", project="Jarvis4codex", title="Worker",
+            business_skill="marketing-collection-mining", target_thread_count=1, max_rounds=1,
+            threads=[{"slot": "worker-1", "acquire": "create", "title": "Worker", "lane": {
+                "candidate_ids": [7, 9], "database_path": "C:/collection.sqlite",
+                "output_boundary": "C:/outputs/worker-1",
+            }}],
+            expires_at="2099-01-01T00:00:00+00:00",
+        )
+        self.assertEqual(result.status, "invalid_request")
+        self.assertEqual(result.reason, "max_rounds must cover every candidate in each thread lane")
 
     def test_loop_rejects_malformed_lane(self):
         result = self.controller.start(

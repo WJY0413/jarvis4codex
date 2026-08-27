@@ -127,8 +127,9 @@ def append_lane_binding(prompt: str, input_binding: Mapping[str, Any] | None) ->
     binding = json.dumps(dict(input_binding), ensure_ascii=False, separators=(",", ":"), sort_keys=True)
     return (
         f"{text}\n\n{LANE_BINDING_MARKER}\n"
-        "以下 JSON 是本线程唯一允许处理的任务范围；仅处理其中的 candidate_ids，"
-        "仅按 database_path 和 output_boundary 执行。\n"
+        "以下 JSON 是当前 Worker 回合唯一允许处理的任务范围；candidate_ids 必须且只会包含一家公司。"
+        "仅按 database_path 和 output_boundary 执行；安全写回后输出结构化单公司回执并等待下一回合，"
+        "不得遍历、预取、并行处理或宣称整条 lane 已完成。\n"
         f"{binding}"
     )
 
@@ -1095,7 +1096,7 @@ class AppServerClient:
                 self.request("thread/resume", {"threadId": thread_id})
                 return self._start_turn_with_model(
                     thread_id,
-                    request["prompt"],
+                    append_lane_binding(request["prompt"], request.get("input_binding")),
                     client_user_message_id=client_user_message_id,
                     selected_model=selected_model,
                     selected_effort=(

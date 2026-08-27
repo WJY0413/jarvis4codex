@@ -276,6 +276,7 @@ class LauncherTests(unittest.TestCase):
         self.assertIn("[Jarvis lane binding v1]", observed["prompt"])
         self.assertIn('"candidate_ids":[7,9]', observed["prompt"])
         self.assertIn('"database_path":"C:/collection.sqlite"', observed["prompt"])
+        self.assertIn("candidate_ids 必须且只会包含一家公司", observed["prompt"])
 
     def test_app_server_client_resumes_the_persisted_thread_before_starting_a_new_turn(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -311,6 +312,40 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(result["thread_id"], "thread-existing-1")
         self.assertEqual(result["prompt"], "继续")
         self.assertEqual(result["client_user_message_id"], "resume-1")
+
+    def test_app_server_client_rebinds_the_single_candidate_when_recovering_a_thread(self):
+        with tempfile.TemporaryDirectory() as temp:
+            _, _, config = self.make_queue(temp)
+            client = AppServerClient.__new__(AppServerClient)
+            client.config = config
+            client.start = lambda: None
+            client.request = lambda method, params: (
+                {"thread": {"id": params["threadId"]}}
+                if method == "thread/resume" else (_ for _ in ()).throw(AssertionError(method))
+            )
+            client.select_model = lambda _model: "gpt-test"
+            observed = {}
+            client._start_turn_with_model = lambda thread_id, prompt, **kwargs: observed.update(
+                thread_id=thread_id, prompt=prompt, **kwargs
+            ) or {"thread_id": thread_id, "turn_id": "turn-recovered-1"}
+
+            client.run_existing_task(
+                "thread-existing-1",
+                {
+                    "prompt": "继续",
+                    "input_binding": {
+                        "candidate_ids": [7],
+                        "database_path": "C:/collection.sqlite",
+                        "output_boundary": "C:/outputs/worker-1",
+                    },
+                },
+                client_user_message_id="recover-1",
+            )
+
+        self.assertEqual(observed["thread_id"], "thread-existing-1")
+        self.assertIn("[Jarvis lane binding v1]", observed["prompt"])
+        self.assertIn('"candidate_ids":[7]', observed["prompt"])
+        self.assertIn("candidate_ids 必须且只会包含一家公司", observed["prompt"])
 
     def test_invalid_reasoning_effort_is_rejected_before_queueing(self):
         with tempfile.TemporaryDirectory() as temp:

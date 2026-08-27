@@ -113,7 +113,7 @@ class LoopController:
                 model=request["model"], reasoning_effort=request["reasoning_effort"],
                 max_turns=request["max_turns"], auto_continue=False,
                 continue_prompt=request["continue_prompt"], notifications=request["notifications"],
-                input_binding=child.get("lane"),
+                input_binding=_current_turn_binding(child, round_number=1),
             )
             child["last_receipt"] = receipt
             child["hold_id"] = _nested_text(receipt, "data", "monitor_id") or _nested_text(receipt, "data", "hold_id")
@@ -164,7 +164,9 @@ class LoopController:
                 child["phase"] = "blocked"; state["status"] = "blocked"; continue
             if not state["auto_continue"]:
                 child["phase"] = "completed"; continue
-            if int(child["round"]) >= int(state["max_rounds"]):
+            lane = child.get("lane")
+            round_limit = len(lane["candidate_ids"]) if isinstance(lane, Mapping) else int(state["max_rounds"])
+            if int(child["round"]) >= round_limit:
                 child["phase"] = "completed"; continue
             if not child.get("thread_id") or not child.get("hold_id"):
                 child["phase"] = "blocked"; state["status"] = "blocked"; continue
@@ -175,7 +177,7 @@ class LoopController:
                 model=state["model"], reasoning_effort=state["reasoning_effort"],
                 hold_id=child["hold_id"], max_turns=state["max_turns"], auto_continue=False,
                 continue_prompt=state["continue_prompt"], notifications=state["notifications"],
-                input_binding=child.get("lane"),
+                input_binding=_current_turn_binding(child, round_number=next_round),
             )
             child["last_receipt"] = receipt
             if receipt.get("status") in ACTIVE:
@@ -345,6 +347,8 @@ def _validate_start(raw: Mapping[str, Any]) -> dict[str, Any]:
                     or len(set(candidate_ids)) != len(candidate_ids)
                     or not database_path or not output_boundary):
                 raise ValueError("thread lane requires unique positive candidate_ids, database_path, and output_boundary")
+            if max_rounds < len(candidate_ids):
+                raise ValueError("max_rounds must cover every candidate in each thread lane")
             child["lane"] = {"candidate_ids": list(candidate_ids), "database_path": database_path,
                              "output_boundary": output_boundary}
         if acquire == "create":
@@ -378,8 +382,25 @@ def _worker_prompt(controller_skill: str, business_skill: str) -> str:
     return (
         "你是本次 Jarvis Worker。\n\n"
         f"执行、续跑和回执规则，必须严格遵守 ${controller_skill}。\n"
+        "每个 Worker 回合仅处理 binding 中的一家公司；安全写回后输出结构化单公司回执并等待下一回合，"
+        "不得遍历、预取、并行处理或宣称整条 lane 已完成。\n"
         f"处理公司和完成本次业务工作，必须严格遵守 ${business_skill}。"
     )
+
+
+def _current_turn_binding(child: Mapping[str, Any], *, round_number: int) -> dict[str, Any] | None:
+    """Expose exactly one stable lane candidate to one Worker turn."""
+    lane = child.get("lane")
+    if not isinstance(lane, Mapping):
+        return None
+    candidate_ids = lane.get("candidate_ids")
+    if not isinstance(candidate_ids, list) or round_number < 1 or round_number > len(candidate_ids):
+        return None
+    return {
+        "candidate_ids": [candidate_ids[round_number - 1]],
+        "database_path": lane["database_path"],
+        "output_boundary": lane["output_boundary"],
+    }
 
 
 def _nested_text(value: Mapping[str, Any], *keys: str) -> str | None:
