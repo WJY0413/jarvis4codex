@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -27,7 +28,7 @@ def _now() -> str:
 
 def _write_json(path: Path, value: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary = path.with_suffix(path.suffix + f".{os.getpid()}.{threading.get_ident()}.tmp")
     temporary.write_text(json.dumps(value, ensure_ascii=False), encoding="utf-8")
     temporary.replace(path)
 
@@ -42,11 +43,14 @@ def _read_json(path: Path) -> dict[str, Any] | None:
 class JarvisHoldHost:
     """One small seam: consume accepted local requests and hold their App Server turns."""
 
-    def __init__(self, *, state_dir: Path, launcher_config: Path) -> None:
+    def __init__(self, *, state_dir: Path, launcher_config: Path, workers: int = 1) -> None:
         self.state_dir = state_dir
         self.launcher_config = launcher_config
         self.requests_roots = (state_dir / "task-holds", state_dir / "task-monitors")
         self.health_path = state_dir / "hold-host.json"
+        self.workers = max(int(workers), 1)
+        self._active_hold_ids: set[str] = set()
+        self._health_lock = threading.Lock()
 
     def run_once(self) -> bool:
         self._write_health("ready")
@@ -65,31 +69,80 @@ class JarvisHoldHost:
                     continue
                 if str(ack.get("phase") or "") != "queued_for_user_host":
                     continue
-                _write_json(ack_path, {
-                    **ack,
-                    "phase": "claimed_by_user_host",
-                    "host_pid": os.getpid(),
-                    "observed_at": _now(),
-                })
+                if not self._claim(root, ack_path, ack):
+                    continue
+                hold_id = str(request.get("hold_id") or request.get("monitor_id") or root.name)
+                self._mark_active(hold_id)
                 self._write_health("holding", request_id=str(request.get("request_id") or ""))
-                hold_task(self.launcher_config, request_path, ack_path, result_path)
-                self._write_health("ready")
+                try:
+                    hold_task(self.launcher_config, request_path, ack_path, result_path)
+                finally:
+                    self._mark_inactive(hold_id)
+                    self._release_claim(root)
+                    self._write_health("ready")
                 return True
         return False
 
-    def run_forever(self, *, poll_seconds: float) -> None:
-        while True:
-            handled = self.run_once()
-            if not handled:
-                time.sleep(max(poll_seconds, 0.25))
-
-    def _write_health(self, status: str, *, request_id: str | None = None) -> None:
-        _write_json(self.health_path, {
-            "status": status,
-            "pid": os.getpid(),
-            "request_id": request_id,
+    @staticmethod
+    def _claim(root: Path, ack_path: Path, ack: dict[str, Any]) -> bool:
+        claim_dir = root / ".user-host-claim"
+        try:
+            claim_dir.mkdir()
+        except FileExistsError:
+            return False
+        _write_json(claim_dir / "owner.json", {"pid": os.getpid(), "observed_at": _now()})
+        _write_json(ack_path, {
+            **ack,
+            "phase": "claimed_by_user_host",
+            "host_pid": os.getpid(),
             "observed_at": _now(),
         })
+        return True
+
+    @staticmethod
+    def _release_claim(root: Path) -> None:
+        claim_dir = root / ".user-host-claim"
+        owner = claim_dir / "owner.json"
+        if owner.is_file():
+            owner.unlink()
+        if claim_dir.is_dir():
+            claim_dir.rmdir()
+
+    def run_forever(self, *, poll_seconds: float) -> None:
+        threads = [threading.Thread(target=self._run_worker, args=(poll_seconds,), daemon=True) for _ in range(self.workers)]
+        for worker in threads:
+            worker.start()
+        for worker in threads:
+            worker.join()
+
+    def _run_worker(self, poll_seconds: float) -> None:
+        while True:
+            if not self.run_once():
+                time.sleep(max(poll_seconds, 0.25))
+
+    def _mark_active(self, hold_id: str) -> None:
+        with self._health_lock:
+            self._active_hold_ids.add(hold_id)
+
+    def _mark_inactive(self, hold_id: str) -> None:
+        with self._health_lock:
+            self._active_hold_ids.discard(hold_id)
+
+    def _write_health(self, status: str, *, request_id: str | None = None) -> None:
+        with self._health_lock:
+            active_hold_ids = sorted(self._active_hold_ids)
+            try:
+                _write_json(self.health_path, {
+                    "status": "holding" if active_hold_ids else status,
+                    "pid": os.getpid(),
+                    "request_id": request_id,
+                    "worker_capacity": self.workers,
+                    "active_count": len(active_hold_ids),
+                    "active_hold_ids": active_hold_ids,
+                    "observed_at": _now(),
+                })
+            except PermissionError:
+                pass
 
 
 def main() -> int:
@@ -97,10 +150,12 @@ def main() -> int:
     parser.add_argument("--state-dir", type=Path, required=True)
     parser.add_argument("--launcher-config", type=Path, required=True)
     parser.add_argument("--poll-seconds", type=float, default=1.0)
+    parser.add_argument("--workers", type=int, default=1)
     args = parser.parse_args()
     JarvisHoldHost(
         state_dir=args.state_dir,
         launcher_config=args.launcher_config,
+        workers=args.workers,
     ).run_forever(poll_seconds=args.poll_seconds)
     return 0
 

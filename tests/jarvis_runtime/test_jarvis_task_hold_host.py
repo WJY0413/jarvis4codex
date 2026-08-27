@@ -200,6 +200,19 @@ class TaskMonitorHostTest(unittest.TestCase):
         runner.assert_called_once()
         self.assertEqual(health["status"], "ready")
 
+    def test_second_host_cannot_claim_the_same_accepted_hold(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "task-holds" / "hold-1"
+            root.mkdir(parents=True)
+            ack_path = root / "ack.json"
+            ack = {"request_id": "hold-1", "status": "accepted", "phase": "queued_for_user_host"}
+            ack_path.write_text(json.dumps(ack), encoding="utf-8")
+
+            self.assertTrue(JarvisHoldHost._claim(root, ack_path, ack))
+            self.assertFalse(JarvisHoldHost._claim(root, ack_path, ack))
+            JarvisHoldHost._release_claim(root)
+            self.assertTrue(JarvisHoldHost._claim(root, ack_path, ack))
+
 
 if __name__ == "__main__":
     unittest.main()
