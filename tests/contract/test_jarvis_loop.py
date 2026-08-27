@@ -208,6 +208,12 @@ class JarvisLoopContractTest(unittest.TestCase):
                 "acquire": "create|resume (default create)",
                 "create_requires": ["title"],
                 "resume_requires": ["task_id"],
+                "lane": {
+                    "optional": True,
+                    "candidate_ids": "unique positive integers",
+                    "database_path": "non-empty path",
+                    "output_boundary": "non-empty path",
+                },
             },
             "count": "must equal target_thread_count when supplied",
         })
