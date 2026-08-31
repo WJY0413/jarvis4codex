@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import json
-import os
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from adapters.codex_app_server.task_provisioning_adapter import CodexAppServerTaskProvisioningAdapter
@@ -21,14 +21,16 @@ class FakeConfig:
 
 
 class TaskProvisioningAdapterContractTest(unittest.TestCase):
-    def test_hold_host_health_accepts_a_ready_matching_identity(self):
+    def test_hold_host_health_accepts_a_fresh_holding_identity_with_a_dead_pid(self):
         config = FakeConfig()
         with tempfile.TemporaryDirectory() as temp:
             state_dir = Path(temp)
             config_path = state_dir / "launcher.json"
             (state_dir / "hold-host.json").write_text(json.dumps({
-                "status": "ready",
-                "pid": os.getpid(),
+                "status": "holding",
+                "pid": 1780,
+                "active_count": 3,
+                "observed_at": datetime.now(timezone.utc).isoformat(),
                 "profile": config.profile,
                 "codex_home": config.expected_codex_home,
                 "state_dir": str(state_dir.resolve()),
@@ -40,6 +42,48 @@ class TaskProvisioningAdapterContractTest(unittest.TestCase):
             health = adapter.hold_host_health()
 
         self.assertEqual(health, {"status": "ready"})
+
+    def test_hold_host_health_blocks_a_stale_identity(self):
+        config = FakeConfig()
+        with tempfile.TemporaryDirectory() as temp:
+            state_dir = Path(temp)
+            (state_dir / "hold-host.json").write_text(json.dumps({
+                "status": "ready",
+                "pid": 1780,
+                "observed_at": (datetime.now(timezone.utc) - timedelta(seconds=31)).isoformat(),
+                "profile": config.profile,
+                "codex_home": config.expected_codex_home,
+                "state_dir": str(state_dir.resolve()),
+            }), encoding="utf-8")
+            adapter = CodexAppServerTaskProvisioningAdapter(
+                state_dir / "launcher.json", state_dir=state_dir, config_loader=lambda _: config
+            )
+
+            health = adapter.hold_host_health()
+
+        self.assertEqual(health["status"], "host_not_ready")
+        self.assertEqual(health["reason"], "HoldHost observed_at is stale")
+
+    def test_hold_host_health_blocks_a_profile_mismatch(self):
+        config = FakeConfig()
+        with tempfile.TemporaryDirectory() as temp:
+            state_dir = Path(temp)
+            (state_dir / "hold-host.json").write_text(json.dumps({
+                "status": "ready",
+                "pid": 1780,
+                "observed_at": datetime.now(timezone.utc).isoformat(),
+                "profile": "other",
+                "codex_home": config.expected_codex_home,
+                "state_dir": str(state_dir.resolve()),
+            }), encoding="utf-8")
+            adapter = CodexAppServerTaskProvisioningAdapter(
+                state_dir / "launcher.json", state_dir=state_dir, config_loader=lambda _: config
+            )
+
+            health = adapter.hold_host_health()
+
+        self.assertEqual(health["status"], "host_not_ready")
+        self.assertEqual(health["reason"], "HoldHost profile does not match")
 
     def test_create_queues_for_the_user_host_without_starting_an_app_server(self):
         config = FakeConfig()

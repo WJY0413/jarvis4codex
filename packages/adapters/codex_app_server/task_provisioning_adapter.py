@@ -7,6 +7,7 @@ import os
 import re
 import sys
 from collections.abc import Callable
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +23,7 @@ class CodexAppServerTaskProvisioningAdapter:
     """Queue one task; the MCP process never starts or owns an App Server."""
 
     name = "codex-app-server-provisioning"
+    _HOST_HEALTH_MAX_AGE = timedelta(seconds=30)
 
     def __init__(
         self,
@@ -101,9 +103,11 @@ class CodexAppServerTaskProvisioningAdapter:
             return {"status": "host_not_ready", "reason": "HoldHost health file is unreadable"}
         if str(health.get("status") or "") not in {"ready", "holding"}:
             return {"status": "host_not_ready", "reason": "HoldHost status is not ready"}
-        pid = _positive_int(health.get("pid"))
-        if pid is None or not _pid_is_alive(pid):
-            return {"status": "host_not_ready", "reason": "HoldHost PID is not alive"}
+        observed_at = _parse_observed_at(health.get("observed_at"))
+        if observed_at is None:
+            return {"status": "host_not_ready", "reason": "HoldHost observed_at is invalid"}
+        if observed_now() - observed_at > self._HOST_HEALTH_MAX_AGE:
+            return {"status": "host_not_ready", "reason": "HoldHost observed_at is stale"}
         profile = str(getattr(config, "profile", "") or "").strip()
         if not profile or str(health.get("profile") or "").strip() != profile:
             return {"status": "host_not_ready", "reason": "HoldHost profile does not match"}
@@ -311,14 +315,12 @@ def _same_path(left: object, right: object) -> bool:
         return False
 
 
-def _pid_is_alive(pid: int) -> bool:
+def _parse_observed_at(value: object) -> datetime | None:
     try:
-        os.kill(pid, 0)
-    except PermissionError:
-        return True
-    except OSError:
-        return False
-    return True
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed.astimezone(timezone.utc)
 
 
 def _safe_id(value: str) -> str:
