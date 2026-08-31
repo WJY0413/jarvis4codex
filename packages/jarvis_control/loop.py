@@ -318,7 +318,6 @@ def _validate_start(raw: Mapping[str, Any]) -> dict[str, Any]:
     task_prompt = str(raw["prompt"]).strip()
     if not task_prompt:
         raise ValueError("prompt is required")
-    prompt = _worker_prompt(task_prompt, controller_skill, business_skill)
     threads = raw.get("threads")
     if threads is None:
         title = str(raw.get("title") or f"Jarvis loop {raw['request_id']}").strip()
@@ -337,7 +336,7 @@ def _validate_start(raw: Mapping[str, Any]) -> dict[str, Any]:
         if not slot or slot in slots or acquire not in {"create", "resume"}:
             raise ValueError("each thread requires a unique slot and acquire=create|resume")
         slots.add(slot)
-        child: dict[str, Any] = {"slot": slot, "acquire": acquire, "prompt": prompt}
+        child: dict[str, Any] = {"slot": slot, "acquire": acquire}
         lane = raw_child.get("lane")
         if lane is not None:
             if not isinstance(lane, Mapping):
@@ -354,6 +353,7 @@ def _validate_start(raw: Mapping[str, Any]) -> dict[str, Any]:
                 raise ValueError("max_rounds must cover every candidate in each thread lane")
             child["lane"] = {"candidate_ids": list(candidate_ids), "database_path": database_path,
                              "output_boundary": output_boundary}
+        child["prompt"] = _worker_prompt(task_prompt, controller_skill, business_skill, lane_bound="lane" in child)
         if acquire == "create":
             child["title"] = str(raw_child.get("title") or raw.get("title") or "").strip()
             if not child["title"]:
@@ -372,21 +372,27 @@ def _validate_start(raw: Mapping[str, Any]) -> dict[str, Any]:
         notifications = dict(notifications)
     else:
         raise ValueError("notifications must be a boolean or object")
+    continue_prompt = _worker_prompt(task_prompt, controller_skill, business_skill,
+                                     lane_bound=any("lane" in child for child in normalized))
     return {"request_id": str(raw["request_id"]).strip(), "project": str(raw["project"]).strip(), "threads": normalized,
             "target_thread_count": target_count, "max_rounds": max_rounds, "max_turns": max_turns,
-            "auto_continue": auto_continue, "continue_prompt": prompt,
+            "auto_continue": auto_continue, "continue_prompt": continue_prompt,
             "controller_skill": controller_skill, "business_skill": business_skill,
             "model": str(raw.get("model") or "gpt-5.6-luna").strip() or "gpt-5.6-luna",
             "reasoning_effort": str(raw.get("reasoning_effort") or "max").strip() or "max",
             "notifications": notifications, "interval_seconds": interval, "expires_at": expires.isoformat()}
 
 
-def _worker_prompt(task_prompt: str, controller_skill: str, business_skill: str) -> str:
+def _worker_prompt(task_prompt: str, controller_skill: str, business_skill: str, *, lane_bound: bool) -> str:
+    binding_rule = (
+        "每个 Worker 回合仅处理 binding 中的一家公司；安全写回后输出结构化单公司回执并等待下一回合，"
+        "不得遍历、预取、并行处理或宣称整条 lane 已完成。\n"
+        if lane_bound else ""
+    )
     return (
         f"{task_prompt}\n\n你是本次 Jarvis Worker。\n\n"
         f"执行、续跑和回执规则，必须严格遵守 ${controller_skill}。\n"
-        "每个 Worker 回合仅处理 binding 中的一家公司；安全写回后输出结构化单公司回执并等待下一回合，"
-        "不得遍历、预取、并行处理或宣称整条 lane 已完成。\n"
+        f"{binding_rule}"
         f"处理公司和完成本次业务工作，必须严格遵守 ${business_skill}。"
     )
 

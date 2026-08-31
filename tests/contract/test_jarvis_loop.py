@@ -84,8 +84,6 @@ class JarvisLoopContractTest(unittest.TestCase):
         prompt = (
             "从 1 数到 20\n\n你是本次 Jarvis Worker。\n\n"
             "执行、续跑和回执规则，必须严格遵守 $jarvis-run-controller。\n"
-            "每个 Worker 回合仅处理 binding 中的一家公司；安全写回后输出结构化单公司回执并等待下一回合，"
-            "不得遍历、预取、并行处理或宣称整条 lane 已完成。\n"
             "处理公司和完成本次业务工作，必须严格遵守 $bd-search-stage6-research。"
         )
         started = self.controller.start(
@@ -105,6 +103,18 @@ class JarvisLoopContractTest(unittest.TestCase):
         self.controller.tick(self.runtime, loop_id=started.loop_id)
 
         self.assertEqual(self.runtime.hold_calls[1]["prompt"], prompt.replace("jarvis-run-controller", "company-run-controller"))
+
+    def test_loop_keeps_explicit_prompt_free_of_lane_default_without_lane(self):
+        started = self.controller.start(
+            self.runtime, request_id="plain-prompt", project="Jarvis4codex", title="Worker",
+            prompt="从 1 数到 20。", business_skill="counting-test", target_thread_count=1,
+            max_rounds=2, expires_at="2099-01-01T00:00:00+00:00",
+        )
+
+        prompt = self.runtime.hold_calls[0]["prompt"]
+        self.assertTrue(prompt.startswith("从 1 数到 20。"))
+        self.assertNotIn("binding 中的一家公司", prompt)
+        self.assertEqual(started.data["children"][0]["prompt"], prompt)
 
     def test_loop_exposes_one_stable_lane_candidate_per_worker_turn(self):
         lane = {"candidate_ids": [7, 9], "database_path": "C:/collection.sqlite", "output_boundary": "C:/outputs/worker-1"}
