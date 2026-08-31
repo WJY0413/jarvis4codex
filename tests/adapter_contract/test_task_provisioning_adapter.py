@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -11,12 +12,35 @@ from jarvis_control.provisioning import TaskMonitorResumeRequest
 
 
 class FakeConfig:
+    profile = "jarvis_test"
+    expected_codex_home = "C:/test/codex-home"
+
     def resolve_project(self, project: str):
         self.project = project
         return project, "C:/test/project"
 
 
 class TaskProvisioningAdapterContractTest(unittest.TestCase):
+    def test_hold_host_health_accepts_a_ready_matching_identity(self):
+        config = FakeConfig()
+        with tempfile.TemporaryDirectory() as temp:
+            state_dir = Path(temp)
+            config_path = state_dir / "launcher.json"
+            (state_dir / "hold-host.json").write_text(json.dumps({
+                "status": "ready",
+                "pid": os.getpid(),
+                "profile": config.profile,
+                "codex_home": config.expected_codex_home,
+                "state_dir": str(state_dir.resolve()),
+            }), encoding="utf-8")
+            adapter = CodexAppServerTaskProvisioningAdapter(
+                config_path, state_dir=state_dir, config_loader=lambda _: config
+            )
+
+            health = adapter.hold_host_health()
+
+        self.assertEqual(health, {"status": "ready"})
+
     def test_create_queues_for_the_user_host_without_starting_an_app_server(self):
         config = FakeConfig()
         with tempfile.TemporaryDirectory() as temp:

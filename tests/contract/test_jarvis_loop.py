@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import ast
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 import tempfile
 import unittest
 
+from adapters.codex_app_server.task_provisioning_adapter import CodexAppServerTaskProvisioningAdapter
 from jarvis_control import JarvisControl, LoopController, LoopStore
 
 
@@ -254,6 +256,36 @@ class JarvisLoopContractTest(unittest.TestCase):
         receipt = control.loop(action="start", request_id="no-loop")
         self.assertEqual(receipt["tool"], "jarvis_loop")
         self.assertEqual(receipt["status"], "unsupported")
+
+    def test_loop_start_fails_closed_before_hold_loop_or_heartbeat_when_host_is_unready(self):
+        class Config:
+            profile = "jarvis_test"
+            expected_codex_home = "C:/test/codex-home"
+
+        state_dir = Path(self.temp.name)
+        (state_dir / "hold-host.json").write_text(json.dumps({
+            "status": "holding",
+            "pid": 99999999,
+            "active_count": 3,
+            "profile": "jarvis_test",
+            "codex_home": "C:/test/codex-home",
+            "state_dir": str(state_dir.resolve()),
+        }), encoding="utf-8")
+        adapter = CodexAppServerTaskProvisioningAdapter(
+            state_dir / "launcher.json", state_dir=state_dir, config_loader=lambda _: Config()
+        )
+        control = JarvisControl(object(), object(), adapter, loop_controller=self.controller)
+        receipt = control.loop(
+            action="start", request_id="dead-host", project="Jarvis4codex", title="Worker",
+            prompt="hello", business_skill="bd-search-stage6-research", target_thread_count=1,
+            max_rounds=1, expires_at="2099-01-01T00:00:00+00:00",
+        )
+
+        self.assertEqual(receipt["status"], "host_not_ready")
+        self.assertFalse(receipt["readback"]["verified"])
+        self.assertFalse((Path(self.temp.name) / "loops" / "loop-dead-host").exists())
+        self.assertEqual(self.runtime.hold_calls, [])
+        self.assertEqual(self.runtime.heartbeat_calls, [])
 
     def test_loop_preflight_returns_start_contract_without_starting_any_hold(self):
         class Provisioner:

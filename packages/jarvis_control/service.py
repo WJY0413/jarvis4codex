@@ -55,6 +55,14 @@ class JarvisControl:
                 readback={"verified": True, "terminal": False},
             )
         if action == "start":
+            health_reader = getattr(self._provisioner, "hold_host_health", None)
+            health = health_reader() if callable(health_reader) else {"status": "host_not_ready", "reason": "no HoldHost health adapter is configured"}
+            if health.get("status") != "ready":
+                return self._receipt(
+                    "jarvis_loop", "host_not_ready", request_id=options.get("request_id"),
+                    reason=str(health.get("reason") or "HoldHost is not ready"), data=health,
+                    readback={"verified": False, "terminal": False},
+                )
             result = self._loop_controller.start(self, **options)
         elif action == "tick":
             result = self._loop_controller.tick(self, loop_id=str(loop_id or ""))

@@ -178,6 +178,11 @@ class TaskMonitorHostTest(unittest.TestCase):
     def test_normal_user_host_claims_a_queued_request(self):
         with tempfile.TemporaryDirectory() as temp:
             state_dir = Path(temp)
+            launcher_config = state_dir / "launcher.json"
+            launcher_config.write_text(json.dumps({
+                "profile": "jarvis_test",
+                "expected_codex_home": "C:/test/codex-home",
+            }), encoding="utf-8")
             root = state_dir / "task-monitors" / "monitor-create-1"
             root.mkdir(parents=True)
             (root / "request.json").write_text(json.dumps({"request_id": "create-1"}), encoding="utf-8")
@@ -191,7 +196,7 @@ class TaskMonitorHostTest(unittest.TestCase):
 
             with patch("adapters.codex_app_server.jarvis_hold_host_service.hold_task", side_effect=fake_hold) as runner:
                 handled = JarvisHoldHost(
-                    state_dir=state_dir, launcher_config=Path("launcher.json")
+                    state_dir=state_dir, launcher_config=launcher_config
                 ).run_once()
 
             health = json.loads((state_dir / "hold-host.json").read_text(encoding="utf-8"))
@@ -199,6 +204,9 @@ class TaskMonitorHostTest(unittest.TestCase):
         self.assertTrue(handled)
         runner.assert_called_once()
         self.assertEqual(health["status"], "ready")
+        self.assertEqual(health["profile"], "jarvis_test")
+        self.assertEqual(health["codex_home"], "C:/test/codex-home")
+        self.assertEqual(health["state_dir"], str(state_dir.resolve()))
 
     def test_second_host_cannot_claim_the_same_accepted_hold(self):
         with tempfile.TemporaryDirectory() as temp:

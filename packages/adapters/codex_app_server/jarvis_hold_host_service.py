@@ -46,6 +46,9 @@ class JarvisHoldHost:
     def __init__(self, *, state_dir: Path, launcher_config: Path, workers: int = 1) -> None:
         self.state_dir = state_dir
         self.launcher_config = launcher_config
+        launcher = _read_json(launcher_config) or {}
+        self.profile = str(launcher.get("profile") or "").strip()
+        self.codex_home = str(launcher.get("expected_codex_home") or "").strip()
         self.requests_roots = (state_dir / "task-holds", state_dir / "task-monitors")
         self.health_path = state_dir / "hold-host.json"
         self.workers = max(int(workers), 1)
@@ -133,6 +136,9 @@ class JarvisHoldHost:
             active_hold_ids = sorted(self._active_hold_ids)
             try:
                 _write_json(self.health_path, {
+                    "profile": self.profile,
+                    "codex_home": self.codex_home,
+                    "state_dir": str(self.state_dir.resolve()),
                     "status": "holding" if active_hold_ids else status,
                     "pid": os.getpid(),
                     "request_id": request_id,

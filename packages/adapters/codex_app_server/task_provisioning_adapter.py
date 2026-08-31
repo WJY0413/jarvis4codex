@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 from collections.abc import Callable
@@ -88,6 +89,30 @@ class CodexAppServerTaskProvisioningAdapter:
         """Return configured public project identifiers without writing a task request."""
         config = self._config_loader(self._config_path)
         return sorted(config.allowed_projects)
+
+    def hold_host_health(self) -> dict[str, str]:
+        """Check whether the fixed HoldHost can accept a Loop before it is created."""
+        try:
+            config = self._config_loader(self._config_path)
+        except Exception as exc:
+            return {"status": "host_not_ready", "reason": f"HoldHost config is unreadable: {exc}"}
+        health = _read_json_file(self._state_dir / "hold-host.json")
+        if health is None:
+            return {"status": "host_not_ready", "reason": "HoldHost health file is unreadable"}
+        if str(health.get("status") or "") not in {"ready", "holding"}:
+            return {"status": "host_not_ready", "reason": "HoldHost status is not ready"}
+        pid = _positive_int(health.get("pid"))
+        if pid is None or not _pid_is_alive(pid):
+            return {"status": "host_not_ready", "reason": "HoldHost PID is not alive"}
+        profile = str(getattr(config, "profile", "") or "").strip()
+        if not profile or str(health.get("profile") or "").strip() != profile:
+            return {"status": "host_not_ready", "reason": "HoldHost profile does not match"}
+        codex_home = str(getattr(config, "expected_codex_home", "") or "").strip()
+        if not codex_home or not _same_path(health.get("codex_home"), codex_home):
+            return {"status": "host_not_ready", "reason": "HoldHost CODEX_HOME does not match"}
+        if not _same_path(health.get("state_dir"), self._state_dir):
+            return {"status": "host_not_ready", "reason": "HoldHost state_dir does not match"}
+        return {"status": "ready"}
 
     def resume_with_monitor(self, request: TaskMonitorResumeRequest) -> TaskProvisionReceipt:
         try:
@@ -222,6 +247,14 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     return values
 
 
+def _read_json_file(path: Path) -> dict[str, Any] | None:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
 def _append_jsonl(path: Path, value: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
@@ -269,6 +302,23 @@ def _positive_int(value: Any) -> int | None:
     except (TypeError, ValueError):
         return None
     return parsed if parsed > 0 else None
+
+
+def _same_path(left: object, right: object) -> bool:
+    try:
+        return os.path.normcase(str(Path(str(left)).resolve())) == os.path.normcase(str(Path(str(right)).resolve()))
+    except OSError:
+        return False
+
+
+def _pid_is_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
 
 
 def _safe_id(value: str) -> str:

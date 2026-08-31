@@ -190,6 +190,7 @@ class NativeTaskLauncherConfig:
             raw.get("dispatcher_thread_id"), "dispatcher_thread_id"
         )
         self.codex_cli = str(raw.get("codex_cli") or "auto")
+        self.profile = str(raw.get("profile") or "").strip()
         self.expected_codex_home = str(raw.get("expected_codex_home") or "").strip()
         self.live_creation_enabled = bool(raw.get("live_creation_enabled", False))
         self.poll_seconds = max(float(raw.get("poll_seconds", 2)), 0.25)
