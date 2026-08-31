@@ -107,7 +107,7 @@ class JarvisMcpServer:
 
         @self.mcp.tool(
             name="jarvis_loop",
-            description="Preflight, start, inspect, or stop one bounded Jarvis loop. action=preflight is read-only; action=start requires business_skill; controller_skill defaults to jarvis-run-controller.",
+            description="Preflight, start, inspect, or stop one bounded Jarvis loop. action=preflight is read-only; action=start requires prompt and business_skill; controller_skill defaults to jarvis-run-controller.",
             annotations=ToolAnnotations(destructiveHint=False, idempotentHint=False, openWorldHint=False),
         )
         def jarvis_loop(
@@ -116,6 +116,7 @@ class JarvisMcpServer:
             request_id: str | None = None,
             project: str | None = None,
             title: str | None = None,
+            prompt: Annotated[str | None, Field(description="Required when action=start.")] = None,
             business_skill: Annotated[str | None, Field(description="Required when action=start.")] = None,
             controller_skill: Annotated[str | None, Field(description="Optional when action=start; defaults to jarvis-run-controller.")] = None,
             target_thread_count: int | None = None,
@@ -131,7 +132,7 @@ class JarvisMcpServer:
         ) -> CallToolResult:
             return _tool_result(self.control.loop(
                 action=action, loop_id=loop_id, request_id=request_id, project=project,
-                title=title, business_skill=business_skill, controller_skill=controller_skill, target_thread_count=target_thread_count,
+                title=title, prompt=prompt, business_skill=business_skill, controller_skill=controller_skill, target_thread_count=target_thread_count,
                 threads=threads, max_rounds=max_rounds, max_turns=max_turns,
                 auto_continue=auto_continue, interval_seconds=interval_seconds,
                 expires_at=expires_at, model=model, reasoning_effort=reasoning_effort,

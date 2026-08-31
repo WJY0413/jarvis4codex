@@ -40,7 +40,7 @@ class JarvisLoopContractTest(unittest.TestCase):
 
     def test_loop_observes_hold_then_resumes_only_after_terminal_readback(self):
         started = self.controller.start(
-            self.runtime, request_id="contract-1", project="Jarvis4codex", title="Worker",
+            self.runtime, request_id="contract-1", project="Jarvis4codex", title="Worker", prompt="test task",
             business_skill="bd-search-stage6-research", target_thread_count=1, max_rounds=2, max_turns=3,
             expires_at="2099-01-01T00:00:00+00:00",
         )
@@ -66,7 +66,7 @@ class JarvisLoopContractTest(unittest.TestCase):
 
     def test_loop_does_not_resume_after_one_terminal_turn_when_auto_continue_is_false(self):
         started = self.controller.start(
-            self.runtime, request_id="no-auto", project="Jarvis4codex", title="Worker",
+            self.runtime, request_id="no-auto", project="Jarvis4codex", title="Worker", prompt="test task",
             business_skill="bd-search-stage6-research", target_thread_count=1, max_rounds=9,
             auto_continue=False, expires_at="2099-01-01T00:00:00+00:00",
         )
@@ -80,14 +80,14 @@ class JarvisLoopContractTest(unittest.TestCase):
 
     def test_loop_renders_the_worker_skill_prompt_for_create_and_resume(self):
         prompt = (
-            "你是本次 Jarvis Worker。\n\n"
+            "从 1 数到 20\n\n你是本次 Jarvis Worker。\n\n"
             "执行、续跑和回执规则，必须严格遵守 $jarvis-run-controller。\n"
             "每个 Worker 回合仅处理 binding 中的一家公司；安全写回后输出结构化单公司回执并等待下一回合，"
             "不得遍历、预取、并行处理或宣称整条 lane 已完成。\n"
             "处理公司和完成本次业务工作，必须严格遵守 $bd-search-stage6-research。"
         )
         started = self.controller.start(
-            self.runtime, request_id="skills", project="Jarvis4codex", title="Worker",
+            self.runtime, request_id="skills", project="Jarvis4codex", title="Worker", prompt="从 1 数到 20",
             business_skill="bd-search-stage6-research", controller_skill="company-run-controller",
             target_thread_count=1, max_rounds=2,
             expires_at="2099-01-01T00:00:00+00:00",
@@ -107,7 +107,7 @@ class JarvisLoopContractTest(unittest.TestCase):
     def test_loop_exposes_one_stable_lane_candidate_per_worker_turn(self):
         lane = {"candidate_ids": [7, 9], "database_path": "C:/collection.sqlite", "output_boundary": "C:/outputs/worker-1"}
         started = self.controller.start(
-            self.runtime, request_id="lane", project="Jarvis4codex", title="Worker",
+            self.runtime, request_id="lane", project="Jarvis4codex", title="Worker", prompt="test task",
             business_skill="marketing-collection-mining", target_thread_count=1, max_rounds=2,
             threads=[{"slot": "worker-1", "acquire": "create", "title": "Worker", "lane": lane}],
             expires_at="2099-01-01T00:00:00+00:00",
@@ -131,7 +131,7 @@ class JarvisLoopContractTest(unittest.TestCase):
             list(range(201, 257)),
         ]
         started = self.controller.start(
-            self.runtime, request_id="uneven-lanes", project="Jarvis4codex", title="Worker",
+            self.runtime, request_id="uneven-lanes", project="Jarvis4codex", title="Worker", prompt="test task",
             business_skill="marketing-collection-mining", target_thread_count=3, max_rounds=57,
             threads=[
                 {"slot": f"worker-{number}", "acquire": "create", "title": "Worker", "lane": {
@@ -162,7 +162,7 @@ class JarvisLoopContractTest(unittest.TestCase):
 
     def test_loop_rejects_lane_that_exceeds_its_round_budget(self):
         result = self.controller.start(
-            self.runtime, request_id="lane-budget", project="Jarvis4codex", title="Worker",
+            self.runtime, request_id="lane-budget", project="Jarvis4codex", title="Worker", prompt="test task",
             business_skill="marketing-collection-mining", target_thread_count=1, max_rounds=1,
             threads=[{"slot": "worker-1", "acquire": "create", "title": "Worker", "lane": {
                 "candidate_ids": [7, 9], "database_path": "C:/collection.sqlite",
@@ -175,7 +175,7 @@ class JarvisLoopContractTest(unittest.TestCase):
 
     def test_loop_rejects_malformed_lane(self):
         result = self.controller.start(
-            self.runtime, request_id="bad-lane", project="Jarvis4codex", title="Worker",
+            self.runtime, request_id="bad-lane", project="Jarvis4codex", title="Worker", prompt="test task",
             business_skill="marketing-collection-mining", target_thread_count=1, max_rounds=1,
             threads=[{"slot": "worker-1", "acquire": "create", "title": "Worker", "lane": {"candidate_ids": [1, 1]}}],
             expires_at="2099-01-01T00:00:00+00:00",
@@ -185,7 +185,7 @@ class JarvisLoopContractTest(unittest.TestCase):
 
     def test_loop_rejects_missing_business_skill(self):
         result = self.controller.start(
-            self.runtime, request_id="missing-business-skill", project="Jarvis4codex", title="Worker",
+            self.runtime, request_id="missing-business-skill", project="Jarvis4codex", title="Worker", prompt="test task",
             target_thread_count=1, max_rounds=1, expires_at="2099-01-01T00:00:00+00:00",
         )
 
@@ -193,7 +193,7 @@ class JarvisLoopContractTest(unittest.TestCase):
         self.assertEqual(result.reason, "required loop fields: business_skill")
 
         blank = self.controller.start(
-            self.runtime, request_id="blank-business-skill", project="Jarvis4codex", title="Worker",
+            self.runtime, request_id="blank-business-skill", project="Jarvis4codex", title="Worker", prompt="test task",
             business_skill="   ", target_thread_count=1, max_rounds=1,
             expires_at="2099-01-01T00:00:00+00:00",
         )
@@ -202,7 +202,7 @@ class JarvisLoopContractTest(unittest.TestCase):
         self.assertEqual(blank.reason, "business_skill is required")
 
         overridden = self.controller.start(
-            self.runtime, request_id="thread-prompt", project="Jarvis4codex", title="Worker",
+            self.runtime, request_id="thread-prompt", project="Jarvis4codex", title="Worker", prompt="test task",
             business_skill="bd-search-stage6-research", target_thread_count=1, max_rounds=1,
             threads=[{"slot": "worker-1", "acquire": "create", "title": "Worker", "prompt": "override"}],
             expires_at="2099-01-01T00:00:00+00:00",
@@ -213,7 +213,7 @@ class JarvisLoopContractTest(unittest.TestCase):
 
     def test_confirmed_defaults_create_every_omitted_thread_and_reach_hold(self):
         started = self.controller.start(
-            self.runtime, request_id="defaults", project="Jarvis4codex", title="Worker",
+            self.runtime, request_id="defaults", project="Jarvis4codex", title="Worker", prompt="test task",
             business_skill="bd-search-stage6-research", target_thread_count=2, max_rounds=1,
             expires_at="2099-01-01T00:00:00+00:00",
         )
@@ -236,7 +236,7 @@ class JarvisLoopContractTest(unittest.TestCase):
     def test_explicit_loop_fields_pass_unchanged_to_hold(self):
         notifications = {"milestones": [3], "terminal": False}
         self.controller.start(
-            self.runtime, request_id="override", project="Jarvis4codex", title="Worker",
+            self.runtime, request_id="override", project="Jarvis4codex", title="Worker", prompt="test task",
             business_skill="bd-search-stage6-research", target_thread_count=1, max_rounds=1, max_turns=7,
             model="gpt-5.6-terra", reasoning_effort="high", auto_continue=False,
             notifications=notifications, expires_at="2099-01-01T00:00:00+00:00",
@@ -268,7 +268,7 @@ class JarvisLoopContractTest(unittest.TestCase):
         self.assertEqual(receipt["data"]["allowed_projects"], ["BD Search Worker", "Jarvis4codex"])
         self.assertEqual(
             receipt["data"]["start_contract"]["required"],
-            ["request_id", "project", "business_skill", "target_thread_count", "max_rounds", "expires_at"],
+            ["request_id", "project", "prompt", "business_skill", "target_thread_count", "max_rounds", "expires_at"],
         )
         self.assertEqual(receipt["data"]["start_contract"]["threads"], {
             "item": {
@@ -295,7 +295,7 @@ class JarvisLoopContractTest(unittest.TestCase):
         path.write_text("{}", encoding="utf-8")
 
         result = self.controller.start(
-            self.runtime, request_id="corrupt", project="Jarvis4codex", title="Worker",
+            self.runtime, request_id="corrupt", project="Jarvis4codex", title="Worker", prompt="test task",
             business_skill="bd-search-stage6-research", target_thread_count=1, max_rounds=1,
             expires_at="2099-01-01T00:00:00+00:00",
         )
@@ -314,13 +314,13 @@ class JarvisLoopContractTest(unittest.TestCase):
         self.assertEqual(names, ["jarvis_loop"])
         arguments = {argument.arg for argument in functions[0].args.args}
         self.assertTrue({"model", "reasoning_effort", "notifications", "business_skill", "controller_skill"}.issubset(arguments))
-        self.assertNotIn("prompt", arguments)
+        self.assertIn("prompt", arguments)
         self.assertNotIn("continue_prompt", arguments)
         loop_calls = [node for node in ast.walk(functions[0]) if isinstance(node, ast.Call)
                       and isinstance(node.func, ast.Attribute) and node.func.attr == "loop"]
         self.assertEqual(len(loop_calls), 1)
         forwarded = {keyword.arg for keyword in loop_calls[0].keywords}
-        self.assertTrue({"model", "reasoning_effort", "notifications", "business_skill", "controller_skill"}.issubset(forwarded))
+        self.assertTrue({"model", "reasoning_effort", "notifications", "prompt", "business_skill", "controller_skill"}.issubset(forwarded))
 
 
 if __name__ == "__main__":

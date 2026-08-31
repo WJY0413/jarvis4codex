@@ -204,7 +204,7 @@ class LoopController:
             "allowed_projects": sorted(allowed_projects),
             "start_contract": {
                 "required": [
-                    "request_id", "project", "business_skill", "target_thread_count", "max_rounds", "expires_at",
+                    "request_id", "project", "prompt", "business_skill", "target_thread_count", "max_rounds", "expires_at",
                 ],
                 "defaults": {
                     "controller_skill": "jarvis-run-controller",
@@ -284,7 +284,7 @@ class LoopController:
 
 
 def _validate_start(raw: Mapping[str, Any]) -> dict[str, Any]:
-    required = ("request_id", "project", "business_skill", "target_thread_count", "max_rounds", "expires_at")
+    required = ("request_id", "project", "prompt", "business_skill", "target_thread_count", "max_rounds", "expires_at")
     missing = [name for name in required if raw.get(name) in (None, "")]
     if missing:
         raise ValueError("required loop fields: " + ", ".join(missing))
@@ -315,7 +315,10 @@ def _validate_start(raw: Mapping[str, Any]) -> dict[str, Any]:
     business_skill = str(raw["business_skill"]).strip()
     if not business_skill:
         raise ValueError("business_skill is required")
-    prompt = _worker_prompt(controller_skill, business_skill)
+    task_prompt = str(raw["prompt"]).strip()
+    if not task_prompt:
+        raise ValueError("prompt is required")
+    prompt = _worker_prompt(task_prompt, controller_skill, business_skill)
     threads = raw.get("threads")
     if threads is None:
         title = str(raw.get("title") or f"Jarvis loop {raw['request_id']}").strip()
@@ -378,9 +381,9 @@ def _validate_start(raw: Mapping[str, Any]) -> dict[str, Any]:
             "notifications": notifications, "interval_seconds": interval, "expires_at": expires.isoformat()}
 
 
-def _worker_prompt(controller_skill: str, business_skill: str) -> str:
+def _worker_prompt(task_prompt: str, controller_skill: str, business_skill: str) -> str:
     return (
-        "你是本次 Jarvis Worker。\n\n"
+        f"{task_prompt}\n\n你是本次 Jarvis Worker。\n\n"
         f"执行、续跑和回执规则，必须严格遵守 ${controller_skill}。\n"
         "每个 Worker 回合仅处理 binding 中的一家公司；安全写回后输出结构化单公司回执并等待下一回合，"
         "不得遍历、预取、并行处理或宣称整条 lane 已完成。\n"
