@@ -107,7 +107,7 @@ class JarvisMcpServer:
 
         @self.mcp.tool(
             name="jarvis_loop",
-            description="Preflight, start, inspect, or stop one bounded Jarvis loop. action=preflight is read-only; action=start requires prompt and business_skill; controller_skill defaults to jarvis-run-controller.",
+            description="Preflight, start, inspect, or stop one bounded Jarvis loop. action=preflight is read-only; action=start requires a prompt. controller_skill and business_skill are optional.",
             annotations=ToolAnnotations(destructiveHint=False, idempotentHint=False, openWorldHint=False),
         )
         def jarvis_loop(
@@ -117,8 +117,8 @@ class JarvisMcpServer:
             project: str | None = None,
             title: str | None = None,
             prompt: Annotated[str | None, Field(description="Required when action=start.")] = None,
-            business_skill: Annotated[str | None, Field(description="Required when action=start.")] = None,
-            controller_skill: Annotated[str | None, Field(description="Optional when action=start; defaults to jarvis-run-controller.")] = None,
+            business_skill: Annotated[str | None, Field(description="Optional business Skill to inject into the Worker prompt.")] = None,
+            controller_skill: Annotated[str | None, Field(description="Optional controller Skill to inject into the Worker prompt.")] = None,
             target_thread_count: int | None = None,
             threads: list[dict[str, Any]] | None = None,
             max_rounds: int | None = None,

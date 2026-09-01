@@ -119,8 +119,8 @@ class JarvisMcpContractTest(unittest.TestCase):
         self.assertIn("preflight", loop_tool.input_schema["properties"]["action"]["enum"])
         self.assertEqual(loop_tool.input_schema["properties"]["prompt"]["description"], "Required when action=start.")
         self.assertNotIn("continue_prompt", loop_tool.input_schema["properties"])
-        self.assertIn("Required when action=start", loop_tool.input_schema["properties"]["business_skill"]["description"])
-        self.assertIn("action=start requires prompt and business_skill", loop_tool.description)
+        self.assertIn("Optional business Skill", loop_tool.input_schema["properties"]["business_skill"]["description"])
+        self.assertIn("action=start requires a prompt", loop_tool.description)
 
     def test_resume_without_a_monitor_owned_adapter_reports_unsupported(self):
         result = self.call(

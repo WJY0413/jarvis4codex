@@ -82,9 +82,10 @@ class JarvisLoopContractTest(unittest.TestCase):
 
     def test_loop_renders_the_worker_skill_prompt_for_create_and_resume(self):
         prompt = (
-            "从 1 数到 20\n\n你是本次 Jarvis Worker。\n\n"
+            "你是本次 Jarvis Worker。\n\n"
             "执行、续跑和回执规则，必须严格遵守 $jarvis-run-controller。\n"
-            "处理公司和完成本次业务工作，必须严格遵守 $bd-search-stage6-research。"
+            "处理公司和完成本次业务工作，必须严格遵守 $bd-search-stage6-research。\n\n"
+            "任务：从 1 数到 20"
         )
         started = self.controller.start(
             self.runtime, request_id="skills", project="Jarvis4codex", title="Worker", prompt="从 1 数到 20",
@@ -112,7 +113,7 @@ class JarvisLoopContractTest(unittest.TestCase):
         )
 
         prompt = self.runtime.hold_calls[0]["prompt"]
-        self.assertTrue(prompt.startswith("从 1 数到 20。"))
+        self.assertTrue(prompt.endswith("任务：从 1 数到 20。"))
         self.assertNotIn("binding 中的一家公司", prompt)
         self.assertEqual(started.data["children"][0]["prompt"], prompt)
 
@@ -214,23 +215,16 @@ class JarvisLoopContractTest(unittest.TestCase):
         self.assertEqual(result.status, "invalid_request")
         self.assertEqual(result.reason, "thread lane requires unique positive candidate_ids, database_path, and output_boundary")
 
-    def test_loop_rejects_missing_business_skill(self):
+    def test_loop_allows_no_skills_and_injects_no_skill_rules(self):
         result = self.controller.start(
-            self.runtime, request_id="missing-business-skill", project="Jarvis4codex", title="Worker", prompt="test task",
+            self.runtime, request_id="no-skills", project="Jarvis4codex", title="Worker", prompt="从 1 数到 20",
             target_thread_count=1, max_rounds=1, expires_at="2099-01-01T00:00:00+00:00",
         )
 
-        self.assertEqual(result.status, "invalid_request")
-        self.assertEqual(result.reason, "required loop fields: business_skill")
-
-        blank = self.controller.start(
-            self.runtime, request_id="blank-business-skill", project="Jarvis4codex", title="Worker", prompt="test task",
-            business_skill="   ", target_thread_count=1, max_rounds=1,
-            expires_at="2099-01-01T00:00:00+00:00",
-        )
-
-        self.assertEqual(blank.status, "invalid_request")
-        self.assertEqual(blank.reason, "business_skill is required")
+        self.assertEqual(result.status, "running")
+        self.assertEqual(result.data["controller_skill"], "")
+        self.assertEqual(result.data["business_skill"], "")
+        self.assertEqual(self.runtime.hold_calls[0]["prompt"], "你是本次 Jarvis Worker。\n\n任务：从 1 数到 20")
 
         overridden = self.controller.start(
             self.runtime, request_id="thread-prompt", project="Jarvis4codex", title="Worker", prompt="test task",
@@ -240,7 +234,7 @@ class JarvisLoopContractTest(unittest.TestCase):
         )
 
         self.assertEqual(overridden.status, "invalid_request")
-        self.assertEqual(overridden.reason, "thread prompt is not supported; use business_skill")
+        self.assertEqual(overridden.reason, "thread prompt is not supported; use the loop prompt")
 
     def test_confirmed_defaults_create_every_omitted_thread_and_reach_hold(self):
         started = self.controller.start(
@@ -255,7 +249,7 @@ class JarvisLoopContractTest(unittest.TestCase):
         self.assertEqual(started.data["max_turns"], 999)
         self.assertTrue(started.data["auto_continue"])
         self.assertEqual(started.data["notifications"], {"milestones": [], "terminal": True})
-        self.assertEqual(started.data["controller_skill"], "jarvis-run-controller")
+        self.assertEqual(started.data["controller_skill"], "")
         self.assertEqual([child["acquire"] for child in started.data["children"]], ["create", "create"])
         for call in self.runtime.hold_calls:
             self.assertEqual(call["model"], "gpt-5.6-luna")
@@ -329,7 +323,7 @@ class JarvisLoopContractTest(unittest.TestCase):
         self.assertEqual(receipt["data"]["allowed_projects"], ["BD Search Worker", "Jarvis4codex"])
         self.assertEqual(
             receipt["data"]["start_contract"]["required"],
-            ["request_id", "project", "prompt", "business_skill", "target_thread_count", "max_rounds", "expires_at"],
+            ["request_id", "project", "prompt", "target_thread_count", "max_rounds", "expires_at"],
         )
         self.assertEqual(receipt["data"]["start_contract"]["threads"], {
             "item": {

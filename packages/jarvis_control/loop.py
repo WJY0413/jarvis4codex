@@ -206,10 +206,11 @@ class LoopController:
             "allowed_projects": sorted(allowed_projects),
             "start_contract": {
                 "required": [
-                    "request_id", "project", "prompt", "business_skill", "target_thread_count", "max_rounds", "expires_at",
+                    "request_id", "project", "prompt", "target_thread_count", "max_rounds", "expires_at",
                 ],
                 "defaults": {
-                    "controller_skill": "jarvis-run-controller",
+                    "controller_skill": None,
+                    "business_skill": None,
                     "max_turns": 999,
                     "auto_continue": True,
                     "interval_seconds": 1800,
@@ -291,7 +292,7 @@ class LoopController:
 
 
 def _validate_start(raw: Mapping[str, Any]) -> dict[str, Any]:
-    required = ("request_id", "project", "prompt", "business_skill", "target_thread_count", "max_rounds", "expires_at")
+    required = ("request_id", "project", "prompt", "target_thread_count", "max_rounds", "expires_at")
     missing = [name for name in required if raw.get(name) in (None, "")]
     if missing:
         raise ValueError("required loop fields: " + ", ".join(missing))
@@ -318,10 +319,8 @@ def _validate_start(raw: Mapping[str, Any]) -> dict[str, Any]:
     expires = _parse_time(raw["expires_at"])
     if expires <= datetime.now(timezone.utc):
         raise ValueError("expires_at must be in the future")
-    controller_skill = str(raw.get("controller_skill") or "jarvis-run-controller").strip() or "jarvis-run-controller"
-    business_skill = str(raw["business_skill"]).strip()
-    if not business_skill:
-        raise ValueError("business_skill is required")
+    controller_skill = str(raw.get("controller_skill") or "").strip()
+    business_skill = str(raw.get("business_skill") or "").strip()
     task_prompt = str(raw["prompt"]).strip()
     if not task_prompt:
         raise ValueError("prompt is required")
@@ -339,7 +338,7 @@ def _validate_start(raw: Mapping[str, Any]) -> dict[str, Any]:
             raise ValueError("each thread must be an object")
         slot, acquire = str(raw_child.get("slot") or "").strip(), str(raw_child.get("acquire") or "create").strip()
         if "prompt" in raw_child:
-            raise ValueError("thread prompt is not supported; use business_skill")
+            raise ValueError("thread prompt is not supported; use the loop prompt")
         if not slot or slot in slots or acquire not in {"create", "resume"}:
             raise ValueError("each thread requires a unique slot and acquire=create|resume")
         slots.add(slot)
@@ -396,12 +395,16 @@ def _worker_prompt(task_prompt: str, controller_skill: str, business_skill: str,
         "不得遍历、预取、并行处理或宣称整条 lane 已完成。\n"
         if lane_bound else ""
     )
-    return (
-        f"{task_prompt}\n\n你是本次 Jarvis Worker。\n\n"
-        f"执行、续跑和回执规则，必须严格遵守 ${controller_skill}。\n"
-        f"{binding_rule}"
-        f"处理公司和完成本次业务工作，必须严格遵守 ${business_skill}。"
-    )
+    rules = []
+    if controller_skill:
+        rules.append(f"执行、续跑和回执规则，必须严格遵守 ${controller_skill}。")
+    if binding_rule:
+        rules.append(binding_rule.rstrip())
+    if business_skill:
+        rules.append(f"处理公司和完成本次业务工作，必须严格遵守 ${business_skill}。")
+    rule_text = "\n".join(rules)
+    rules_prefix = f"{rule_text}\n\n" if rule_text else ""
+    return f"你是本次 Jarvis Worker。\n\n{rules_prefix}任务：{task_prompt}"
 
 
 def _current_turn_binding(child: Mapping[str, Any], *, round_number: int) -> dict[str, Any] | None:
