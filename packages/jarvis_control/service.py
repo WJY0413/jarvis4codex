@@ -241,7 +241,8 @@ class JarvisControl:
         )
 
     def read(
-        self, *, subject: str, task_id: str | None = None, hold_id: str | None = None
+        self, *, subject: str, task_id: str | None = None, hold_id: str | None = None,
+        thread_id: str | None = None, turn_id: str | None = None,
     ) -> dict[str, Any]:
         if subject == "capabilities":
             return self._receipt(
@@ -310,7 +311,16 @@ class JarvisControl:
             except Exception as exc:
                 return self._receipt("jarvis_read", "failed", reason=str(exc))
             return self._receipt("jarvis_read", "completed", data=data)
-        return self._receipt("jarvis_read", "invalid_request", reason="subject must be capabilities, thread, or hold")
+        if subject == "history":
+            reader = getattr(self._provisioner, "read_turn_history", None)
+            if not callable(reader):
+                return self._receipt("jarvis_read", "unsupported", reason="no managed-hold history adapter is configured")
+            try:
+                turns = reader(task_id=task_id, hold_id=hold_id, thread_id=thread_id, turn_id=turn_id)
+            except (RuntimeError, ValueError) as exc:
+                return self._receipt("jarvis_read", "invalid_request", reason=str(exc))
+            return self._receipt("jarvis_read", "completed", data={"turns": turns})
+        return self._receipt("jarvis_read", "invalid_request", reason="subject must be capabilities, thread, hold, or history")
 
     def monitor(
         self,

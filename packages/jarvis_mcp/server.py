@@ -145,11 +145,16 @@ class JarvisMcpServer:
             annotations=ToolAnnotations(readOnlyHint=True, idempotentHint=True, openWorldHint=False),
         )
         def jarvis_read(
-            subject: Literal["capabilities", "thread", "hold"],
+            subject: Literal["capabilities", "thread", "hold", "history"],
             task_id: str | None = None,
             hold_id: str | None = None,
+            thread_id: str | None = None,
+            turn_id: str | None = None,
         ) -> CallToolResult:
-            return _tool_result(self.control.read(subject=subject, task_id=task_id, hold_id=hold_id))
+            return _tool_result(self.control.read(
+                subject=subject, task_id=task_id, hold_id=hold_id,
+                thread_id=thread_id, turn_id=turn_id,
+            ))
 
         @self.mcp.tool(
             name="jarvis_resume",

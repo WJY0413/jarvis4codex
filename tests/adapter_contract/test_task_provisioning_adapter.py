@@ -6,7 +6,10 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from adapters.codex_app_server.task_provisioning_adapter import CodexAppServerTaskProvisioningAdapter
+from adapters.codex_app_server.task_provisioning_adapter import (
+    CodexAppServerTaskProvisioningAdapter,
+    append_terminal_turn_history,
+)
 from jarvis_control import TaskProvisionRequest
 from jarvis_control.provisioning import TaskMonitorResumeRequest
 
@@ -163,6 +166,31 @@ class TaskProvisioningAdapterContractTest(unittest.TestCase):
             state = adapter.hold_status("monitor-legacy-1")
 
         self.assertEqual(state["request_id"], "legacy-1")
+
+    def test_read_turn_history_filters_the_existing_sqlite_history(self):
+        config = FakeConfig()
+        with tempfile.TemporaryDirectory() as temp:
+            state_dir = Path(temp)
+            append_terminal_turn_history(
+                state_dir / "turn-history.sqlite", task_id="loop-1", hold_id="loop-1:worker-1",
+                request_id="loop-1:worker-1:acquire", thread_id="thread-1", turn_id="turn-1",
+                turn_number=1, candidate_id=7, status="holding", final_answer="first",
+                completed_at="2026-09-01T00:00:00+00:00",
+            )
+            append_terminal_turn_history(
+                state_dir / "turn-history.sqlite", task_id="loop-1", hold_id="loop-1:worker-1",
+                request_id="loop-1:worker-1:acquire", thread_id="thread-1", turn_id="turn-2",
+                turn_number=2, candidate_id=9, status="turn_limit_reached", final_answer="second",
+                completed_at="2026-09-01T00:01:00+00:00",
+            )
+            adapter = CodexAppServerTaskProvisioningAdapter(
+                "unused.json", state_dir=state_dir, config_loader=lambda _: config
+            )
+            rows = adapter.read_turn_history(task_id="loop-1", turn_id="turn-2")
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["candidate_id"], 9)
+        self.assertEqual(rows[0]["final_answer"], "second")
 
 
 if __name__ == "__main__":

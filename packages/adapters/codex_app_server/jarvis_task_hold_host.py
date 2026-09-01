@@ -16,6 +16,7 @@ from typing import Any
 
 from jarvis_monitor import HoldTurnMonitor, HoldTurnRequest, NotificationPolicy
 from jarvis_runtime.jarvis_native_task_launcher import AppServerClient, NativeTaskLauncherConfig
+from adapters.codex_app_server.task_provisioning_adapter import append_terminal_turn_history
 
 
 def _now() -> str:
@@ -92,6 +93,15 @@ def _turn_input_binding(request: dict[str, Any], total_turn_count: int) -> dict[
         raise RuntimeError("lane binding has no candidate for the current turn")
     binding["candidate_ids"] = [candidate_ids[total_turn_count - 1]]
     return binding
+
+
+def _task_id(request: dict[str, Any], hold_id: str) -> str:
+    return hold_id.rsplit(":", 1)[0] if hold_id.startswith("loop-") and ":" in hold_id else hold_id
+
+
+def _candidate_id(request: dict[str, Any], total_turn_count: int) -> int | None:
+    value = _turn_input_binding(request, total_turn_count).get("candidate_ids")
+    return value[0] if isinstance(value, list) and len(value) == 1 and isinstance(value[0], int) else None
 
 
 def hold_task(
@@ -188,6 +198,14 @@ def hold_task(
             _append_monitor_events(events_path, decision)
             final_message = decision.final_message
             terminal_status = decision.result_status
+            phase = "history_recording"
+            history_path = Path(str(request.get("turn_history_path") or result_path.with_name("turn-history.sqlite")))
+            append_terminal_turn_history(
+                history_path, task_id=_task_id(request, hold_id), hold_id=hold_id,
+                request_id=request_id, thread_id=thread_id, turn_id=turn_id,
+                turn_number=total_turn_count, candidate_id=_candidate_id(request, total_turn_count),
+                status=terminal_status, final_answer=final_message, completed_at=_now(),
+            )
             _write_json(ack_path, {
                 "request_id": request_id,
                 "status": "holding" if decision.action == "CONTINUE" else terminal_status,

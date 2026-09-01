@@ -179,6 +179,26 @@ class JarvisMcpContractTest(unittest.TestCase):
         self.assertTrue(receipt["data"]["jarvis_resume"]["requires_monitor"])
         self.assertFalse(receipt["data"]["jarvis_create"]["available"])
 
+    def test_read_history_uses_the_managed_hold_history_adapter(self):
+        class Provisioner:
+            def read_turn_history(self, **filters):
+                self.filters = filters
+                return [{"task_id": "loop-1", "turn_id": "turn-1", "final_answer": "done"}]
+
+        provisioner = Provisioner()
+        server = JarvisMcpServer(JarvisControl(self.capability_port, self.bridge, provisioner))
+
+        async def run():
+            async with Client(server.mcp) as client:
+                return await client.call_tool(
+                    "jarvis_read", {"subject": "history", "task_id": "loop-1", "turn_id": "turn-1"}
+                )
+
+        result = asyncio.run(run())
+        self.assertFalse(result.is_error)
+        self.assertEqual(result.structured_content["data"]["turns"][0]["final_answer"], "done")
+        self.assertEqual(provisioner.filters["turn_id"], "turn-1")
+
     def test_monitor_observe_returns_its_observation_receipt(self):
         result = self.call(
             "jarvis_monitor",

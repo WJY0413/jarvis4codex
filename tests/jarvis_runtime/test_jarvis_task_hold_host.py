@@ -13,6 +13,7 @@ from unittest.mock import Mock, patch
 from unittest.mock import ANY
 
 from adapters.codex_app_server.jarvis_hold_host_service import JarvisHoldHost, _pid_is_alive, ensure_hold_host, initialize_user_host, main
+from adapters.codex_app_server.task_provisioning_adapter import read_turn_history
 from jarvis_native_task_launcher import HostContextRequiredError
 from adapters.codex_app_server.jarvis_task_hold_host import hold_task
 
@@ -159,10 +160,15 @@ class TaskMonitorHostTest(unittest.TestCase):
             ):
                 exit_code = hold_task(Path("launcher.json"), request, ack, result)
 
+            history = read_turn_history(root / "turn-history.sqlite", hold_id="hold-lane-continue")
+
         self.assertEqual(exit_code, 0)
         self.assertEqual(client.created_requests[0]["input_binding"]["candidate_ids"], [7])
         self.assertEqual(client.started_turns[0]["input_binding"]["candidate_ids"], [9])
         self.assertEqual(client.started_turns[0]["input_binding"]["lane_identity"], "worker-1")
+        self.assertEqual([row["turn_id"] for row in history], ["turn-1", "turn-2"])
+        self.assertEqual([row["candidate_id"] for row in history], [7, 9])
+        self.assertTrue(all(row["has_final_answer"] for row in history))
 
     def test_empty_turn_readback_does_not_block_holder_continuation(self):
         client = EmptyReadbackClient(None)
@@ -184,6 +190,28 @@ class TaskMonitorHostTest(unittest.TestCase):
         self.assertEqual(client.started_prompts, ["继续"])
         self.assertEqual(final["status"], "turn_limit_reached")
         self.assertEqual(final["final_message"], "")
+
+    def test_history_write_failure_stops_before_the_next_turn(self):
+        client = FakeClient(None)
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            request, ack, result = root / "request.json", root / "ack.json", root / "result.json"
+            request.write_text(json.dumps({
+                "request_id": "history-failure", "prompt": "hello", "max_turns": 2,
+                "auto_continue": True, "continue_prompt": "继续",
+            }), encoding="utf-8")
+            with patch("adapters.codex_app_server.jarvis_task_hold_host.NativeTaskLauncherConfig", return_value=FakeConfig()), patch(
+                "adapters.codex_app_server.jarvis_task_hold_host.AppServerClient", return_value=client
+            ), patch(
+                "adapters.codex_app_server.jarvis_task_hold_host.append_terminal_turn_history", side_effect=OSError("disk full")
+            ):
+                exit_code = hold_task(Path("launcher.json"), request, ack, result)
+            failure = json.loads(result.read_text(encoding="utf-8"))
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(client.started_prompts, [])
+        self.assertEqual(failure["phase"], "history_recording")
+        self.assertIn("disk full", failure["reason"])
 
     def test_reports_a_stable_host_context_error_with_the_last_phase(self):
         client = HostContextFailureClient(None)

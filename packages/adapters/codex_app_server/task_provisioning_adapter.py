@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sqlite3
 import sys
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
@@ -57,6 +58,7 @@ class CodexAppServerTaskProvisioningAdapter:
                 "continue_prompt": request.continue_prompt,
                 "notifications": dict(request.notifications or {}),
                 "input_binding": dict(request.input_binding or {}),
+                "turn_history_path": str(self._state_dir / "turn-history.sqlite"),
                 "initial_turn_count": 1,
                 "initial_total_turn_count": 1,
             })
@@ -149,6 +151,7 @@ class CodexAppServerTaskProvisioningAdapter:
                 "continue_prompt": request.continue_prompt,
                 "notifications": dict(request.notifications or {}),
                 "input_binding": dict(request.input_binding or {}),
+                "turn_history_path": str(self._state_dir / "turn-history.sqlite"),
                 "initial_turn_count": initial_turn_count,
                 "initial_total_turn_count": initial_total_turn_count,
             })
@@ -203,6 +206,17 @@ class CodexAppServerTaskProvisioningAdapter:
     def monitor_status(self, monitor_id: str) -> dict[str, Any]:
         """Compatibility alias for lifecycle callers using the old field name."""
         return self.hold_status(monitor_id)
+
+    def read_turn_history(
+        self, *, task_id: str | None = None, hold_id: str | None = None,
+        thread_id: str | None = None, turn_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        if not any((task_id, hold_id, thread_id, turn_id)):
+            raise ValueError("history requires task_id, hold_id, thread_id, or turn_id")
+        return read_turn_history(
+            self._state_dir / "turn-history.sqlite", task_id=task_id, hold_id=hold_id,
+            thread_id=thread_id, turn_id=turn_id,
+        )
 
     def pending_hold_notifications(self, hold_id: str) -> list[dict[str, Any]]:
         paths = self._paths(hold_id)
@@ -263,6 +277,77 @@ def _append_jsonl(path: Path, value: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(value, ensure_ascii=False) + "\n")
+
+
+def append_terminal_turn_history(
+    path: Path,
+    *,
+    task_id: str,
+    hold_id: str,
+    request_id: str,
+    thread_id: str,
+    turn_id: str,
+    turn_number: int,
+    candidate_id: int | None,
+    status: str,
+    final_answer: str,
+    completed_at: str,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(path, timeout=10)
+    try:
+        connection.execute("PRAGMA busy_timeout=10000")
+        connection.execute(
+            """CREATE TABLE IF NOT EXISTS turn_history (
+                hold_id TEXT NOT NULL, turn_id TEXT NOT NULL,
+                task_id TEXT NOT NULL, request_id TEXT NOT NULL, thread_id TEXT NOT NULL,
+                turn_number INTEGER NOT NULL, candidate_id INTEGER,
+                status TEXT NOT NULL, final_answer TEXT, has_final_answer INTEGER NOT NULL,
+                completed_at TEXT NOT NULL, recorded_at TEXT NOT NULL,
+                PRIMARY KEY (hold_id, turn_id)
+            )"""
+        )
+        connection.execute(
+            """INSERT OR IGNORE INTO turn_history(
+                hold_id,turn_id,task_id,request_id,thread_id,turn_number,candidate_id,
+                status,final_answer,has_final_answer,completed_at,recorded_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (hold_id, turn_id, task_id, request_id, thread_id, turn_number, candidate_id,
+             status, final_answer or None, int(bool(final_answer)), completed_at, observed_now().isoformat()),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def read_turn_history(
+    path: Path,
+    *,
+    task_id: str | None = None,
+    hold_id: str | None = None,
+    thread_id: str | None = None,
+    turn_id: str | None = None,
+) -> list[dict[str, Any]]:
+    if not path.is_file():
+        return []
+    clauses: list[str] = []
+    parameters: list[str] = []
+    for column, value in (("task_id", task_id), ("hold_id", hold_id), ("thread_id", thread_id), ("turn_id", turn_id)):
+        if value and value.strip():
+            clauses.append(f"{column}=?")
+            parameters.append(value.strip())
+    where = " WHERE " + " AND ".join(clauses) if clauses else ""
+    connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    try:
+        connection.row_factory = sqlite3.Row
+        rows = connection.execute(
+            "SELECT task_id,hold_id,request_id,thread_id,turn_id,turn_number,candidate_id,"
+            "status,final_answer,has_final_answer,completed_at,recorded_at FROM turn_history"
+            + where + " ORDER BY recorded_at, turn_number", parameters,
+        ).fetchall()
+    finally:
+        connection.close()
+    return [dict(row) for row in rows]
 
 
 def _accepted_ack(
