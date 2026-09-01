@@ -88,7 +88,7 @@ class JarvisMcpContractTest(unittest.TestCase):
         return asyncio.run(run())
 
     def test_initialize_reports_the_current_mcp_version(self):
-        self.assertEqual(self.server.mcp.version, "0.1.9")
+        self.assertEqual(self.server.mcp.version, "0.2.0")
 
     def call(self, name, arguments):
         async def run():

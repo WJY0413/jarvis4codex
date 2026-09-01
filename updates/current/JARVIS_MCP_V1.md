@@ -1,4 +1,4 @@
-# Jarvis MCP v0.1.9 (in progress)
+# Jarvis MCP v0.2.0 (in progress)
 
 ## Scope
 
