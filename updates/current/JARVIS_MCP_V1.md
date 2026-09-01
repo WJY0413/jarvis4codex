@@ -30,6 +30,15 @@ Milestone and terminal events are durable but disabled by default. If a verified
 notification adapter is configured, `jarvis_monitor` can deliver pending events
 and records the returned delivery receipt before marking an event sent.
 
+## TEST-only normal-user Host bootstrap
+
+The existing Hold Host entry point accepts `--initialize-user-host` for a
+normal-user TEST bootstrapper. It initializes `task-holds/` and
+`task-monitors/`, validates the explicit `profile` and `expected_codex_home`,
+then reuses a matching fresh Host or starts exactly one Host and waits for a
+matching health readback. MCP does not invoke this entry point or own the Host
+process.
+
 `jarvis_heartbeat` uses a separate local scheduler database and the computer's
 clock; it accepts only bounded structured calls to `JarvisControl.monitor`,
 `JarvisControl.resume`, or `JarvisControl.notify`. It never stores or builds a

@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import json
+import io
+import sys
 import tempfile
 import threading
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from unittest.mock import ANY
 
-from adapters.codex_app_server.jarvis_hold_host_service import JarvisHoldHost
+from adapters.codex_app_server.jarvis_hold_host_service import JarvisHoldHost, ensure_hold_host, initialize_user_host, main
 from jarvis_native_task_launcher import HostContextRequiredError
 from adapters.codex_app_server.jarvis_task_hold_host import hold_task
 
@@ -271,6 +273,122 @@ class TaskMonitorHostTest(unittest.TestCase):
             self.assertFalse(JarvisHoldHost._claim(root, ack_path, ack))
             JarvisHoldHost._release_claim(root)
             self.assertTrue(JarvisHoldHost._claim(root, ack_path, ack))
+
+    def test_ensure_hold_host_reuses_a_matching_fresh_host(self):
+        with tempfile.TemporaryDirectory() as temp:
+            state_dir = Path(temp)
+            launcher_config = state_dir / "launcher.json"
+            launcher_config.write_text(json.dumps({
+                "profile": "jarvis_test",
+                "expected_codex_home": "C:/test/codex-home",
+            }), encoding="utf-8")
+            (state_dir / "hold-host.json").write_text(json.dumps({
+                "status": "ready", "pid": 1780,
+                "observed_at": "2026-09-01T00:00:00+00:00",
+                "profile": "jarvis_test", "codex_home": "C:/test/codex-home",
+                "state_dir": str(state_dir.resolve()),
+            }), encoding="utf-8")
+            start_host = Mock()
+
+            receipt = ensure_hold_host(
+                state_dir=state_dir, launcher_config=launcher_config,
+                start_host=start_host, now=lambda: "2026-09-01T00:00:10+00:00",
+            )
+
+        self.assertEqual(receipt, {"status": "ready", "phase": "already_running"})
+        start_host.assert_not_called()
+
+    def test_ensure_hold_host_starts_once_and_waits_for_matching_health(self):
+        with tempfile.TemporaryDirectory() as temp:
+            state_dir = Path(temp)
+            launcher_config = state_dir / "launcher.json"
+            launcher_config.write_text(json.dumps({
+                "profile": "jarvis_test",
+                "expected_codex_home": "C:/test/codex-home",
+            }), encoding="utf-8")
+            (state_dir / "hold-host.json").write_text(json.dumps({
+                "status": "ready", "pid": 1780,
+                "observed_at": "2026-08-31T00:00:00+00:00",
+                "profile": "jarvis_test", "codex_home": "C:/test/codex-home",
+                "state_dir": str(state_dir.resolve()),
+            }), encoding="utf-8")
+
+            def start_host():
+                (state_dir / "hold-host.json").write_text(json.dumps({
+                    "status": "ready", "pid": 1781,
+                    "observed_at": "2026-09-01T00:00:10+00:00",
+                    "profile": "jarvis_test", "codex_home": "C:/test/codex-home",
+                    "state_dir": str(state_dir.resolve()),
+                }), encoding="utf-8")
+
+            receipt = ensure_hold_host(
+                state_dir=state_dir, launcher_config=launcher_config,
+                start_host=start_host, wait_seconds=1, poll_seconds=0,
+                now=lambda: "2026-09-01T00:00:10+00:00",
+            )
+
+        self.assertEqual(receipt, {"status": "ready", "phase": "started"})
+
+    def test_initialize_user_host_creates_the_test_state_roots_before_starting(self):
+        with tempfile.TemporaryDirectory() as temp:
+            state_dir = Path(temp) / "new-state"
+            launcher_config = Path(temp) / "launcher.json"
+            launcher_config.write_text(json.dumps({
+                "profile": "jarvis_test",
+                "expected_codex_home": "C:/test/codex-home",
+            }), encoding="utf-8")
+
+            def start_host():
+                (state_dir / "hold-host.json").write_text(json.dumps({
+                    "status": "ready", "pid": 1781,
+                    "observed_at": "2026-09-01T00:00:10+00:00",
+                    "profile": "jarvis_test", "codex_home": "C:/test/codex-home",
+                    "state_dir": str(state_dir.resolve()),
+                }), encoding="utf-8")
+
+            receipt = initialize_user_host(
+                state_dir=state_dir, launcher_config=launcher_config,
+                start_host=start_host, poll_seconds=0,
+                now=lambda: "2026-09-01T00:00:10+00:00",
+            )
+
+            roots_exist = (state_dir / "task-holds").is_dir() and (state_dir / "task-monitors").is_dir()
+
+        self.assertEqual(receipt, {"status": "ready", "phase": "started"})
+        self.assertTrue(roots_exist)
+
+    def test_ensure_hold_host_does_not_start_a_second_host_while_bootstrap_is_locked(self):
+        with tempfile.TemporaryDirectory() as temp:
+            state_dir = Path(temp)
+            launcher_config = state_dir / "launcher.json"
+            launcher_config.write_text(json.dumps({
+                "profile": "jarvis_test",
+                "expected_codex_home": "C:/test/codex-home",
+            }), encoding="utf-8")
+            (state_dir / "hold-host-bootstrap.lock").mkdir()
+            start_host = Mock()
+
+            receipt = ensure_hold_host(
+                state_dir=state_dir, launcher_config=launcher_config,
+                start_host=start_host, now=lambda: "2026-09-01T00:00:10+00:00",
+            )
+
+        self.assertEqual(receipt, {"status": "blocked", "reason": "HoldHost bootstrap is already in progress"})
+        start_host.assert_not_called()
+
+    def test_ensure_running_cli_returns_the_bootstrap_readback(self):
+        with patch.object(sys, "argv", [
+            "jarvis_hold_host_service", "--initialize-user-host", "--state-dir", "C:/test/state",
+            "--launcher-config", "C:/test/launcher.json",
+        ]), patch(
+            "adapters.codex_app_server.jarvis_hold_host_service.initialize_user_host",
+            return_value={"status": "ready", "phase": "started"},
+        ) as ensure, patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            exit_code = main()
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(json.loads(stdout.getvalue()), {"status": "ready", "phase": "started"})
+        ensure.assert_called_once()
 
 
 if __name__ == "__main__":

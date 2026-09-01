@@ -10,11 +10,13 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
+import sys
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 try:  # Supports both package import and the deployed direct-script entry point.
     from .jarvis_task_hold_host import hold_task
@@ -38,6 +40,124 @@ def _read_json(path: Path) -> dict[str, Any] | None:
         return None
     value = json.loads(path.read_text(encoding="utf-8"))
     return value if isinstance(value, dict) else None
+
+
+_HOST_HEALTH_MAX_AGE = timedelta(seconds=30)
+
+
+def initialize_user_host(
+    *,
+    state_dir: Path,
+    launcher_config: Path,
+    workers: int = 1,
+    poll_seconds: float = 3.0,
+    wait_seconds: float = 15.0,
+    start_host: Callable[[], object] | None = None,
+    now: Callable[[], datetime | str] = _now,
+) -> dict[str, str]:
+    """Start one normal-user Hold Host only when its matching health is absent or stale.
+
+    This entry is intended for a normal-user bootstrapper, never for MCP.  It
+    returns only after a matching Host health record is read back.
+    """
+    state_dir.mkdir(parents=True, exist_ok=True)
+    (state_dir / "task-holds").mkdir(exist_ok=True)
+    (state_dir / "task-monitors").mkdir(exist_ok=True)
+    launcher = _read_json(launcher_config)
+    if launcher is None:
+        return {"status": "failed", "reason": "HoldHost launcher config is unreadable"}
+    profile = str(launcher.get("profile") or "").strip()
+    codex_home = str(launcher.get("expected_codex_home") or "").strip()
+    if not profile or not codex_home:
+        return {"status": "failed", "reason": "HoldHost launcher config requires profile and expected_codex_home"}
+    if _matching_health(state_dir, profile, codex_home, now=now):
+        return {"status": "ready", "phase": "already_running"}
+
+    lock_path = state_dir / "hold-host-bootstrap.lock"
+    try:
+        lock_path.mkdir(parents=True)
+    except FileExistsError:
+        return {"status": "blocked", "reason": "HoldHost bootstrap is already in progress"}
+    try:
+        if _matching_health(state_dir, profile, codex_home, now=now):
+            return {"status": "ready", "phase": "already_running"}
+        if start_host is None:
+            _start_hold_host(
+                state_dir=state_dir,
+                launcher_config=launcher_config,
+                workers=workers,
+                poll_seconds=poll_seconds,
+            )
+        else:
+            start_host()
+        deadline = time.monotonic() + max(wait_seconds, 0)
+        while True:
+            if _matching_health(state_dir, profile, codex_home, now=now):
+                return {"status": "ready", "phase": "started"}
+            if time.monotonic() >= deadline:
+                return {"status": "failed", "reason": "HoldHost did not report matching health before timeout"}
+            time.sleep(max(poll_seconds, 0.05))
+    finally:
+        try:
+            lock_path.rmdir()
+        except OSError:
+            pass
+
+
+def ensure_hold_host(**kwargs: Any) -> dict[str, str]:
+    """Compatibility alias for callers that use the former recovery-only name."""
+    return initialize_user_host(**kwargs)
+
+
+def _start_hold_host(*, state_dir: Path, launcher_config: Path, workers: int, poll_seconds: float) -> subprocess.Popen[str]:
+    package_root = Path(__file__).resolve().parents[2]
+    kwargs: dict[str, Any] = {
+        "cwd": str(package_root),
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+        "text": True,
+        "shell": False,
+    }
+    if os.name == "nt":
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    else:  # pragma: no cover - Windows user-host deployment is the supported path.
+        kwargs["start_new_session"] = True
+    return subprocess.Popen([
+        sys.executable, "-m", "adapters.codex_app_server.jarvis_hold_host_service",
+        "--state-dir", str(state_dir), "--launcher-config", str(launcher_config),
+        "--poll-seconds", str(max(poll_seconds, 0.25)), "--workers", str(max(workers, 1)),
+    ], **kwargs)
+
+
+def _matching_health(state_dir: Path, profile: str, codex_home: str, *, now: Callable[[], datetime | str]) -> bool:
+    health = _read_json(state_dir / "hold-host.json")
+    if health is None or str(health.get("status") or "") not in {"ready", "holding"}:
+        return False
+    observed_at = _parse_time(health.get("observed_at"))
+    current = _parse_time(now())
+    if observed_at is None or current is None or current - observed_at > _HOST_HEALTH_MAX_AGE:
+        return False
+    return (
+        str(health.get("profile") or "").strip() == profile
+        and _same_path(health.get("codex_home"), codex_home)
+        and _same_path(health.get("state_dir"), state_dir)
+    )
+
+
+def _parse_time(value: object) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed.astimezone(timezone.utc)
+
+
+def _same_path(left: object, right: object) -> bool:
+    try:
+        return os.path.normcase(str(Path(str(left)).resolve())) == os.path.normcase(str(Path(str(right)).resolve()))
+    except OSError:
+        return False
 
 
 class JarvisHoldHost:
@@ -157,7 +277,19 @@ def main() -> int:
     parser.add_argument("--launcher-config", type=Path, required=True)
     parser.add_argument("--poll-seconds", type=float, default=1.0)
     parser.add_argument("--workers", type=int, default=1)
+    parser.add_argument("--initialize-user-host", "--ensure-running", dest="initialize_user_host", action="store_true", help="initialize profile-bound state and start one matching Hold Host only when needed")
+    parser.add_argument("--wait-seconds", type=float, default=15.0)
     args = parser.parse_args()
+    if args.initialize_user_host:
+        receipt = initialize_user_host(
+            state_dir=args.state_dir,
+            launcher_config=args.launcher_config,
+            workers=args.workers,
+            poll_seconds=args.poll_seconds,
+            wait_seconds=args.wait_seconds,
+        )
+        print(json.dumps(receipt, ensure_ascii=False))
+        return 0 if receipt.get("status") == "ready" else 1
     JarvisHoldHost(
         state_dir=args.state_dir,
         launcher_config=args.launcher_config,
