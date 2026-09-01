@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import io
 import os
+import subprocess
 import sys
 import tempfile
 import threading
@@ -434,6 +435,11 @@ class TaskMonitorHostTest(unittest.TestCase):
     def test_pid_liveness_accepts_the_current_process_and_rejects_an_unknown_pid(self):
         self.assertTrue(_pid_is_alive(os.getpid()))
         self.assertFalse(_pid_is_alive(999999))
+
+    def test_pid_liveness_rejects_an_exited_process_with_an_open_handle(self):
+        child = subprocess.Popen([sys.executable, "-c", "pass"])
+        child.wait(timeout=5)
+        self.assertFalse(_pid_is_alive(child.pid))
 
     def test_ensure_hold_host_does_not_start_a_second_host_while_bootstrap_is_locked(self):
         with tempfile.TemporaryDirectory() as temp:

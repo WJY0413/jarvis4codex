@@ -168,8 +168,13 @@ def _pid_is_alive(pid: int) -> bool:
         process = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
         if not process:
             return False
-        ctypes.windll.kernel32.CloseHandle(process)
-        return True
+        try:
+            exit_code = ctypes.c_ulong()
+            if not ctypes.windll.kernel32.GetExitCodeProcess(process, ctypes.byref(exit_code)):
+                return False
+            return exit_code.value == 259
+        finally:
+            ctypes.windll.kernel32.CloseHandle(process)
     try:
         os.kill(pid, 0)
     except OSError:
