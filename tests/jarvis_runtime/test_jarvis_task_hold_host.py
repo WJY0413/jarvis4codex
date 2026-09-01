@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import io
+import os
 import sys
 import tempfile
 import threading
@@ -10,7 +11,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 from unittest.mock import ANY
 
-from adapters.codex_app_server.jarvis_hold_host_service import JarvisHoldHost, ensure_hold_host, initialize_user_host, main
+from adapters.codex_app_server.jarvis_hold_host_service import JarvisHoldHost, _pid_is_alive, ensure_hold_host, initialize_user_host, main
 from jarvis_native_task_launcher import HostContextRequiredError
 from adapters.codex_app_server.jarvis_task_hold_host import hold_task
 
@@ -386,6 +387,10 @@ class TaskMonitorHostTest(unittest.TestCase):
             )
 
         self.assertEqual(receipt, {"status": "ready", "phase": "started"})
+
+    def test_pid_liveness_accepts_the_current_process_and_rejects_an_unknown_pid(self):
+        self.assertTrue(_pid_is_alive(os.getpid()))
+        self.assertFalse(_pid_is_alive(999999))
 
     def test_ensure_hold_host_does_not_start_a_second_host_while_bootstrap_is_locked(self):
         with tempfile.TemporaryDirectory() as temp:

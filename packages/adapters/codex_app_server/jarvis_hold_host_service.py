@@ -155,6 +155,14 @@ def _matching_health(
 
 
 def _pid_is_alive(pid: int) -> bool:
+    if os.name == "nt":
+        import ctypes
+
+        process = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
+        if not process:
+            return False
+        ctypes.windll.kernel32.CloseHandle(process)
+        return True
     try:
         os.kill(pid, 0)
     except OSError:
