@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
-import math
 import os
 from pathlib import Path
 from typing import Any, Mapping, Protocol
@@ -118,22 +117,22 @@ class LoopController:
             "notifications": request["notifications"],
             "interval_seconds": request["interval_seconds"], "expires_at": request["expires_at"],
             "target_thread_count": request["target_thread_count"], "status": "acquiring",
-            "heartbeat_id": f"heartbeat-{loop_id}", "heartbeat": None, "children": [],
+            "heartbeat_id": None, "heartbeat": None, "children": [],
         }
         for spec in request["threads"]:
             child = {**spec, "thread_id": spec.get("task_id"), "hold_id": None, "round": 0,
                      "phase": "acquiring", "lifecycle": None, "last_receipt": None}
-            child["holder_owns_continuation"] = bool(request["auto_continue"] and "lane" not in child)
+            child["holder_owns_continuation"] = bool(request["auto_continue"])
             receipt = runtime.hold(
                 request_id=f"{loop_id}:{child['slot']}:acquire", prompt=child["prompt"],
                 source_ref=f"jarvis_loop:{loop_id}:{child['slot']}", task_id=child.get("task_id"),
                 project=request["project"] if child["acquire"] == "create" else None,
                 title=child.get("title"), hold_id=f"{loop_id}:{child['slot']}",
                 model=request["model"], reasoning_effort=request["reasoning_effort"],
-                max_turns=request["max_rounds"] if child["holder_owns_continuation"] else request["max_turns"],
+                max_turns=_round_limit(child, request["max_rounds"]) if child["holder_owns_continuation"] else request["max_turns"],
                 auto_continue=child["holder_owns_continuation"],
                 continue_prompt=request["continue_prompt"], notifications=request["notifications"],
-                input_binding=_current_turn_binding(child, round_number=1),
+                input_binding=_holder_lane_binding(child),
             )
             child["last_receipt"] = receipt
             child["hold_id"] = _nested_text(receipt, "data", "monitor_id") or _nested_text(receipt, "data", "hold_id")
@@ -145,79 +144,32 @@ class LoopController:
 
         if state["status"] != "blocked":
             self._observe(runtime, state)
-            heartbeat = runtime.heartbeat(
-                action="create", request_id=f"{loop_id}:heartbeat", source_ref=f"jarvis_loop:{loop_id}",
-                heartbeat_id=state["heartbeat_id"], options={
-                    "name": f"Jarvis loop {loop_id}", "function": "JarvisControl.loop_tick",
-                    "arguments": {"loop_id": loop_id}, "interval_seconds": request["interval_seconds"],
-                    "start_immediately": False, "max_runs": _run_limit(request["expires_at"], request["interval_seconds"]),
-                    "expires_at": request["expires_at"], "source_event_key": request["request_id"],
-                    "confirmation_evidence": f"jarvis_loop:{request['request_id']}",
-                },
-            )
-            state["heartbeat"] = heartbeat
-            if heartbeat.get("status") not in {"active", "accepted", "completed"}:
-                state["status"] = "blocked"
-            else:
-                self._refresh(state)
+            self._refresh(state)
         self._store.create(loop_id, state)
         self._store.save(loop_id, state)
         return self._result(state)
 
     def tick(self, runtime: LoopRuntime, *, loop_id: str) -> LoopResult:
+        del runtime
+        return LoopResult("invalid_request", loop_id, {}, "loop tick is disabled; Holder and Monitor own continuation")
+
+    def status(self, runtime: LoopRuntime, *, loop_id: str) -> LoopResult:
         try:
             state = self._store.load(loop_id)
         except ValueError as exc:
             return LoopResult("invalid_request", loop_id, {}, str(exc))
-        if state["status"] in {"blocked", "completed", "stopped", "expired"}:
-            return self._result(state)
-        if _expired(state["expires_at"]):
-            state["status"] = "expired"
-            state["heartbeat"] = self._cancel(runtime, state)
-            self._store.save(loop_id, state)
-            return self._result(state)
-        self._observe(runtime, state)
-        for child in state["children"]:
-            if child.get("phase") != "terminal":
-                continue
-            if child.get("lifecycle") not in {"completed", "turn_limit_reached"}:
-                child["phase"] = "blocked"; state["status"] = "blocked"; continue
-            if not state["auto_continue"]:
-                child["phase"] = "completed"; continue
-            lane = child.get("lane")
-            round_limit = len(lane["candidate_ids"]) if isinstance(lane, Mapping) else int(state["max_rounds"])
-            if int(child["round"]) >= round_limit:
-                child["phase"] = "completed"; continue
-            if not child.get("thread_id") or not child.get("hold_id"):
-                child["phase"] = "blocked"; state["status"] = "blocked"; continue
-            next_round = int(child["round"]) + 1
-            receipt = runtime.hold(
-                request_id=f"{loop_id}:{child['slot']}:round-{next_round}", task_id=child["thread_id"],
-                prompt=state["continue_prompt"], source_ref=f"jarvis_loop:{loop_id}:{child['slot']}",
-                model=state["model"], reasoning_effort=state["reasoning_effort"],
-                hold_id=child["hold_id"], max_turns=state["max_turns"], auto_continue=False,
-                continue_prompt=state["continue_prompt"], notifications=state["notifications"],
-                input_binding=_current_turn_binding(child, round_number=next_round),
-            )
-            child["last_receipt"] = receipt
-            if receipt.get("status") in ACTIVE:
-                child["round"] = next_round; child["phase"] = "running"
+        if state["status"] not in {"blocked", "completed", "stopped", "expired"}:
+            if _expired(state["expires_at"]):
+                state["status"] = "expired"
+                state["heartbeat"] = self._cancel(runtime, state)
             else:
-                child["phase"] = "blocked"; state["status"] = "blocked"
-        if state["status"] == "blocked":
-            state["heartbeat"] = self._cancel(runtime, state)
-        elif all(child.get("phase") == "completed" for child in state["children"]):
-            state["status"] = "completed"; state["heartbeat"] = self._cancel(runtime, state)
-        else:
-            self._refresh(state)
-        self._store.save(loop_id, state)
+                self._observe(runtime, state)
+                if state["auto_continue"]:
+                    self._reconcile_holder_terminals(runtime, state)
+                else:
+                    self._finalize_observed_terminals(state)
+            self._store.save(loop_id, state)
         return self._result(state)
-
-    def status(self, *, loop_id: str) -> LoopResult:
-        try:
-            return self._result(self._store.load(loop_id))
-        except ValueError as exc:
-            return LoopResult("invalid_request", loop_id, {}, str(exc))
 
     def reconcile(self, runtime: LoopRuntime) -> LoopResult:
         """Close Holder-owned terminal slots without scheduling another Worker turn."""
@@ -344,6 +296,18 @@ class LoopController:
             state["heartbeat"] = self._cancel(runtime, state)
         return True
 
+    def _finalize_observed_terminals(self, state: dict[str, Any]) -> None:
+        for child in state["children"]:
+            if child.get("phase") != "terminal":
+                continue
+            child["phase"] = "completed" if child.get("lifecycle") in {"completed", "turn_limit_reached"} else "blocked"
+        if any(child.get("phase") == "blocked" for child in state["children"]):
+            state["status"] = "blocked"
+        elif all(child.get("phase") == "completed" for child in state["children"]):
+            state["status"] = "completed"
+        else:
+            self._refresh(state)
+
     def _refresh(self, state: dict[str, Any]) -> None:
         if state.get("status") == "blocked":
             return
@@ -355,6 +319,8 @@ class LoopController:
             state["status"] = "running"
 
     def _cancel(self, runtime: LoopRuntime, state: Mapping[str, Any]) -> dict[str, Any]:
+        if not state.get("heartbeat_id") or not state.get("heartbeat"):
+            return {"status": "not_required"}
         return runtime.heartbeat(action="cancel", request_id=f"{state['loop_id']}:stop",
                                  source_ref=f"jarvis_loop:{state['loop_id']}", heartbeat_id=state["heartbeat_id"])
 
@@ -480,21 +446,28 @@ def _worker_prompt(task_prompt: str, controller_skill: str, business_skill: str,
     return f"你是本次 Jarvis Worker。\n\n{rules_prefix}任务：{task_prompt}"
 
 
-def _current_turn_binding(child: Mapping[str, Any], *, round_number: int) -> dict[str, Any] | None:
-    """Expose exactly one stable lane candidate to one Worker turn."""
+def _holder_lane_binding(child: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Persist the lane for Holder; Holder exposes only its current candidate to Workers."""
     lane = child.get("lane")
     if not isinstance(lane, Mapping):
         return None
     candidate_ids = lane.get("candidate_ids")
-    if not isinstance(candidate_ids, list) or round_number < 1 or round_number > len(candidate_ids):
+    if not isinstance(candidate_ids, list):
         return None
     return {
-        "candidate_ids": [candidate_ids[round_number - 1]],
+        "candidate_ids": list(candidate_ids),
         "database_path": lane["database_path"],
         "output_boundary": lane["output_boundary"],
         "lane_identity": child["slot"],
         "lane_item_count": len(candidate_ids),
     }
+
+
+def _round_limit(child: Mapping[str, Any], default: int) -> int:
+    lane = child.get("lane")
+    if isinstance(lane, Mapping) and isinstance(lane.get("candidate_ids"), list):
+        return len(lane["candidate_ids"])
+    return default
 
 
 def _nested_text(value: Mapping[str, Any], *keys: str) -> str | None:
@@ -517,7 +490,3 @@ def _parse_time(value: object) -> datetime:
 
 def _expired(value: object) -> bool:
     return _parse_time(value) <= datetime.now(timezone.utc)
-
-
-def _run_limit(expires_at: str, interval_seconds: int) -> int:
-    return max(1, math.ceil(max((_parse_time(expires_at) - datetime.now(timezone.utc)).total_seconds(), 0) / interval_seconds))

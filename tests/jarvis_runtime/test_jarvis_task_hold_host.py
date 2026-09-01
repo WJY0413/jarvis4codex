@@ -21,10 +21,12 @@ class FakeClient:
     def __init__(self, _config):
         self.started_prompts: list[str] = []
         self.started_turns: list[dict] = []
+        self.created_requests: list[dict] = []
         self.waited: list[str] = []
         self.closed = False
 
-    def create_task(self, _request, **_kwargs):
+    def create_task(self, request, **_kwargs):
+        self.created_requests.append(request)
         return {"thread_id": "thread-1", "turn_id": "turn-1", "model": "gpt-test"}
 
     def wait_for_turn_started(self, _thread_id, turn_id):
@@ -134,6 +136,29 @@ class TaskMonitorHostTest(unittest.TestCase):
         self.assertEqual(final["session_turn_count"], 2)
         self.assertEqual(final["total_turn_count"], 2)
         self.assertTrue(client.closed)
+
+    def test_holder_advances_a_private_lane_one_candidate_per_monitor_continue(self):
+        client = FakeClient(None)
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            request, ack, result = root / "request.json", root / "ack.json", root / "result.json"
+            request.write_text(json.dumps({
+                "request_id": "lane-continue", "prompt": "hello", "max_turns": 2,
+                "auto_continue": True, "continue_prompt": "继续",
+                "input_binding": {
+                    "candidate_ids": [7, 9], "database_path": "C:/collection.sqlite",
+                    "output_boundary": "C:/outputs", "lane_identity": "worker-1", "lane_item_count": 2,
+                },
+            }), encoding="utf-8")
+            with patch("adapters.codex_app_server.jarvis_task_hold_host.NativeTaskLauncherConfig", return_value=FakeConfig()), patch(
+                "adapters.codex_app_server.jarvis_task_hold_host.AppServerClient", return_value=client
+            ):
+                exit_code = hold_task(Path("launcher.json"), request, ack, result)
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(client.created_requests[0]["input_binding"]["candidate_ids"], [7])
+        self.assertEqual(client.started_turns[0]["input_binding"]["candidate_ids"], [9])
+        self.assertEqual(client.started_turns[0]["input_binding"]["lane_identity"], "worker-1")
 
     def test_empty_turn_readback_does_not_block_holder_continuation(self):
         client = EmptyReadbackClient(None)

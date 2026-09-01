@@ -82,6 +82,18 @@ def _validate_monitor_command(decision: object, *, hold_id: str, turn_id: str) -
         raise RuntimeError("monitor command_id is required")
 
 
+def _turn_input_binding(request: dict[str, Any], total_turn_count: int) -> dict[str, Any]:
+    """Keep a full lane private to Holder while exposing one candidate per Worker turn."""
+    binding = dict(request.get("input_binding") or {})
+    if "lane_item_count" not in binding:
+        return binding
+    candidate_ids = binding.get("candidate_ids")
+    if not isinstance(candidate_ids, list) or not 1 <= total_turn_count <= len(candidate_ids):
+        raise RuntimeError("lane binding has no candidate for the current turn")
+    binding["candidate_ids"] = [candidate_ids[total_turn_count - 1]]
+    return binding
+
+
 def hold_task(
     launcher_config_path: Path,
     request_path: Path,
@@ -122,6 +134,7 @@ def hold_task(
         report("hold_started")
         client = AppServerClient(NativeTaskLauncherConfig(launcher_config_path))
         report("launcher_config_loaded")
+        input_binding = _turn_input_binding(request, initial_total_turn_count)
         if str(request.get("mode") or "create") == "resume":
             thread_id = str(request.get("thread_id") or "").strip()
             if not thread_id:
@@ -132,11 +145,11 @@ def hold_task(
                 client_user_message_id=request_id,
                 model=request.get("model"),
                 reasoning_effort=request.get("reasoning_effort"),
-                input_binding=request.get("input_binding"),
+                input_binding=input_binding,
                 on_phase=report,
             )
         else:
-            created = client.create_task(request, on_phase=report)
+            created = client.create_task({**request, "input_binding": input_binding}, on_phase=report)
             thread_id = str(created.get("thread_id") or "").strip()
         turn_id = str(created.get("turn_id") or "").strip()
         if not thread_id or not turn_id:
@@ -203,7 +216,7 @@ def hold_task(
                 client_user_message_id=decision.command_id,
                 model=request.get("model"),
                 reasoning_effort=request.get("reasoning_effort"),
-                input_binding=request.get("input_binding"),
+                input_binding=_turn_input_binding(request, total_turn_count + 1),
                 on_phase=report,
             )
             turn_id = str(started.get("turn_id") or "").strip()

@@ -38,7 +38,7 @@ class JarvisControl:
         self._loop_controller = loop_controller
 
     def loop(self, *, action: str, loop_id: str | None = None, **options: Any) -> dict[str, Any]:
-        """Use the existing Hold, Monitor and heartbeat ports as one bounded loop."""
+        """Use the existing Holder and Monitor ports as one bounded loop."""
         if self._loop_controller is None:
             return self.unsupported(tool="jarvis_loop", reason="no loop controller is configured")
         if action == "preflight":
@@ -65,11 +65,15 @@ class JarvisControl:
                 )
             result = self._loop_controller.start(self, **options)
         elif action == "tick":
-            result = self._loop_controller.tick(self, loop_id=str(loop_id or ""))
+            return self._receipt(
+                "jarvis_loop", "invalid_request", request_id=options.get("request_id"),
+                reason="loop tick is disabled; Holder and Monitor own continuation",
+                readback={"verified": False, "terminal": False},
+            )
         elif action == "reconcile":
             result = self._loop_controller.reconcile(self)
         elif action == "status":
-            result = self._loop_controller.status(loop_id=str(loop_id or ""))
+            result = self._loop_controller.status(self, loop_id=str(loop_id or ""))
         elif action == "stop":
             result = self._loop_controller.stop(self, loop_id=str(loop_id or ""))
         else:
@@ -255,7 +259,7 @@ class JarvisControl:
                     },
                     "jarvis_loop": {
                         "available": self._loop_controller is not None,
-                        "requires_hold_monitor_and_heartbeat": True,
+                        "requires_hold_monitor": True,
                     },
                     "jarvis_read": {"available": True, "read_only": True},
                     "jarvis_resume": {

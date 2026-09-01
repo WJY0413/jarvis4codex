@@ -40,31 +40,23 @@ class JarvisLoopContractTest(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp.cleanup()
 
-    def test_loop_observes_hold_then_resumes_only_after_terminal_readback(self):
+    def test_loop_delegates_continuation_to_holder_without_a_tick_heartbeat(self):
         started = self.controller.start(
             self.runtime, request_id="contract-1", project="Jarvis4codex", title="Worker", prompt="test task",
             business_skill="bd-search-stage6-research", target_thread_count=1, max_rounds=2, max_turns=3,
             expires_at="2099-01-01T00:00:00+00:00",
         )
         self.assertEqual(started.status, "running")
-        self.assertEqual(self.runtime.heartbeat_calls[0]["options"]["function"], "JarvisControl.loop_tick")
-        self.assertFalse(self.runtime.heartbeat_calls[0]["options"]["start_immediately"])
+        self.assertEqual(self.runtime.heartbeat_calls, [])
         self.assertTrue(self.runtime.hold_calls[0]["auto_continue"])
+        self.assertEqual(self.runtime.hold_calls[0]["max_turns"], 2)
         hold_id = started.data["children"][0]["hold_id"]
-        self.runtime.states[hold_id] = {"status": "completed", "thread_id": "thread-1"}
-
-        resumed = self.controller.tick(self.runtime, loop_id=started.loop_id)
-
-        self.assertEqual(resumed.status, "running")
-        self.assertEqual(len(self.runtime.hold_calls), 2)
-        self.assertEqual(self.runtime.hold_calls[1]["task_id"], "thread-1")
-        self.assertEqual(self.runtime.hold_calls[1]["prompt"], self.runtime.hold_calls[0]["prompt"])
-        self.assertFalse(self.runtime.hold_calls[1]["auto_continue"])
-
-        self.runtime.states[hold_id] = {"status": "completed", "thread_id": "thread-1"}
-        completed = self.controller.tick(self.runtime, loop_id=started.loop_id)
+        self.runtime.states[hold_id] = {
+            "status": "turn_limit_reached", "thread_id": "thread-1", "total_turn_count": 2,
+        }
+        completed = self.controller.status(self.runtime, loop_id=started.loop_id)
         self.assertEqual(completed.status, "completed")
-        self.assertEqual(self.runtime.heartbeat_calls[-1]["action"], "cancel")
+        self.assertEqual(len(self.runtime.hold_calls), 1)
 
     def test_loop_does_not_resume_after_one_terminal_turn_when_auto_continue_is_false(self):
         started = self.controller.start(
@@ -75,7 +67,7 @@ class JarvisLoopContractTest(unittest.TestCase):
         hold_id = started.data["children"][0]["hold_id"]
         self.runtime.states[hold_id] = {"status": "completed", "thread_id": "thread-1"}
 
-        completed = self.controller.tick(self.runtime, loop_id=started.loop_id)
+        completed = self.controller.status(self.runtime, loop_id=started.loop_id)
 
         self.assertEqual(completed.status, "completed")
         self.assertEqual(len(self.runtime.hold_calls), 1)
@@ -98,12 +90,7 @@ class JarvisLoopContractTest(unittest.TestCase):
         self.assertEqual(started.data["controller_skill"], "company-run-controller")
         self.assertEqual(started.data["business_skill"], "bd-search-stage6-research")
         self.assertEqual(self.runtime.hold_calls[0]["prompt"], prompt.replace("jarvis-run-controller", "company-run-controller"))
-        hold_id = started.data["children"][0]["hold_id"]
-        self.runtime.states[hold_id] = {"status": "completed", "thread_id": "thread-1"}
-
-        self.controller.tick(self.runtime, loop_id=started.loop_id)
-
-        self.assertEqual(self.runtime.hold_calls[1]["prompt"], prompt.replace("jarvis-run-controller", "company-run-controller"))
+        self.assertEqual(len(self.runtime.hold_calls), 1)
 
     def test_loop_keeps_explicit_prompt_free_of_lane_default_without_lane(self):
         started = self.controller.start(
@@ -131,12 +118,12 @@ class JarvisLoopContractTest(unittest.TestCase):
         self.runtime.states[hold_id] = {
             "status": "turn_limit_reached", "thread_id": "thread-1", "total_turn_count": 4,
         }
-        completed = self.controller.tick(self.runtime, loop_id=started.loop_id)
+        completed = self.controller.status(self.runtime, loop_id=started.loop_id)
 
         self.assertEqual(completed.status, "completed")
         self.assertEqual(len(self.runtime.hold_calls), 1)
 
-    def test_reconcile_closes_a_holder_owned_terminal_loop_and_cancels_heartbeat(self):
+    def test_status_closes_a_holder_owned_terminal_loop_without_heartbeat(self):
         started = self.controller.start(
             self.runtime, request_id="terminal-reconcile", project="Jarvis4codex", title="Worker", prompt="count",
             target_thread_count=1, max_rounds=2, expires_at="2099-01-01T00:00:00+00:00",
@@ -146,17 +133,13 @@ class JarvisLoopContractTest(unittest.TestCase):
             "status": "turn_limit_reached", "thread_id": "thread-1", "turn_id": "turn-2", "total_turn_count": 2,
         }
 
-        reconciled = self.controller.reconcile(self.runtime)
-        final = self.controller.status(loop_id=started.loop_id)
+        final = self.controller.status(self.runtime, loop_id=started.loop_id)
 
-        self.assertEqual(reconciled.data["reconciled"], [{"loop_id": started.loop_id, "status": "completed"}])
         self.assertEqual(final.status, "completed")
         self.assertEqual(final.data["children"][0]["round"], 2)
-        self.assertEqual(self.runtime.heartbeat_calls[-1]["action"], "cancel")
-        self.controller.reconcile(self.runtime)
-        self.assertEqual(len([call for call in self.runtime.heartbeat_calls if call["action"] == "cancel"]), 1)
+        self.assertEqual(self.runtime.heartbeat_calls, [])
 
-    def test_tick_cancels_the_heartbeat_when_a_terminal_hold_blocks_the_loop(self):
+    def test_status_blocks_a_terminal_hold_failure_without_heartbeat(self):
         started = self.controller.start(
             self.runtime, request_id="blocked-terminal", project="Jarvis4codex", title="Worker", prompt="count",
             target_thread_count=1, max_rounds=2, expires_at="2099-01-01T00:00:00+00:00",
@@ -164,10 +147,10 @@ class JarvisLoopContractTest(unittest.TestCase):
         hold_id = started.data["children"][0]["hold_id"]
         self.runtime.states[hold_id] = {"status": "failed", "thread_id": "thread-1"}
 
-        blocked = self.controller.tick(self.runtime, loop_id=started.loop_id)
+        blocked = self.controller.status(self.runtime, loop_id=started.loop_id)
 
         self.assertEqual(blocked.status, "blocked")
-        self.assertEqual(self.runtime.heartbeat_calls[-1]["action"], "cancel")
+        self.assertEqual(self.runtime.heartbeat_calls, [])
 
     def test_loop_exposes_one_stable_lane_candidate_per_worker_turn(self):
         lane = {"candidate_ids": [7, 9], "database_path": "C:/collection.sqlite", "output_boundary": "C:/outputs/worker-1"}
@@ -178,16 +161,12 @@ class JarvisLoopContractTest(unittest.TestCase):
             expires_at="2099-01-01T00:00:00+00:00",
         )
         self.assertEqual(self.runtime.hold_calls[0]["input_binding"], {
-            **lane, "candidate_ids": [7], "lane_identity": "worker-1", "lane_item_count": 2,
+            **lane, "lane_identity": "worker-1", "lane_item_count": 2,
         })
+        self.assertTrue(self.runtime.hold_calls[0]["auto_continue"])
+        self.assertEqual(self.runtime.hold_calls[0]["max_turns"], 2)
         self.assertEqual(started.data["children"][0]["lane"], lane)
         self.assertIn("每个 Worker 回合仅处理 binding 中的一家公司", self.runtime.hold_calls[0]["prompt"])
-        hold_id = started.data["children"][0]["hold_id"]
-        self.runtime.states[hold_id] = {"status": "completed", "thread_id": "thread-1"}
-        self.controller.tick(self.runtime, loop_id=started.loop_id)
-        self.assertEqual(self.runtime.hold_calls[1]["input_binding"], {
-            **lane, "candidate_ids": [9], "lane_identity": "worker-1", "lane_item_count": 2,
-        })
 
     def test_loop_completes_uneven_lanes_without_an_unbound_extra_turn(self):
         lanes = [
@@ -207,25 +186,18 @@ class JarvisLoopContractTest(unittest.TestCase):
             ],
             expires_at="2099-01-01T00:00:00+00:00",
         )
-        hold_ids = [child["hold_id"] for child in started.data["children"]]
-        result = started
-        for round_number in range(1, 58):
-            for hold_id, lane in zip(hold_ids, lanes):
-                if round_number <= len(lane):
-                    self.runtime.states[hold_id] = {"status": "completed", "thread_id": "thread-1"}
-            result = self.controller.tick(self.runtime, loop_id=started.loop_id)
+        for child, lane in zip(started.data["children"], lanes):
+            self.runtime.states[child["hold_id"]] = {
+                "status": "turn_limit_reached", "thread_id": "thread-1", "total_turn_count": len(lane),
+            }
+        result = self.controller.status(self.runtime, loop_id=started.loop_id)
 
         self.assertEqual(result.status, "completed")
         self.assertTrue(all(child["phase"] == "completed" for child in result.data["children"]))
         for number, lane in enumerate(lanes, 1):
-            bindings = [
-                call["input_binding"] for call in self.runtime.hold_calls
-                if call["source_ref"].endswith(f"worker-{number}")
-            ]
-            self.assertEqual([binding["candidate_ids"] for binding in bindings], [[value] for value in lane])
-            self.assertTrue(all(binding["lane_identity"] == f"worker-{number}" for binding in bindings))
-            self.assertTrue(all(binding["lane_item_count"] == len(lane) for binding in bindings))
-            self.assertTrue(all(binding is not None for binding in bindings))
+            call = next(call for call in self.runtime.hold_calls if call["source_ref"].endswith(f"worker-{number}"))
+            self.assertEqual(call["max_turns"], len(lane))
+            self.assertEqual(call["input_binding"]["candidate_ids"], lane)
 
     def test_loop_rejects_lane_that_exceeds_its_round_budget(self):
         result = self.controller.start(
