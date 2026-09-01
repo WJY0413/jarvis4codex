@@ -105,13 +105,15 @@ class LoopController:
         for spec in request["threads"]:
             child = {**spec, "thread_id": spec.get("task_id"), "hold_id": None, "round": 0,
                      "phase": "acquiring", "lifecycle": None, "last_receipt": None}
+            child["holder_owns_continuation"] = bool(request["auto_continue"] and "lane" not in child)
             receipt = runtime.hold(
                 request_id=f"{loop_id}:{child['slot']}:acquire", prompt=child["prompt"],
                 source_ref=f"jarvis_loop:{loop_id}:{child['slot']}", task_id=child.get("task_id"),
                 project=request["project"] if child["acquire"] == "create" else None,
                 title=child.get("title"), hold_id=f"{loop_id}:{child['slot']}",
                 model=request["model"], reasoning_effort=request["reasoning_effort"],
-                max_turns=request["max_turns"], auto_continue=False,
+                max_turns=request["max_rounds"] if child["holder_owns_continuation"] else request["max_turns"],
+                auto_continue=child["holder_owns_continuation"],
                 continue_prompt=request["continue_prompt"], notifications=request["notifications"],
                 input_binding=_current_turn_binding(child, round_number=1),
             )
@@ -261,6 +263,11 @@ class LoopController:
                 if not child["round"]:
                     child["round"] = 1
             elif lifecycle in TERMINAL:
+                if child.get("holder_owns_continuation"):
+                    try:
+                        child["round"] = max(int(child.get("round") or 0), int(data.get("total_turn_count") or 0))
+                    except (TypeError, ValueError):
+                        pass
                 child["phase"] = "terminal"
 
     def _refresh(self, state: dict[str, Any]) -> None:

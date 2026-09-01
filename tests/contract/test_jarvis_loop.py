@@ -49,7 +49,7 @@ class JarvisLoopContractTest(unittest.TestCase):
         self.assertEqual(started.status, "running")
         self.assertEqual(self.runtime.heartbeat_calls[0]["options"]["function"], "JarvisControl.loop_tick")
         self.assertFalse(self.runtime.heartbeat_calls[0]["options"]["start_immediately"])
-        self.assertFalse(self.runtime.hold_calls[0]["auto_continue"])
+        self.assertTrue(self.runtime.hold_calls[0]["auto_continue"])
         hold_id = started.data["children"][0]["hold_id"]
         self.runtime.states[hold_id] = {"status": "completed", "thread_id": "thread-1"}
 
@@ -115,6 +115,25 @@ class JarvisLoopContractTest(unittest.TestCase):
         self.assertTrue(prompt.startswith("从 1 数到 20。"))
         self.assertNotIn("binding 中的一家公司", prompt)
         self.assertEqual(started.data["children"][0]["prompt"], prompt)
+
+    def test_loop_delegates_unbound_auto_continue_to_holder(self):
+        started = self.controller.start(
+            self.runtime, request_id="holder-owned", project="Jarvis4codex", title="Worker",
+            prompt="count", business_skill="counting-test", target_thread_count=1, max_rounds=4,
+            max_turns=1, auto_continue=True, expires_at="2099-01-01T00:00:00+00:00",
+        )
+        call = self.runtime.hold_calls[0]
+        self.assertTrue(call["auto_continue"])
+        self.assertEqual(call["max_turns"], 4)
+
+        hold_id = started.data["children"][0]["hold_id"]
+        self.runtime.states[hold_id] = {
+            "status": "turn_limit_reached", "thread_id": "thread-1", "total_turn_count": 4,
+        }
+        completed = self.controller.tick(self.runtime, loop_id=started.loop_id)
+
+        self.assertEqual(completed.status, "completed")
+        self.assertEqual(len(self.runtime.hold_calls), 1)
 
     def test_loop_exposes_one_stable_lane_candidate_per_worker_turn(self):
         lane = {"candidate_ids": [7, 9], "database_path": "C:/collection.sqlite", "output_boundary": "C:/outputs/worker-1"}
@@ -241,8 +260,8 @@ class JarvisLoopContractTest(unittest.TestCase):
         for call in self.runtime.hold_calls:
             self.assertEqual(call["model"], "gpt-5.6-luna")
             self.assertEqual(call["reasoning_effort"], "max")
-            self.assertEqual(call["max_turns"], 999)
-            self.assertFalse(call["auto_continue"])
+            self.assertEqual(call["max_turns"], 1)
+            self.assertTrue(call["auto_continue"])
             self.assertEqual(call["notifications"], {"milestones": [], "terminal": True})
 
     def test_explicit_loop_fields_pass_unchanged_to_hold(self):
