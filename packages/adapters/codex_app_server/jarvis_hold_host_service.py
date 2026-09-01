@@ -54,6 +54,7 @@ def initialize_user_host(
     wait_seconds: float = 15.0,
     start_host: Callable[[], object] | None = None,
     now: Callable[[], datetime | str] = _now,
+    pid_alive: Callable[[int], bool] | None = None,
 ) -> dict[str, str]:
     """Start one normal-user Hold Host only when its matching health is absent or stale.
 
@@ -70,7 +71,7 @@ def initialize_user_host(
     codex_home = str(launcher.get("expected_codex_home") or "").strip()
     if not profile or not codex_home:
         return {"status": "failed", "reason": "HoldHost launcher config requires profile and expected_codex_home"}
-    if _matching_health(state_dir, profile, codex_home, now=now):
+    if _matching_health(state_dir, profile, codex_home, now=now, pid_alive=pid_alive or _pid_is_alive):
         return {"status": "ready", "phase": "already_running"}
 
     lock_path = state_dir / "hold-host-bootstrap.lock"
@@ -79,7 +80,7 @@ def initialize_user_host(
     except FileExistsError:
         return {"status": "blocked", "reason": "HoldHost bootstrap is already in progress"}
     try:
-        if _matching_health(state_dir, profile, codex_home, now=now):
+        if _matching_health(state_dir, profile, codex_home, now=now, pid_alive=pid_alive or _pid_is_alive):
             return {"status": "ready", "phase": "already_running"}
         if start_host is None:
             _start_hold_host(
@@ -92,7 +93,7 @@ def initialize_user_host(
             start_host()
         deadline = time.monotonic() + max(wait_seconds, 0)
         while True:
-            if _matching_health(state_dir, profile, codex_home, now=now):
+            if _matching_health(state_dir, profile, codex_home, now=now, pid_alive=pid_alive or _pid_is_alive):
                 return {"status": "ready", "phase": "started"}
             if time.monotonic() >= deadline:
                 return {"status": "failed", "reason": "HoldHost did not report matching health before timeout"}
@@ -130,7 +131,9 @@ def _start_hold_host(*, state_dir: Path, launcher_config: Path, workers: int, po
     ], **kwargs)
 
 
-def _matching_health(state_dir: Path, profile: str, codex_home: str, *, now: Callable[[], datetime | str]) -> bool:
+def _matching_health(
+    state_dir: Path, profile: str, codex_home: str, *, now: Callable[[], datetime | str], pid_alive: Callable[[int], bool]
+) -> bool:
     health = _read_json(state_dir / "hold-host.json")
     if health is None or str(health.get("status") or "") not in {"ready", "holding"}:
         return False
@@ -138,11 +141,25 @@ def _matching_health(state_dir: Path, profile: str, codex_home: str, *, now: Cal
     current = _parse_time(now())
     if observed_at is None or current is None or current - observed_at > _HOST_HEALTH_MAX_AGE:
         return False
+    try:
+        pid = int(health.get("pid"))
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0 or not pid_alive(pid):
+        return False
     return (
         str(health.get("profile") or "").strip() == profile
         and _same_path(health.get("codex_home"), codex_home)
         and _same_path(health.get("state_dir"), state_dir)
     )
+
+
+def _pid_is_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
 
 
 def _parse_time(value: object) -> datetime | None:

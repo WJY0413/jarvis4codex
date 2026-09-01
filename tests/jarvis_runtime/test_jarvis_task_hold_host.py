@@ -292,7 +292,7 @@ class TaskMonitorHostTest(unittest.TestCase):
 
             receipt = ensure_hold_host(
                 state_dir=state_dir, launcher_config=launcher_config,
-                start_host=start_host, now=lambda: "2026-09-01T00:00:10+00:00",
+                start_host=start_host, now=lambda: "2026-09-01T00:00:10+00:00", pid_alive=lambda _: True,
             )
 
         self.assertEqual(receipt, {"status": "ready", "phase": "already_running"})
@@ -324,7 +324,7 @@ class TaskMonitorHostTest(unittest.TestCase):
             receipt = ensure_hold_host(
                 state_dir=state_dir, launcher_config=launcher_config,
                 start_host=start_host, wait_seconds=1, poll_seconds=0,
-                now=lambda: "2026-09-01T00:00:10+00:00",
+                now=lambda: "2026-09-01T00:00:10+00:00", pid_alive=lambda _: True,
             )
 
         self.assertEqual(receipt, {"status": "ready", "phase": "started"})
@@ -349,13 +349,43 @@ class TaskMonitorHostTest(unittest.TestCase):
             receipt = initialize_user_host(
                 state_dir=state_dir, launcher_config=launcher_config,
                 start_host=start_host, poll_seconds=0,
-                now=lambda: "2026-09-01T00:00:10+00:00",
+                now=lambda: "2026-09-01T00:00:10+00:00", pid_alive=lambda _: True,
             )
 
             roots_exist = (state_dir / "task-holds").is_dir() and (state_dir / "task-monitors").is_dir()
 
         self.assertEqual(receipt, {"status": "ready", "phase": "started"})
         self.assertTrue(roots_exist)
+
+    def test_initialize_user_host_restarts_when_a_fresh_health_pid_is_dead(self):
+        with tempfile.TemporaryDirectory() as temp:
+            state_dir = Path(temp)
+            launcher_config = state_dir / "launcher.json"
+            launcher_config.write_text(json.dumps({
+                "profile": "jarvis_test", "expected_codex_home": "C:/test/codex-home",
+            }), encoding="utf-8")
+            (state_dir / "hold-host.json").write_text(json.dumps({
+                "status": "ready", "pid": 1780,
+                "observed_at": "2026-09-01T00:00:00+00:00",
+                "profile": "jarvis_test", "codex_home": "C:/test/codex-home",
+                "state_dir": str(state_dir.resolve()),
+            }), encoding="utf-8")
+
+            def start_host():
+                (state_dir / "hold-host.json").write_text(json.dumps({
+                    "status": "ready", "pid": 1781,
+                    "observed_at": "2026-09-01T00:00:10+00:00",
+                    "profile": "jarvis_test", "codex_home": "C:/test/codex-home",
+                    "state_dir": str(state_dir.resolve()),
+                }), encoding="utf-8")
+
+            receipt = initialize_user_host(
+                state_dir=state_dir, launcher_config=launcher_config, start_host=start_host,
+                poll_seconds=0, now=lambda: "2026-09-01T00:00:10+00:00",
+                pid_alive=lambda pid: pid == 1781,
+            )
+
+        self.assertEqual(receipt, {"status": "ready", "phase": "started"})
 
     def test_ensure_hold_host_does_not_start_a_second_host_while_bootstrap_is_locked(self):
         with tempfile.TemporaryDirectory() as temp:
