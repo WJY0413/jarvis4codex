@@ -55,6 +55,7 @@ def initialize_user_host(
     start_host: Callable[[], object] | None = None,
     now: Callable[[], datetime | str] = _now,
     pid_alive: Callable[[int], bool] | None = None,
+    pid_started_at: Callable[[int], datetime | str | None] | None = None,
 ) -> dict[str, str]:
     """Start one normal-user Hold Host only when its matching health is absent or stale.
 
@@ -71,7 +72,8 @@ def initialize_user_host(
     codex_home = str(launcher.get("expected_codex_home") or "").strip()
     if not profile or not codex_home:
         return {"status": "failed", "reason": "HoldHost launcher config requires profile and expected_codex_home"}
-    if _matching_health(state_dir, profile, codex_home, now=now, pid_alive=pid_alive or _pid_is_alive):
+    health_checks = {"now": now, "pid_alive": pid_alive or _pid_is_alive, "pid_started_at": pid_started_at or _pid_started_at}
+    if _matching_health(state_dir, profile, codex_home, **health_checks):
         return {"status": "ready", "phase": "already_running"}
 
     lock_path = state_dir / "hold-host-bootstrap.lock"
@@ -80,7 +82,7 @@ def initialize_user_host(
     except FileExistsError:
         return {"status": "blocked", "reason": "HoldHost bootstrap is already in progress"}
     try:
-        if _matching_health(state_dir, profile, codex_home, now=now, pid_alive=pid_alive or _pid_is_alive):
+        if _matching_health(state_dir, profile, codex_home, **health_checks):
             return {"status": "ready", "phase": "already_running"}
         if start_host is None:
             _start_hold_host(
@@ -93,7 +95,7 @@ def initialize_user_host(
             start_host()
         deadline = time.monotonic() + max(wait_seconds, 0)
         while True:
-            if _matching_health(state_dir, profile, codex_home, now=now, pid_alive=pid_alive or _pid_is_alive):
+            if _matching_health(state_dir, profile, codex_home, **health_checks):
                 return {"status": "ready", "phase": "started"}
             if time.monotonic() >= deadline:
                 return {"status": "failed", "reason": "HoldHost did not report matching health before timeout"}
@@ -132,7 +134,8 @@ def _start_hold_host(*, state_dir: Path, launcher_config: Path, workers: int, po
 
 
 def _matching_health(
-    state_dir: Path, profile: str, codex_home: str, *, now: Callable[[], datetime | str], pid_alive: Callable[[int], bool]
+    state_dir: Path, profile: str, codex_home: str, *, now: Callable[[], datetime | str], pid_alive: Callable[[int], bool],
+    pid_started_at: Callable[[int], datetime | str | None],
 ) -> bool:
     health = _read_json(state_dir / "hold-host.json")
     if health is None or str(health.get("status") or "") not in {"ready", "holding"}:
@@ -146,6 +149,10 @@ def _matching_health(
     except (TypeError, ValueError):
         return False
     if pid <= 0 or not pid_alive(pid):
+        return False
+    host_started_at = _parse_time(health.get("host_started_at"))
+    process_started_at = _parse_time(pid_started_at(pid))
+    if host_started_at is None or process_started_at is None or process_started_at - host_started_at > timedelta(seconds=5):
         return False
     return (
         str(health.get("profile") or "").strip() == profile
@@ -168,6 +175,27 @@ def _pid_is_alive(pid: int) -> bool:
     except OSError:
         return False
     return True
+
+
+def _pid_started_at(pid: int) -> datetime | None:
+    if os.name != "nt":  # pragma: no cover - Windows user-host deployment is the supported path.
+        return None
+    import ctypes
+
+    class FileTime(ctypes.Structure):
+        _fields_ = [("dwLowDateTime", ctypes.c_ulong), ("dwHighDateTime", ctypes.c_ulong)]
+
+    process = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
+    if not process:
+        return None
+    try:
+        created, exited, kernel, user = FileTime(), FileTime(), FileTime(), FileTime()
+        if not ctypes.windll.kernel32.GetProcessTimes(process, ctypes.byref(created), ctypes.byref(exited), ctypes.byref(kernel), ctypes.byref(user)):
+            return None
+        ticks = (created.dwHighDateTime << 32) | created.dwLowDateTime
+        return datetime(1601, 1, 1, tzinfo=timezone.utc) + timedelta(microseconds=ticks // 10)
+    finally:
+        ctypes.windll.kernel32.CloseHandle(process)
 
 
 def _parse_time(value: object) -> datetime | None:
@@ -194,6 +222,7 @@ class JarvisHoldHost:
         launcher = _read_json(launcher_config) or {}
         self.profile = str(launcher.get("profile") or "").strip()
         self.codex_home = str(launcher.get("expected_codex_home") or "").strip()
+        self.started_at = _now()
         self.requests_roots = (state_dir / "task-holds", state_dir / "task-monitors")
         self.health_path = state_dir / "hold-host.json"
         self.workers = max(int(workers), 1)
@@ -286,6 +315,7 @@ class JarvisHoldHost:
                     "state_dir": str(self.state_dir.resolve()),
                     "status": "holding" if active_hold_ids else status,
                     "pid": os.getpid(),
+                    "host_started_at": self.started_at,
                     "request_id": request_id,
                     "worker_capacity": self.workers,
                     "active_count": len(active_hold_ids),

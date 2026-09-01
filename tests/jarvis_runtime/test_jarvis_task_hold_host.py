@@ -286,6 +286,7 @@ class TaskMonitorHostTest(unittest.TestCase):
             (state_dir / "hold-host.json").write_text(json.dumps({
                 "status": "ready", "pid": 1780,
                 "observed_at": "2026-09-01T00:00:00+00:00",
+                "host_started_at": "2026-09-01T00:00:00+00:00",
                 "profile": "jarvis_test", "codex_home": "C:/test/codex-home",
                 "state_dir": str(state_dir.resolve()),
             }), encoding="utf-8")
@@ -294,6 +295,7 @@ class TaskMonitorHostTest(unittest.TestCase):
             receipt = ensure_hold_host(
                 state_dir=state_dir, launcher_config=launcher_config,
                 start_host=start_host, now=lambda: "2026-09-01T00:00:10+00:00", pid_alive=lambda _: True,
+                pid_started_at=lambda _: "2026-08-31T23:59:59+00:00",
             )
 
         self.assertEqual(receipt, {"status": "ready", "phase": "already_running"})
@@ -310,6 +312,7 @@ class TaskMonitorHostTest(unittest.TestCase):
             (state_dir / "hold-host.json").write_text(json.dumps({
                 "status": "ready", "pid": 1780,
                 "observed_at": "2026-08-31T00:00:00+00:00",
+                "host_started_at": "2026-08-31T00:00:00+00:00",
                 "profile": "jarvis_test", "codex_home": "C:/test/codex-home",
                 "state_dir": str(state_dir.resolve()),
             }), encoding="utf-8")
@@ -318,6 +321,7 @@ class TaskMonitorHostTest(unittest.TestCase):
                 (state_dir / "hold-host.json").write_text(json.dumps({
                     "status": "ready", "pid": 1781,
                     "observed_at": "2026-09-01T00:00:10+00:00",
+                    "host_started_at": "2026-09-01T00:00:00+00:00",
                     "profile": "jarvis_test", "codex_home": "C:/test/codex-home",
                     "state_dir": str(state_dir.resolve()),
                 }), encoding="utf-8")
@@ -326,6 +330,7 @@ class TaskMonitorHostTest(unittest.TestCase):
                 state_dir=state_dir, launcher_config=launcher_config,
                 start_host=start_host, wait_seconds=1, poll_seconds=0,
                 now=lambda: "2026-09-01T00:00:10+00:00", pid_alive=lambda _: True,
+                pid_started_at=lambda _: "2026-08-31T23:59:59+00:00",
             )
 
         self.assertEqual(receipt, {"status": "ready", "phase": "started"})
@@ -343,6 +348,7 @@ class TaskMonitorHostTest(unittest.TestCase):
                 (state_dir / "hold-host.json").write_text(json.dumps({
                     "status": "ready", "pid": 1781,
                     "observed_at": "2026-09-01T00:00:10+00:00",
+                    "host_started_at": "2026-09-01T00:00:00+00:00",
                     "profile": "jarvis_test", "codex_home": "C:/test/codex-home",
                     "state_dir": str(state_dir.resolve()),
                 }), encoding="utf-8")
@@ -351,6 +357,7 @@ class TaskMonitorHostTest(unittest.TestCase):
                 state_dir=state_dir, launcher_config=launcher_config,
                 start_host=start_host, poll_seconds=0,
                 now=lambda: "2026-09-01T00:00:10+00:00", pid_alive=lambda _: True,
+                pid_started_at=lambda _: "2026-08-31T23:59:59+00:00",
             )
 
             roots_exist = (state_dir / "task-holds").is_dir() and (state_dir / "task-monitors").is_dir()
@@ -368,6 +375,7 @@ class TaskMonitorHostTest(unittest.TestCase):
             (state_dir / "hold-host.json").write_text(json.dumps({
                 "status": "ready", "pid": 1780,
                 "observed_at": "2026-09-01T00:00:00+00:00",
+                "host_started_at": "2026-09-01T00:00:00+00:00",
                 "profile": "jarvis_test", "codex_home": "C:/test/codex-home",
                 "state_dir": str(state_dir.resolve()),
             }), encoding="utf-8")
@@ -376,6 +384,7 @@ class TaskMonitorHostTest(unittest.TestCase):
                 (state_dir / "hold-host.json").write_text(json.dumps({
                     "status": "ready", "pid": 1781,
                     "observed_at": "2026-09-01T00:00:10+00:00",
+                    "host_started_at": "2026-09-01T00:00:00+00:00",
                     "profile": "jarvis_test", "codex_home": "C:/test/codex-home",
                     "state_dir": str(state_dir.resolve()),
                 }), encoding="utf-8")
@@ -384,6 +393,40 @@ class TaskMonitorHostTest(unittest.TestCase):
                 state_dir=state_dir, launcher_config=launcher_config, start_host=start_host,
                 poll_seconds=0, now=lambda: "2026-09-01T00:00:10+00:00",
                 pid_alive=lambda pid: pid == 1781,
+                pid_started_at=lambda _: "2026-08-31T23:59:59+00:00",
+            )
+
+        self.assertEqual(receipt, {"status": "ready", "phase": "started"})
+
+    def test_initialize_user_host_restarts_when_pid_has_been_reused(self):
+        with tempfile.TemporaryDirectory() as temp:
+            state_dir = Path(temp)
+            launcher_config = state_dir / "launcher.json"
+            launcher_config.write_text(json.dumps({
+                "profile": "jarvis_test", "expected_codex_home": "C:/test/codex-home",
+            }), encoding="utf-8")
+            (state_dir / "hold-host.json").write_text(json.dumps({
+                "status": "ready", "pid": 1780,
+                "observed_at": "2026-09-01T00:00:10+00:00",
+                "host_started_at": "2026-09-01T00:00:00+00:00",
+                "profile": "jarvis_test", "codex_home": "C:/test/codex-home",
+                "state_dir": str(state_dir.resolve()),
+            }), encoding="utf-8")
+
+            def start_host():
+                (state_dir / "hold-host.json").write_text(json.dumps({
+                    "status": "ready", "pid": 1781,
+                    "observed_at": "2026-09-01T00:00:10+00:00",
+                    "host_started_at": "2026-09-01T00:00:00+00:00",
+                    "profile": "jarvis_test", "codex_home": "C:/test/codex-home",
+                    "state_dir": str(state_dir.resolve()),
+                }), encoding="utf-8")
+
+            receipt = initialize_user_host(
+                state_dir=state_dir, launcher_config=launcher_config, start_host=start_host,
+                poll_seconds=0, now=lambda: "2026-09-01T00:00:10+00:00",
+                pid_alive=lambda _: True,
+                pid_started_at=lambda pid: "2026-09-01T00:01:00+00:00" if pid == 1780 else "2026-08-31T23:59:59+00:00",
             )
 
         self.assertEqual(receipt, {"status": "ready", "phase": "started"})
