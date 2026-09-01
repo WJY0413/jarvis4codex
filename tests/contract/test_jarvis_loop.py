@@ -178,7 +178,7 @@ class JarvisLoopContractTest(unittest.TestCase):
             expires_at="2099-01-01T00:00:00+00:00",
         )
         self.assertEqual(self.runtime.hold_calls[0]["input_binding"], {
-            **lane, "candidate_ids": [7],
+            **lane, "candidate_ids": [7], "lane_identity": "worker-1", "lane_item_count": 2,
         })
         self.assertEqual(started.data["children"][0]["lane"], lane)
         self.assertIn("每个 Worker 回合仅处理 binding 中的一家公司", self.runtime.hold_calls[0]["prompt"])
@@ -186,7 +186,7 @@ class JarvisLoopContractTest(unittest.TestCase):
         self.runtime.states[hold_id] = {"status": "completed", "thread_id": "thread-1"}
         self.controller.tick(self.runtime, loop_id=started.loop_id)
         self.assertEqual(self.runtime.hold_calls[1]["input_binding"], {
-            **lane, "candidate_ids": [9],
+            **lane, "candidate_ids": [9], "lane_identity": "worker-1", "lane_item_count": 2,
         })
 
     def test_loop_completes_uneven_lanes_without_an_unbound_extra_turn(self):
@@ -223,6 +223,8 @@ class JarvisLoopContractTest(unittest.TestCase):
                 if call["source_ref"].endswith(f"worker-{number}")
             ]
             self.assertEqual([binding["candidate_ids"] for binding in bindings], [[value] for value in lane])
+            self.assertTrue(all(binding["lane_identity"] == f"worker-{number}" for binding in bindings))
+            self.assertTrue(all(binding["lane_item_count"] == len(lane) for binding in bindings))
             self.assertTrue(all(binding is not None for binding in bindings))
 
     def test_loop_rejects_lane_that_exceeds_its_round_budget(self):
@@ -369,6 +371,8 @@ class JarvisLoopContractTest(unittest.TestCase):
                     "candidate_ids": "unique positive integers",
                     "database_path": "non-empty path",
                     "output_boundary": "non-empty path",
+                    "lane_identity": "read-only worker slot injected by Loop",
+                    "lane_item_count": "read-only total candidate count injected by Loop",
                 },
             },
             "count": "must equal target_thread_count when supplied",

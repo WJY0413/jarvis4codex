@@ -263,6 +263,8 @@ class LoopController:
                             "candidate_ids": "unique positive integers",
                             "database_path": "non-empty path",
                             "output_boundary": "non-empty path",
+                            "lane_identity": "read-only worker slot injected by Loop",
+                            "lane_item_count": "read-only total candidate count injected by Loop",
                         },
                     },
                     "count": "must equal target_thread_count when supplied",
@@ -490,6 +492,8 @@ def _current_turn_binding(child: Mapping[str, Any], *, round_number: int) -> dic
         "candidate_ids": [candidate_ids[round_number - 1]],
         "database_path": lane["database_path"],
         "output_boundary": lane["output_boundary"],
+        "lane_identity": child["slot"],
+        "lane_item_count": len(candidate_ids),
     }
 
 
