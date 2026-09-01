@@ -136,6 +136,39 @@ class JarvisLoopContractTest(unittest.TestCase):
         self.assertEqual(completed.status, "completed")
         self.assertEqual(len(self.runtime.hold_calls), 1)
 
+    def test_reconcile_closes_a_holder_owned_terminal_loop_and_cancels_heartbeat(self):
+        started = self.controller.start(
+            self.runtime, request_id="terminal-reconcile", project="Jarvis4codex", title="Worker", prompt="count",
+            target_thread_count=1, max_rounds=2, expires_at="2099-01-01T00:00:00+00:00",
+        )
+        hold_id = started.data["children"][0]["hold_id"]
+        self.runtime.states[hold_id] = {
+            "status": "turn_limit_reached", "thread_id": "thread-1", "turn_id": "turn-2", "total_turn_count": 2,
+        }
+
+        reconciled = self.controller.reconcile(self.runtime)
+        final = self.controller.status(loop_id=started.loop_id)
+
+        self.assertEqual(reconciled.data["reconciled"], [{"loop_id": started.loop_id, "status": "completed"}])
+        self.assertEqual(final.status, "completed")
+        self.assertEqual(final.data["children"][0]["round"], 2)
+        self.assertEqual(self.runtime.heartbeat_calls[-1]["action"], "cancel")
+        self.controller.reconcile(self.runtime)
+        self.assertEqual(len([call for call in self.runtime.heartbeat_calls if call["action"] == "cancel"]), 1)
+
+    def test_tick_cancels_the_heartbeat_when_a_terminal_hold_blocks_the_loop(self):
+        started = self.controller.start(
+            self.runtime, request_id="blocked-terminal", project="Jarvis4codex", title="Worker", prompt="count",
+            target_thread_count=1, max_rounds=2, expires_at="2099-01-01T00:00:00+00:00",
+        )
+        hold_id = started.data["children"][0]["hold_id"]
+        self.runtime.states[hold_id] = {"status": "failed", "thread_id": "thread-1"}
+
+        blocked = self.controller.tick(self.runtime, loop_id=started.loop_id)
+
+        self.assertEqual(blocked.status, "blocked")
+        self.assertEqual(self.runtime.heartbeat_calls[-1]["action"], "cancel")
+
     def test_loop_exposes_one_stable_lane_candidate_per_worker_turn(self):
         lane = {"candidate_ids": [7, 9], "database_path": "C:/collection.sqlite", "output_boundary": "C:/outputs/worker-1"}
         started = self.controller.start(

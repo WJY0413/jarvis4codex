@@ -77,8 +77,6 @@ class HoldTurnMonitor:
         command_id = f"monitor:{request.hold_id}:{request.turn_id}:{request.turn_count}"
         if terminal_status != "completed":
             return self._stop(request, command_id, terminal_status, final_message, "non_completed_terminal")
-        if not final_message.strip():
-            return self._stop(request, command_id, "requires_readback", final_message, "empty_turn_readback")
         if request.turn_count >= request.max_turns:
             return self._stop(request, command_id, "turn_limit_reached", final_message, "turn_budget_consumed")
         if not request.continuation_enabled:
@@ -90,7 +88,7 @@ class HoldTurnMonitor:
             expected_turn_id=request.turn_id,
             result_status="holding",
             final_message=final_message,
-            reason="completed_nonempty_under_budget",
+            reason="completed_under_budget",
             continue_prompt=request.continue_prompt,
             notification_events=self._milestone_events(request, "completed"),
         )

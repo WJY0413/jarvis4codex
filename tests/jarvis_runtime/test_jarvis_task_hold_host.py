@@ -63,6 +63,11 @@ class TerminalGateClient(FakeClient):
         return {"id": turn_id, "status": "completed"}
 
 
+class EmptyReadbackClient(FakeClient):
+    def wait_for_turn_readback(self, _thread_id, _turn_id):
+        return ""
+
+
 class HostContextFailureClient(FakeClient):
     def create_task(self, _request, *, on_phase, **_kwargs):
         on_phase("app_server_initializing", {})
@@ -129,6 +134,27 @@ class TaskMonitorHostTest(unittest.TestCase):
         self.assertEqual(final["session_turn_count"], 2)
         self.assertEqual(final["total_turn_count"], 2)
         self.assertTrue(client.closed)
+
+    def test_empty_turn_readback_does_not_block_holder_continuation(self):
+        client = EmptyReadbackClient(None)
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            request, ack, result = root / "request.json", root / "ack.json", root / "result.json"
+            request.write_text(json.dumps({
+                "request_id": "empty-readback", "prompt": "hello", "max_turns": 2,
+                "auto_continue": True, "continue_prompt": "继续",
+            }), encoding="utf-8")
+            with patch("adapters.codex_app_server.jarvis_task_hold_host.NativeTaskLauncherConfig", return_value=FakeConfig()), patch(
+                "adapters.codex_app_server.jarvis_task_hold_host.AppServerClient", return_value=client
+            ):
+                exit_code = hold_task(Path("launcher.json"), request, ack, result)
+
+            final = json.loads(result.read_text(encoding="utf-8"))
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(client.started_prompts, ["继续"])
+        self.assertEqual(final["status"], "turn_limit_reached")
+        self.assertEqual(final["final_message"], "")
 
     def test_reports_a_stable_host_context_error_with_the_last_phase(self):
         client = HostContextFailureClient(None)

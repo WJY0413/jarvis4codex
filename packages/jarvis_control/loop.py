@@ -53,6 +53,24 @@ class LoopStore:
     def exists(self, loop_id: str) -> bool:
         return self._path(loop_id).exists()
 
+    def active_loop_ids(self) -> list[str]:
+        if not self._root.is_dir():
+            return []
+        loop_ids: list[str] = []
+        for path in self._root.glob("*/state.json"):
+            try:
+                state = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not isinstance(state, Mapping) or state.get("schema") != "jarvis-loop-state/v1":
+                continue
+            if state.get("status") in {"blocked", "completed", "stopped", "expired"}:
+                continue
+            loop_id = str(state.get("loop_id") or "").strip()
+            if loop_id:
+                loop_ids.append(loop_id)
+        return loop_ids
+
     def save(self, loop_id: str, state: Mapping[str, Any]) -> None:
         path = self._path(loop_id)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -186,7 +204,9 @@ class LoopController:
                 child["round"] = next_round; child["phase"] = "running"
             else:
                 child["phase"] = "blocked"; state["status"] = "blocked"
-        if all(child.get("phase") == "completed" for child in state["children"]):
+        if state["status"] == "blocked":
+            state["heartbeat"] = self._cancel(runtime, state)
+        elif all(child.get("phase") == "completed" for child in state["children"]):
             state["status"] = "completed"; state["heartbeat"] = self._cancel(runtime, state)
         else:
             self._refresh(state)
@@ -198,6 +218,20 @@ class LoopController:
             return self._result(self._store.load(loop_id))
         except ValueError as exc:
             return LoopResult("invalid_request", loop_id, {}, str(exc))
+
+    def reconcile(self, runtime: LoopRuntime) -> LoopResult:
+        """Close Holder-owned terminal slots without scheduling another Worker turn."""
+        reconciled: list[dict[str, Any]] = []
+        for loop_id in self._store.active_loop_ids():
+            try:
+                state = self._store.load(loop_id)
+            except ValueError:
+                continue
+            if not self._reconcile_holder_terminals(runtime, state):
+                continue
+            self._store.save(loop_id, state)
+            reconciled.append({"loop_id": loop_id, "status": state["status"]})
+        return LoopResult("completed", None, {"reconciled": reconciled})
 
     @staticmethod
     def preflight_contract(*, allowed_projects: list[str]) -> dict[str, Any]:
@@ -270,6 +304,43 @@ class LoopController:
                     except (TypeError, ValueError):
                         pass
                 child["phase"] = "terminal"
+
+    def _reconcile_holder_terminals(self, runtime: LoopRuntime, state: dict[str, Any]) -> bool:
+        changed = False
+        for child in state["children"]:
+            if not child.get("holder_owns_continuation") or child.get("phase") == "completed":
+                continue
+            hold_id = child.get("hold_id")
+            if not hold_id:
+                continue
+            receipt = runtime.monitor(
+                action="status", request_id=f"{state['loop_id']}:{child['slot']}:terminal-monitor",
+                source_ref=f"jarvis_loop:{state['loop_id']}:{child['slot']}", hold_id=hold_id,
+            )
+            if receipt.get("status") != "completed":
+                continue
+            data = receipt.get("data") or {}
+            lifecycle = str(data.get("lifecycle_status") or data.get("status") or "")
+            if lifecycle not in TERMINAL:
+                continue
+            child["last_receipt"] = receipt
+            child["lifecycle"] = lifecycle
+            child["thread_id"] = receipt.get("target_thread_id") or data.get("thread_id") or child.get("thread_id")
+            try:
+                child["round"] = max(int(child.get("round") or 0), int(data.get("total_turn_count") or 0))
+            except (TypeError, ValueError):
+                pass
+            child["phase"] = "completed" if lifecycle in {"completed", "turn_limit_reached"} else "blocked"
+            changed = True
+        if not changed:
+            return False
+        if any(child.get("phase") == "blocked" for child in state["children"]):
+            state["status"] = "blocked"
+            state["heartbeat"] = self._cancel(runtime, state)
+        elif all(child.get("phase") == "completed" for child in state["children"]):
+            state["status"] = "completed"
+            state["heartbeat"] = self._cancel(runtime, state)
+        return True
 
     def _refresh(self, state: dict[str, Any]) -> None:
         if state.get("status") == "blocked":

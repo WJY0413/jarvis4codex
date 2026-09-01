@@ -6,6 +6,7 @@ import argparse
 import json
 from pathlib import Path
 import sys
+import time
 from typing import Any, Mapping
 
 from jarvis_control import JarvisControl
@@ -56,6 +57,10 @@ class JarvisControlFunctionRunner:
             return self._control.loop(action="tick", loop_id=str(arguments.get("loop_id") or ""))
         return {"status": "failed", "reason": f"unsupported heartbeat function: {function_name}"}
 
+    def reconcile_terminal_holds(self) -> Mapping[str, Any]:
+        """Observe existing Holder terminal receipts without scheduling a heartbeat function."""
+        return self._control.loop(action="reconcile")
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -71,12 +76,19 @@ def main() -> int:
         local_heartbeat_config_path=args.local_heartbeat_config,
         notification_config_path=args.notification_config,
     )
+    runner = JarvisControlFunctionRunner(control)
     service = HeartbeatService(
         LocalHeartbeatConfig.load(args.local_heartbeat_config),
-        function_runner=JarvisControlFunctionRunner(control),
+        function_runner=runner,
     )
     if args.command == "run-forever":
-        return service.run_forever()
+        try:
+            while True:
+                service.run_once()
+                runner.reconcile_terminal_holds()
+                time.sleep(service.config.poll_seconds)
+        except KeyboardInterrupt:
+            return 0
     payload = service.health() if args.command == "health-check" else service.run_once()
     print(json.dumps(payload, ensure_ascii=False))
     return 0

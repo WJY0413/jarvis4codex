@@ -50,16 +50,16 @@ class HoldTurnMonitorTest(unittest.TestCase):
         self.assertEqual(decision.continue_prompt, "继续")
         self.assertEqual(decision.notification_events[0].event_type, "milestone")
 
-    def test_empty_completed_turn_stops_and_emits_terminal_event(self):
+    def test_empty_completed_turn_continues_without_a_terminal_event(self):
         client = FakeHeldTurnClient(content="  ")
         decision = HoldTurnMonitor().observe(client, self.request(
             notification_policy=NotificationPolicy(terminal=True),
         ))
 
-        self.assertEqual(decision.action, "STOP")
-        self.assertEqual(decision.result_status, "requires_readback")
-        self.assertEqual(decision.reason, "empty_turn_readback")
-        self.assertEqual(decision.notification_events[0].event_type, "terminal")
+        self.assertEqual(decision.action, "CONTINUE")
+        self.assertEqual(decision.result_status, "holding")
+        self.assertEqual(decision.reason, "completed_under_budget")
+        self.assertEqual(decision.notification_events, ())
 
     def test_non_completed_terminal_does_not_read_content_or_continue(self):
         client = FakeHeldTurnClient(status="failed")

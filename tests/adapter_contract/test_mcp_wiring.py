@@ -88,6 +88,17 @@ class McpWiringContractTest(unittest.TestCase):
         self.assertEqual(result["status"], "running")
         self.assertEqual(control.kwargs, {"action": "tick", "loop_id": "loop-contract-1"})
 
+    def test_heartbeat_host_runner_reconciles_terminal_holds_without_a_scheduled_tick(self):
+        class Control:
+            def loop(self, **kwargs):
+                self.kwargs = kwargs
+                return {"status": "completed"}
+
+        control = Control()
+        result = JarvisControlFunctionRunner(control).reconcile_terminal_holds()
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(control.kwargs, {"action": "reconcile"})
+
 
 if __name__ == "__main__":
     unittest.main()

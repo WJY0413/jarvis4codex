@@ -66,6 +66,8 @@ class JarvisControl:
             result = self._loop_controller.start(self, **options)
         elif action == "tick":
             result = self._loop_controller.tick(self, loop_id=str(loop_id or ""))
+        elif action == "reconcile":
+            result = self._loop_controller.reconcile(self)
         elif action == "status":
             result = self._loop_controller.status(loop_id=str(loop_id or ""))
         elif action == "stop":
