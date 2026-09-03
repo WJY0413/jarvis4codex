@@ -80,6 +80,27 @@ class JarvisLoopContractTest(unittest.TestCase):
             "heartbeat_id": "loop-contract-1:reconcile",
         })
 
+    def test_legacy_v1_state_without_reconcile_fields_reaches_terminal_without_migration(self):
+        started = self.controller.start(
+            self.runtime, request_id="legacy-reconcile", project="Jarvis4codex", title="Worker", prompt="test task",
+            target_thread_count=1, max_rounds=1, expires_at="2099-01-01T00:00:00+00:00",
+        )
+        loop_id = str(started.loop_id)
+        state = self.controller._store.load(loop_id)
+        state.pop("heartbeat_id")
+        state.pop("heartbeat")
+        self.controller._store.save(loop_id, state)
+        hold_id = str(state["children"][0]["hold_id"])
+        self.runtime.states[hold_id] = {
+            "status": "turn_limit_reached", "thread_id": "thread-1", "turn_id": "turn-1", "total_turn_count": 1,
+        }
+
+        completed = self.controller.tick(self.runtime, loop_id=loop_id)
+
+        self.assertEqual(completed.status, "completed")
+        self.assertEqual([call["action"] for call in self.runtime.heartbeat_calls], ["create"])
+        self.assertEqual(self.controller._store.load(loop_id)["heartbeat"], {"status": "not_required"})
+
     def test_loop_does_not_resume_after_one_terminal_turn_when_auto_continue_is_false(self):
         started = self.controller.start(
             self.runtime, request_id="no-auto", project="Jarvis4codex", title="Worker", prompt="test task",
