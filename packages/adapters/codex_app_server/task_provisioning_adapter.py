@@ -12,6 +12,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from jarvis_runtime.coo_dispatcher_store import ProcessLock
+
 from jarvis_control.provisioning import (
     TaskMonitorResumeRequest,
     TaskProvisionReceipt,
@@ -182,6 +184,10 @@ class CodexAppServerTaskProvisioningAdapter:
         safe_id = _safe_id(request_id)
         root = self._state_dir / "task-holds" / safe_id
         root.mkdir(parents=True, exist_ok=True)
+        return self._paths_at(root)
+
+    @staticmethod
+    def _paths_at(root: Path) -> dict[str, Path]:
         return {
             "request": root / "request.json",
             "ack": root / "ack.json",
@@ -189,6 +195,19 @@ class CodexAppServerTaskProvisioningAdapter:
             "events": root / "monitor-events.jsonl",
             "deliveries": root / "monitor-notification-deliveries.jsonl",
         }
+
+    def _existing_paths(self, hold_id: str) -> dict[str, Path] | None:
+        safe_id = _safe_id(str(hold_id))
+        for parent_name in ("task-holds", "task-monitors"):
+            parent = self._state_dir / parent_name
+            root = parent / safe_id
+            if root.is_dir():
+                return self._paths_at(root)
+            if parent.is_dir():
+                for candidate in parent.iterdir():
+                    if candidate.is_dir() and _hold_id_from_state(candidate) == hold_id:
+                        return self._paths_at(candidate)
+        return None
 
     def hold_status(self, hold_id: str) -> dict[str, Any]:
         safe_id = _safe_id(str(hold_id))
@@ -218,22 +237,72 @@ class CodexAppServerTaskProvisioningAdapter:
             thread_id=thread_id, turn_id=turn_id,
         )
 
-    def pending_hold_notifications(self, hold_id: str) -> list[dict[str, Any]]:
-        paths = self._paths(hold_id)
+    def pending_hold_notifications(
+        self, hold_id: str, *, event_type: str | None = None,
+    ) -> list[dict[str, Any]]:
+        paths = self._existing_paths(hold_id)
+        if paths is None:
+            return []
         delivered = {
             str(row.get("event_id") or "")
             for row in _read_jsonl(paths["deliveries"])
-            if str(row.get("delivery_status") or "") == "delivered"
+            if (
+                str(row.get("delivery_status") or "") == "delivered"
+                and str(row.get("message_id") or "").strip()
+            )
         }
         return [
             row for row in _read_jsonl(paths["events"])
-            if str(row.get("event_id") or "") not in delivered
+            if (
+                str(row.get("event_id") or "") not in delivered
+                and (event_type is None or str(row.get("event_type") or "") == event_type)
+            )
         ]
+
+    def pending_hold_notification_holds(self, *, event_type: str | None = None) -> list[str]:
+        """Return exact Hold identities that have durable, undelivered notification events."""
+        hold_ids: set[str] = set()
+        for parent_name in ("task-holds", "task-monitors"):
+            parent = self._state_dir / parent_name
+            if not parent.is_dir():
+                continue
+            for root in parent.iterdir():
+                if not root.is_dir():
+                    continue
+                event_rows = _read_jsonl(root / "monitor-events.jsonl")
+                if not event_rows:
+                    continue
+                delivered = {
+                    str(row.get("event_id") or "")
+                    for row in _read_jsonl(root / "monitor-notification-deliveries.jsonl")
+                    if (
+                        str(row.get("delivery_status") or "") == "delivered"
+                        and str(row.get("message_id") or "").strip()
+                    )
+                }
+                if not any(
+                    str(event.get("event_id") or "")
+                    and str(event.get("event_id") or "") not in delivered
+                    and (event_type is None or str(event.get("event_type") or "") == event_type)
+                    for event in event_rows
+                ):
+                    continue
+                hold_id = _hold_id_from_state(root)
+                if hold_id:
+                    hold_ids.add(hold_id)
+        return sorted(hold_ids)
+
+    def hold_notification_delivery_lock(self, hold_id: str) -> ProcessLock:
+        """Serialize one Hold's notification send and its durable receipt."""
+        paths = self._existing_paths(hold_id)
+        if paths is None:
+            raise RuntimeError("hold state was not found")
+        return ProcessLock(paths["deliveries"].with_suffix(".lock"))
 
     def record_hold_notification_delivery(
         self, hold_id: str, event_id: str, delivery: dict[str, Any]
     ) -> None:
-        paths = self._paths(hold_id)
+        paths = self._existing_paths(hold_id) or self._paths(hold_id)
         _append_jsonl(paths["deliveries"], {
             "event_id": event_id,
             "delivery_status": str(delivery.get("delivery_status") or delivery.get("status") or "failed"),
@@ -271,6 +340,15 @@ def _read_json_file(path: Path) -> dict[str, Any] | None:
     except (OSError, json.JSONDecodeError):
         return None
     return value if isinstance(value, dict) else None
+
+
+def _hold_id_from_state(root: Path) -> str | None:
+    for name in ("request.json", "ack.json", "result.json"):
+        value = _read_json_file(root / name)
+        hold_id = str((value or {}).get("hold_id") or "").strip()
+        if hold_id:
+            return hold_id
+    return None
 
 
 def _append_jsonl(path: Path, value: dict[str, Any]) -> None:

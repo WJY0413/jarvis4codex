@@ -94,10 +94,35 @@ class McpWiringContractTest(unittest.TestCase):
                 self.kwargs = kwargs
                 return {"status": "completed"}
 
+            def deliver_pending_hold_notifications(self, **_kwargs):
+                return {"status": "completed", "readback": {"verified": True}}
+
         control = Control()
         result = JarvisControlFunctionRunner(control).reconcile_terminal_holds()
         self.assertEqual(result["status"], "completed")
         self.assertEqual(control.kwargs, {"action": "reconcile"})
+
+    def test_heartbeat_host_runner_drains_pending_terminal_notifications(self):
+        class Control:
+            def loop(self, **kwargs):
+                self.loop_kwargs = kwargs
+                return {"status": "completed"}
+
+            def deliver_pending_hold_notifications(self, **kwargs):
+                self.delivery_kwargs = kwargs
+                return {
+                    "status": "completed",
+                    "readback": {"verified": True},
+                    "data": {"deliveries": [{"message_id": "om-1"}]},
+                }
+
+        control = Control()
+        result = JarvisControlFunctionRunner(control).reconcile_terminal_holds()
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(control.loop_kwargs, {"action": "reconcile"})
+        self.assertEqual(control.delivery_kwargs["source_ref"], "local-heartbeat:terminal-notification-drain")
+        self.assertTrue(result["notification_delivery"]["readback"]["verified"])
 
 
 if __name__ == "__main__":

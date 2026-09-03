@@ -192,6 +192,59 @@ class TaskProvisioningAdapterContractTest(unittest.TestCase):
         self.assertEqual(rows[0]["candidate_id"], 9)
         self.assertEqual(rows[0]["final_answer"], "second")
 
+    def test_pending_hold_notification_holds_returns_only_undelivered_events(self):
+        with tempfile.TemporaryDirectory() as temp:
+            state_dir = Path(temp)
+            pending = state_dir / "task-holds" / "hold-pending"
+            delivered = state_dir / "task-holds" / "hold-delivered"
+            unverified = state_dir / "task-holds" / "hold-unverified"
+            for root, hold_id in (
+                (pending, "hold:pending"),
+                (delivered, "hold:delivered"),
+                (unverified, "hold:unverified"),
+            ):
+                root.mkdir(parents=True)
+                (root / "request.json").write_text(json.dumps({"hold_id": hold_id}), encoding="utf-8")
+                (root / "monitor-events.jsonl").write_text(json.dumps({"event_id": "terminal:turn-1"}) + "\n", encoding="utf-8")
+            (delivered / "monitor-notification-deliveries.jsonl").write_text(
+                json.dumps({"event_id": "terminal:turn-1", "delivery_status": "delivered", "message_id": "om-1"}) + "\n",
+                encoding="utf-8",
+            )
+            adapter = CodexAppServerTaskProvisioningAdapter(
+                "unused.json", state_dir=state_dir, config_loader=lambda _: FakeConfig()
+            )
+
+            hold_ids = adapter.pending_hold_notification_holds()
+
+        self.assertEqual(hold_ids, ["hold:pending", "hold:unverified"])
+
+    def test_pending_terminal_discovery_skips_milestones_and_records_legacy_delivery_in_place(self):
+        with tempfile.TemporaryDirectory() as temp:
+            state_dir = Path(temp)
+            root = state_dir / "task-monitors" / "legacy-monitor"
+            root.mkdir(parents=True)
+            (root / "request.json").write_text(json.dumps({"hold_id": "legacy:monitor"}), encoding="utf-8")
+            (root / "monitor-events.jsonl").write_text(
+                "\n".join((
+                    json.dumps({"event_id": "milestone:turn-1", "event_type": "milestone"}),
+                    json.dumps({"event_id": "terminal:turn-1", "event_type": "terminal"}),
+                )) + "\n",
+                encoding="utf-8",
+            )
+            adapter = CodexAppServerTaskProvisioningAdapter(
+                "unused.json", state_dir=state_dir, config_loader=lambda _: FakeConfig()
+            )
+
+            hold_ids = adapter.pending_hold_notification_holds(event_type="terminal")
+            adapter.record_hold_notification_delivery(
+                "legacy:monitor", "terminal:turn-1",
+                {"delivery_status": "delivered", "message_id": "om-legacy"},
+            )
+
+            self.assertEqual(hold_ids, ["legacy:monitor"])
+            self.assertTrue((root / "monitor-notification-deliveries.jsonl").is_file())
+            self.assertFalse((state_dir / "task-holds" / "legacy_monitor").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

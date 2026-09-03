@@ -58,8 +58,23 @@ class JarvisControlFunctionRunner:
         return {"status": "failed", "reason": f"unsupported heartbeat function: {function_name}"}
 
     def reconcile_terminal_holds(self) -> Mapping[str, Any]:
-        """Observe existing Holder terminal receipts without scheduling a heartbeat function."""
-        return self._control.loop(action="reconcile")
+        """Reconcile terminal Holds, then pass their durable events to Jarvis Bridge."""
+        lifecycle = self._control.loop(action="reconcile")
+        notification_delivery = self._control.deliver_pending_hold_notifications(
+            request_id="local-heartbeat:terminal-notification-drain",
+            source_ref="local-heartbeat:terminal-notification-drain",
+        )
+        status = (
+            "completed"
+            if lifecycle.get("status") == "completed"
+            and notification_delivery.get("status") == "completed"
+            else str(notification_delivery.get("status") or lifecycle.get("status") or "failed")
+        )
+        return {
+            "status": status,
+            "lifecycle": lifecycle,
+            "notification_delivery": notification_delivery,
+        }
 
 
 def main() -> int:
@@ -90,6 +105,8 @@ def main() -> int:
         except KeyboardInterrupt:
             return 0
     payload = service.health() if args.command == "health-check" else service.run_once()
+    if args.command == "run-once":
+        payload["terminal_hold_reconciliation"] = runner.reconcile_terminal_holds()
     print(json.dumps(payload, ensure_ascii=False))
     return 0
 

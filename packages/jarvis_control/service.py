@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from typing import Any, Mapping, Protocol
 
 from jarvis_codex_bridge import CapabilityRequest, ExistingThreadBridge, JarvisCapabilityPort
@@ -336,6 +337,7 @@ class JarvisControl:
         model: str | None = None,
         reasoning_effort: str | None = None,
         hold_id: str | None = None,
+        notification_event_type: str | None = None,
     ) -> dict[str, Any]:
         if action == "status":
             status_reader = getattr(self._provisioner, "hold_status", None)
@@ -371,19 +373,39 @@ class JarvisControl:
                     "jarvis_monitor", "unsupported", request_id=request_id,
                     reason="no managed-hold notification event adapter is configured",
                 )
-            deliveries: list[dict[str, Any]] = []
-            for event in pending_reader(hold_id):
-                event_id = str(event.get("event_id") or "").strip()
-                if not event_id:
-                    continue
-                delivery = dict(self._notifier.notify(
-                    request_id=f"{request_id}:{event_id}",
-                    source_ref=source_ref,
-                    message=str(event.get("message") or ""),
-                ))
-                recorder(hold_id, event_id, delivery)
-                deliveries.append({"event_id": event_id, **delivery})
-            verified = bool(deliveries) and all(
+            lock_factory = getattr(self._provisioner, "hold_notification_delivery_lock", None)
+            try:
+                delivery_lock = lock_factory(hold_id) if callable(lock_factory) else nullcontext()
+                with delivery_lock:
+                    deliveries: list[dict[str, Any]] = []
+                    for event in pending_reader(hold_id):
+                        if (
+                            notification_event_type is not None
+                            and str(event.get("event_type") or "") != notification_event_type
+                        ):
+                            continue
+                        event_id = str(event.get("event_id") or "").strip()
+                        if not event_id:
+                            continue
+                        try:
+                            delivery = dict(self._notifier.notify(
+                                request_id=f"{request_id}:{event_id}",
+                                source_ref=source_ref,
+                                message=str(event.get("message") or ""),
+                            ))
+                        except Exception as exc:
+                            delivery = {"delivery_status": "failed", "reason": str(exc)}
+                        try:
+                            recorder(hold_id, event_id, delivery)
+                        except Exception as exc:
+                            delivery = {"delivery_status": "failed", "reason": str(exc)}
+                        deliveries.append({"event_id": event_id, **delivery})
+            except Exception as exc:
+                return self._receipt(
+                    "jarvis_monitor", "failed", request_id=request_id, reason=str(exc),
+                    readback={"verified": False, "terminal": False},
+                )
+            verified = all(
                 item.get("delivery_status") == "delivered" and item.get("message_id")
                 for item in deliveries
             )
@@ -414,6 +436,49 @@ class JarvisControl:
                 "model": model,
                 "reasoning_effort": reasoning_effort,
             },
+        )
+
+    def deliver_pending_hold_notifications(
+        self, *, request_id: str, source_ref: str,
+    ) -> dict[str, Any]:
+        """Drain durable Hold notification events through the configured bridge."""
+        if self._notifier is None:
+            return self.unsupported(
+                tool="jarvis_monitor", reason="no verified notification adapter is configured"
+            )
+        hold_reader = getattr(self._provisioner, "pending_hold_notification_holds", None)
+        if not callable(hold_reader):
+            return self._receipt(
+                "jarvis_monitor", "unsupported", request_id=request_id,
+                reason="no managed-hold notification discovery adapter is configured",
+            )
+        try:
+            hold_ids = list(hold_reader(event_type="terminal"))
+        except Exception as exc:
+            return self._receipt("jarvis_monitor", "failed", request_id=request_id, reason=str(exc))
+        deliveries: list[dict[str, Any]] = []
+        verified = True
+        for hold_id in hold_ids:
+            try:
+                receipt = self.monitor(
+                    action="deliver_hold_notifications",
+                    request_id=f"{request_id}:{hold_id}", source_ref=source_ref,
+                    hold_id=str(hold_id), notification_event_type="terminal",
+                )
+            except Exception as exc:
+                receipt = self._receipt(
+                    "jarvis_monitor", "failed", request_id=f"{request_id}:{hold_id}", reason=str(exc),
+                    readback={"verified": False, "terminal": False},
+                )
+            data = receipt.get("data") or {}
+            for delivery in data.get("deliveries") or []:
+                deliveries.append({"hold_id": str(hold_id), **dict(delivery)})
+            verified = verified and bool((receipt.get("readback") or {}).get("verified"))
+        return self._receipt(
+            "jarvis_monitor", "completed" if verified else "requires_readback",
+            request_id=request_id,
+            data={"hold_ids": hold_ids, "deliveries": deliveries},
+            readback={"verified": verified, "terminal": False},
         )
 
     def heartbeat(

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -375,6 +377,191 @@ class JarvisMcpContractTest(unittest.TestCase):
         self.assertTrue(receipt["readback"]["verified"])
         self.assertEqual(provisioner.recorded[0][0:2], ("hold-1", "terminal:turn-1"))
         self.assertEqual(notifier.kwargs["request_id"], "notify-1:terminal:turn-1")
+
+    def test_terminal_notification_drain_discovers_and_delivers_pending_holds(self):
+        class Provisioner:
+            def __init__(self):
+                self.recorded = []
+
+            def pending_hold_notification_holds(self, *, event_type=None):
+                self.event_type = event_type
+                return ["hold-1"]
+
+            def pending_hold_notifications(self, hold_id):
+                self.hold_id = hold_id
+                return [{
+                    "event_id": "terminal:turn-1",
+                    "event_type": "terminal",
+                    "message": "JARVIS_HOLD_TERMINAL_V1 hold-1 completed",
+                }]
+
+            def record_hold_notification_delivery(self, hold_id, event_id, delivery):
+                self.recorded.append((hold_id, event_id, delivery))
+
+        class Notifier:
+            def notify(self, **kwargs):
+                self.kwargs = kwargs
+                return {"delivery_status": "delivered", "message_id": "feishu-1"}
+
+        provisioner = Provisioner()
+        notifier = Notifier()
+        control = JarvisControl(self.capability_port, self.bridge, provisioner, notifier)
+        receipt = control.deliver_pending_hold_notifications(
+            request_id="drain-1", source_ref="local-heartbeat:test",
+        )
+
+        self.assertEqual(receipt["status"], "completed")
+        self.assertTrue(receipt["readback"]["verified"])
+        self.assertEqual(provisioner.event_type, "terminal")
+        self.assertEqual(provisioner.hold_id, "hold-1")
+        self.assertEqual(provisioner.recorded[0][0:2], ("hold-1", "terminal:turn-1"))
+        self.assertEqual(notifier.kwargs["request_id"], "drain-1:hold-1:terminal:turn-1")
+
+    def test_terminal_notification_delivery_holds_the_per_hold_lock_through_receipt(self):
+        class Lock:
+            def __init__(self):
+                self.active = False
+                self.entered = 0
+                self.exited = 0
+
+            def __enter__(self):
+                self.active = True
+                self.entered += 1
+                return self
+
+            def __exit__(self, *_args):
+                self.active = False
+                self.exited += 1
+
+        class Provisioner:
+            def __init__(self):
+                self.lock = Lock()
+                self.recorded = []
+
+            def pending_hold_notifications(self, _hold_id):
+                return [{"event_id": "terminal:turn-1", "message": "done"}]
+
+            def hold_notification_delivery_lock(self, _hold_id):
+                return self.lock
+
+            def record_hold_notification_delivery(self, hold_id, event_id, delivery):
+                self.assert_lock_active()
+                self.recorded.append((hold_id, event_id, delivery))
+
+            def assert_lock_active(self):
+                if not self.lock.active:
+                    raise AssertionError("receipt was recorded outside the per-Hold lock")
+
+        class Notifier:
+            def __init__(self, lock):
+                self._lock = lock
+
+            def notify(self, **_kwargs):
+                if not self._lock.active:
+                    raise AssertionError("notifier ran outside the per-Hold lock")
+                return {"delivery_status": "delivered", "message_id": "feishu-1"}
+
+        provisioner = Provisioner()
+        control = JarvisControl(
+            self.capability_port, self.bridge, provisioner, Notifier(provisioner.lock),
+        )
+        receipt = control.monitor(
+            action="deliver_hold_notifications", request_id="locked-notify",
+            source_ref="mcp:test", hold_id="hold-1",
+        )
+
+        self.assertEqual(receipt["status"], "completed")
+        self.assertEqual((provisioner.lock.entered, provisioner.lock.exited), (1, 1))
+        self.assertEqual(len(provisioner.recorded), 1)
+
+    def test_overlapping_terminal_notification_deliveries_enqueue_once(self):
+        class Provisioner:
+            def __init__(self):
+                self.lock = threading.Lock()
+                self.delivered = False
+
+            def pending_hold_notifications(self, _hold_id):
+                return [] if self.delivered else [{"event_id": "terminal:turn-1", "message": "done"}]
+
+            def hold_notification_delivery_lock(self, _hold_id):
+                return self.lock
+
+            def record_hold_notification_delivery(self, _hold_id, _event_id, _delivery):
+                self.delivered = True
+
+        class Notifier:
+            def __init__(self):
+                self.calls = 0
+
+            def notify(self, **_kwargs):
+                self.calls += 1
+                time.sleep(0.05)
+                return {"delivery_status": "delivered", "message_id": "feishu-1"}
+
+        provisioner = Provisioner()
+        notifier = Notifier()
+        control = JarvisControl(self.capability_port, self.bridge, provisioner, notifier)
+        start = threading.Barrier(3)
+        receipts: list[dict] = []
+
+        def deliver(request_id: str) -> None:
+            start.wait()
+            receipts.append(control.monitor(
+                action="deliver_hold_notifications", request_id=request_id,
+                source_ref="mcp:test", hold_id="hold-1",
+            ))
+
+        workers = [
+            threading.Thread(target=deliver, args=("concurrent-1",)),
+            threading.Thread(target=deliver, args=("concurrent-2",)),
+        ]
+        for worker in workers:
+            worker.start()
+        start.wait()
+        for worker in workers:
+            worker.join(timeout=2)
+
+        self.assertFalse(any(worker.is_alive() for worker in workers))
+        self.assertEqual(notifier.calls, 1)
+        self.assertEqual([receipt["status"] for receipt in receipts], ["completed", "completed"])
+
+    def test_terminal_notification_drain_continues_after_a_bridge_failure(self):
+        class Provisioner:
+            def __init__(self):
+                self.recorded = []
+
+            def pending_hold_notification_holds(self, *, event_type=None):
+                self.event_type = event_type
+                return ["hold-1", "hold-2"]
+
+            def pending_hold_notifications(self, hold_id):
+                return [{"event_id": f"terminal:{hold_id}", "event_type": "terminal", "message": hold_id}]
+
+            def record_hold_notification_delivery(self, hold_id, event_id, delivery):
+                self.recorded.append((hold_id, event_id, delivery))
+
+        class Notifier:
+            def __init__(self):
+                self.calls = 0
+
+            def notify(self, **_kwargs):
+                self.calls += 1
+                if self.calls == 1:
+                    raise RuntimeError("bridge unavailable")
+                return {"delivery_status": "delivered", "message_id": "feishu-2"}
+
+        provisioner = Provisioner()
+        notifier = Notifier()
+        control = JarvisControl(self.capability_port, self.bridge, provisioner, notifier)
+        receipt = control.deliver_pending_hold_notifications(
+            request_id="drain-failure", source_ref="local-heartbeat:test",
+        )
+
+        self.assertEqual(receipt["status"], "requires_readback")
+        self.assertEqual(provisioner.event_type, "terminal")
+        self.assertEqual([record[0] for record in provisioner.recorded], ["hold-1", "hold-2"])
+        self.assertEqual(provisioner.recorded[0][2]["delivery_status"], "failed")
+        self.assertEqual(provisioner.recorded[1][2]["message_id"], "feishu-2")
 
 
 if __name__ == "__main__":
