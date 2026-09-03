@@ -5,6 +5,7 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
 
 from adapters.codex_app_server.task_provisioning_adapter import CodexAppServerTaskProvisioningAdapter
@@ -40,14 +41,29 @@ class JarvisLoopContractTest(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp.cleanup()
 
-    def test_loop_delegates_continuation_to_holder_without_a_tick_heartbeat(self):
+    def test_loop_registers_a_bounded_reconcile_heartbeat_and_cancels_it_on_terminal(self):
         started = self.controller.start(
             self.runtime, request_id="contract-1", project="Jarvis4codex", title="Worker", prompt="test task",
             business_skill="bd-search-stage6-research", target_thread_count=1, max_rounds=2, max_turns=3,
             expires_at="2099-01-01T00:00:00+00:00",
         )
         self.assertEqual(started.status, "running")
-        self.assertEqual(self.runtime.heartbeat_calls, [])
+        heartbeat = self.runtime.heartbeat_calls[0]
+        self.assertEqual(heartbeat["action"], "create")
+        self.assertEqual(heartbeat["request_id"], "loop-contract-1:reconcile-heartbeat")
+        self.assertEqual(heartbeat["source_ref"], "jarvis_loop:loop-contract-1:reconcile-heartbeat")
+        heartbeat_options = dict(heartbeat["options"])
+        self.assertGreater(heartbeat_options.pop("max_runs"), 1)
+        self.assertEqual(heartbeat_options, {
+            "heartbeat_id": "loop-contract-1:reconcile",
+            "name": "Jarvis loop reconciliation loop-contract-1",
+            "function": "JarvisControl.loop_tick",
+            "arguments": {"loop_id": "loop-contract-1"},
+            "interval_seconds": 1800,
+            "expires_at": "2099-01-01T00:00:00+00:00",
+            "source_event_key": "jarvis_loop:loop-contract-1:reconcile",
+            "confirmation_evidence": "jarvis_loop.start:contract-1",
+        })
         self.assertTrue(self.runtime.hold_calls[0]["auto_continue"])
         self.assertEqual(self.runtime.hold_calls[0]["max_turns"], 2)
         hold_id = started.data["children"][0]["hold_id"]
@@ -57,6 +73,33 @@ class JarvisLoopContractTest(unittest.TestCase):
         completed = self.controller.status(self.runtime, loop_id=started.loop_id)
         self.assertEqual(completed.status, "completed")
         self.assertEqual(len(self.runtime.hold_calls), 1)
+        self.assertEqual(self.runtime.heartbeat_calls[1], {
+            "action": "cancel",
+            "request_id": "loop-contract-1:stop",
+            "source_ref": "jarvis_loop:loop-contract-1",
+            "heartbeat_id": "loop-contract-1:reconcile",
+        })
+
+    def test_legacy_v1_state_without_reconcile_fields_reaches_terminal_without_migration(self):
+        started = self.controller.start(
+            self.runtime, request_id="legacy-reconcile", project="Jarvis4codex", title="Worker", prompt="test task",
+            target_thread_count=1, max_rounds=1, expires_at="2099-01-01T00:00:00+00:00",
+        )
+        loop_id = str(started.loop_id)
+        state = self.controller._store.load(loop_id)
+        state.pop("heartbeat_id")
+        state.pop("heartbeat")
+        self.controller._store.save(loop_id, state)
+        hold_id = str(state["children"][0]["hold_id"])
+        self.runtime.states[hold_id] = {
+            "status": "turn_limit_reached", "thread_id": "thread-1", "turn_id": "turn-1", "total_turn_count": 1,
+        }
+
+        completed = self.controller.tick(self.runtime, loop_id=loop_id)
+
+        self.assertEqual(completed.status, "completed")
+        self.assertEqual([call["action"] for call in self.runtime.heartbeat_calls], ["create"])
+        self.assertEqual(self.controller._store.load(loop_id)["heartbeat"], {"status": "not_required"})
 
     def test_loop_does_not_resume_after_one_terminal_turn_when_auto_continue_is_false(self):
         started = self.controller.start(
@@ -71,6 +114,7 @@ class JarvisLoopContractTest(unittest.TestCase):
 
         self.assertEqual(completed.status, "completed")
         self.assertEqual(len(self.runtime.hold_calls), 1)
+        self.assertEqual([call["action"] for call in self.runtime.heartbeat_calls], ["create", "cancel"])
 
     def test_loop_renders_the_worker_skill_prompt_for_create_and_resume(self):
         prompt = (
@@ -123,7 +167,7 @@ class JarvisLoopContractTest(unittest.TestCase):
         self.assertEqual(completed.status, "completed")
         self.assertEqual(len(self.runtime.hold_calls), 1)
 
-    def test_status_closes_a_holder_owned_terminal_loop_without_heartbeat(self):
+    def test_status_closes_a_holder_owned_terminal_loop_and_cancels_its_heartbeat(self):
         started = self.controller.start(
             self.runtime, request_id="terminal-reconcile", project="Jarvis4codex", title="Worker", prompt="count",
             target_thread_count=1, max_rounds=2, expires_at="2099-01-01T00:00:00+00:00",
@@ -137,9 +181,24 @@ class JarvisLoopContractTest(unittest.TestCase):
 
         self.assertEqual(final.status, "completed")
         self.assertEqual(final.data["children"][0]["round"], 2)
-        self.assertEqual(self.runtime.heartbeat_calls, [])
+        self.assertEqual([call["action"] for call in self.runtime.heartbeat_calls], ["create", "cancel"])
 
-    def test_status_blocks_a_terminal_hold_failure_without_heartbeat(self):
+    def test_reconcile_heartbeat_tick_closes_a_terminal_holder_owned_loop(self):
+        started = self.controller.start(
+            self.runtime, request_id="heartbeat-terminal", project="Jarvis4codex", title="Worker", prompt="count",
+            target_thread_count=1, max_rounds=1, expires_at="2099-01-01T00:00:00+00:00",
+        )
+        hold_id = started.data["children"][0]["hold_id"]
+        self.runtime.states[hold_id] = {
+            "status": "turn_limit_reached", "thread_id": "thread-1", "turn_id": "turn-1", "total_turn_count": 1,
+        }
+
+        final = self.controller.tick(self.runtime, loop_id=str(started.loop_id))
+
+        self.assertEqual(final.status, "completed")
+        self.assertEqual([call["action"] for call in self.runtime.heartbeat_calls], ["create", "cancel"])
+
+    def test_status_blocks_a_terminal_hold_failure_and_cancels_its_heartbeat(self):
         started = self.controller.start(
             self.runtime, request_id="blocked-terminal", project="Jarvis4codex", title="Worker", prompt="count",
             target_thread_count=1, max_rounds=2, expires_at="2099-01-01T00:00:00+00:00",
@@ -150,7 +209,7 @@ class JarvisLoopContractTest(unittest.TestCase):
         blocked = self.controller.status(self.runtime, loop_id=started.loop_id)
 
         self.assertEqual(blocked.status, "blocked")
-        self.assertEqual(self.runtime.heartbeat_calls, [])
+        self.assertEqual([call["action"] for call in self.runtime.heartbeat_calls], ["create", "cancel"])
 
     def test_loop_exposes_one_stable_lane_candidate_per_worker_turn(self):
         lane = {"candidate_ids": [7, 9], "database_path": "C:/collection.sqlite", "output_boundary": "C:/outputs/worker-1"}
@@ -316,6 +375,54 @@ class JarvisLoopContractTest(unittest.TestCase):
         self.assertFalse((Path(self.temp.name) / "loops" / "loop-dead-host").exists())
         self.assertEqual(self.runtime.hold_calls, [])
         self.assertEqual(self.runtime.heartbeat_calls, [])
+
+    def test_loop_start_self_heals_the_host_before_creating_workers(self):
+        class SchedulerCapabilities:
+            heartbeat_available = True
+
+            def invoke(self, request):
+                return SimpleNamespace(
+                    status="active", request_id=request.request_id, target_thread_id=None,
+                    turn_id=None, reason=None, data={"heartbeat_id": request.arguments["heartbeat_id"]},
+                )
+
+        class Config:
+            profile = "jarvis_test"
+            expected_codex_home = "C:/test/codex-home"
+
+            def resolve_project(self, project):
+                return project, "C:/test/project"
+
+        state_dir = Path(self.temp.name)
+        initialized = []
+
+        def initialize_host(**kwargs):
+            initialized.append(kwargs["workers"])
+            (state_dir / "hold-host.json").write_text(json.dumps({
+                "status": "ready", "pid": 1781, "worker_capacity": kwargs["workers"],
+                "observed_at": datetime.now(timezone.utc).isoformat(),
+                "host_started_at": datetime.now(timezone.utc).isoformat(),
+                "profile": "jarvis_test", "codex_home": "C:/test/codex-home",
+                "state_dir": str(state_dir.resolve()),
+            }), encoding="utf-8")
+            return {"status": "ready", "phase": "started"}
+
+        provisioner = CodexAppServerTaskProvisioningAdapter(
+            state_dir / "launcher.json", state_dir=state_dir, config_loader=lambda _: Config(),
+            host_initializer=initialize_host, pid_alive=lambda _: True,
+            pid_started_at=lambda _: datetime.now(timezone.utc),
+        )
+        control = JarvisControl(SchedulerCapabilities(), object(), provisioner, loop_controller=self.controller)
+
+        receipt = control.loop(
+            action="start", request_id="self-heal", project="Jarvis4codex", title="Worker",
+            prompt="hello", business_skill="bd-search-stage6-research", target_thread_count=2,
+            max_rounds=1, expires_at="2099-01-01T00:00:00+00:00",
+        )
+
+        self.assertEqual(receipt["status"], "running")
+        self.assertEqual(initialized, [2])
+        self.assertEqual(len(list((state_dir / "task-holds").glob("*/request.json"))), 2)
 
     def test_loop_preflight_returns_start_contract_without_starting_any_hold(self):
         class Provisioner:

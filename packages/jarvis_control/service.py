@@ -56,8 +56,12 @@ class JarvisControl:
                 readback={"verified": True, "terminal": False},
             )
         if action == "start":
-            health_reader = getattr(self._provisioner, "hold_host_health", None)
-            health = health_reader() if callable(health_reader) else {"status": "host_not_ready", "reason": "no HoldHost health adapter is configured"}
+            requested_workers = options.get("target_thread_count")
+            required_workers = requested_workers if isinstance(requested_workers, int) and requested_workers > 0 else 1
+            if self._provisioner is None:
+                health = {"status": "host_not_ready", "reason": "no HoldHost health adapter is configured"}
+            else:
+                health = self._provisioner.ensure_hold_host_ready(required_workers=required_workers)
             if health.get("status") != "ready":
                 return self._receipt(
                     "jarvis_loop", "host_not_ready", request_id=options.get("request_id"),
@@ -66,11 +70,7 @@ class JarvisControl:
                 )
             result = self._loop_controller.start(self, **options)
         elif action == "tick":
-            return self._receipt(
-                "jarvis_loop", "invalid_request", request_id=options.get("request_id"),
-                reason="loop tick is disabled; Holder and Monitor own continuation",
-                readback={"verified": False, "terminal": False},
-            )
+            result = self._loop_controller.tick(self, loop_id=str(loop_id or ""))
         elif action == "reconcile":
             result = self._loop_controller.reconcile(self)
         elif action == "status":
@@ -355,7 +355,16 @@ class JarvisControl:
                 data = status_reader(target_hold_id)
             except Exception as exc:
                 return self._receipt("jarvis_monitor", "failed", request_id=request_id, reason=str(exc))
-            return self._receipt("jarvis_monitor", "completed", request_id=request_id, data=data)
+            lifecycle = str(data.get("lifecycle_status") or data.get("status") or "").lower()
+            verified = (
+                lifecycle in {"completed", "failed", "interrupted", "cancelled", "canceled", "turn_limit_reached"}
+                and bool(str(data.get("thread_id") or "").strip())
+                and bool(str(data.get("turn_id") or "").strip())
+            )
+            return self._receipt(
+                "jarvis_monitor", "completed", request_id=request_id, data=data,
+                readback={"verified": verified, "terminal": verified},
+            )
         if action == "deliver_hold_notifications":
             if not hold_id:
                 return self._receipt(
@@ -441,7 +450,7 @@ class JarvisControl:
     def deliver_pending_hold_notifications(
         self, *, request_id: str, source_ref: str,
     ) -> dict[str, Any]:
-        """Drain durable Hold notification events through the configured bridge."""
+        """Drain durable terminal Hold notification events through the configured bridge."""
         if self._notifier is None:
             return self.unsupported(
                 tool="jarvis_monitor", reason="no verified notification adapter is configured"

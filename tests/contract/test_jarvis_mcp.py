@@ -345,6 +345,29 @@ class JarvisMcpContractTest(unittest.TestCase):
         self.assertEqual(result.structured_content["data"]["turn_count"], 1)
         self.assertEqual(result.structured_content["data"]["max_turns"], 2)
 
+    def test_monitor_status_verifies_an_exact_terminal_hold_readback(self):
+        class Provisioner:
+            def hold_status(self, hold_id):
+                return {
+                    "hold_id": hold_id, "status": "turn_limit_reached",
+                    "thread_id": "thread-1", "turn_id": "turn-1", "final_message": "done",
+                }
+
+        server = JarvisMcpServer(JarvisControl(self.capability_port, self.bridge, Provisioner()))
+
+        async def run():
+            async with Client(server.mcp) as client:
+                return await client.call_tool("jarvis_monitor", {
+                    "action": "status", "request_id": "terminal-status-1",
+                    "hold_id": "hold-terminal-1",
+                })
+
+        result = asyncio.run(run())
+        self.assertFalse(result.is_error)
+        self.assertEqual(result.structured_content["status"], "completed")
+        self.assertTrue(result.structured_content["readback"]["verified"])
+        self.assertTrue(result.structured_content["readback"]["terminal"])
+
     def test_monitor_delivers_pending_hold_notifications_with_saved_readback(self):
         class Provisioner:
             def __init__(self):

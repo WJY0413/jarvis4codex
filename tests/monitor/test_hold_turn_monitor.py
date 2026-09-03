@@ -61,6 +61,32 @@ class HoldTurnMonitorTest(unittest.TestCase):
         self.assertEqual(decision.reason, "completed_under_budget")
         self.assertEqual(decision.notification_events, ())
 
+    def test_worker_reported_blocked_stops_without_consuming_more_turns(self):
+        client = FakeHeldTurnClient(content="JARVIS_RUN_STATUS: blocked\nMissing explicit workpack")
+        decision = HoldTurnMonitor().observe(client, self.request(
+            notification_policy=NotificationPolicy(terminal=True),
+        ))
+
+        self.assertEqual(decision.action, "STOP")
+        self.assertEqual(decision.result_status, "blocked")
+        self.assertEqual(decision.reason, "worker_reported_blocked")
+        self.assertIsNone(decision.continue_prompt)
+        self.assertEqual(decision.notification_events[-1].event_type, "terminal")
+
+    def test_legacy_blocked_message_also_stops(self):
+        client = FakeHeldTurnClient(content="BLOCKED：未收到有效 workpack")
+        decision = HoldTurnMonitor().observe(client, self.request())
+
+        self.assertEqual(decision.action, "STOP")
+        self.assertEqual(decision.reason, "worker_reported_blocked")
+
+    def test_non_status_use_of_blocked_does_not_stop_the_turn(self):
+        client = FakeHeldTurnClient(content="The previous message was not blocked.")
+        decision = HoldTurnMonitor().observe(client, self.request())
+
+        self.assertEqual(decision.action, "CONTINUE")
+        self.assertEqual(decision.reason, "completed_under_budget")
+
     def test_non_completed_terminal_does_not_read_content_or_continue(self):
         client = FakeHeldTurnClient(status="failed")
         decision = HoldTurnMonitor().observe(client, self.request(

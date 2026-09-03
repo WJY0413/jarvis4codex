@@ -77,6 +77,8 @@ class HoldTurnMonitor:
         command_id = f"monitor:{request.hold_id}:{request.turn_id}:{request.turn_count}"
         if terminal_status != "completed":
             return self._stop(request, command_id, terminal_status, final_message, "non_completed_terminal")
+        if _worker_reported_blocked(final_message):
+            return self._stop(request, command_id, "blocked", final_message, "worker_reported_blocked")
         if request.turn_count >= request.max_turns:
             return self._stop(request, command_id, "turn_limit_reached", final_message, "turn_budget_consumed")
         if not request.continuation_enabled:
@@ -141,3 +143,8 @@ class HoldTurnMonitor:
             status=status,
             message=f"JARVIS_HOLD_MILESTONE_V1 {request.hold_id} turn={request.turn_count}",
         ),)
+
+
+def _worker_reported_blocked(final_message: str) -> bool:
+    prefixes = ("jarvis_run_status: blocked", "blocked:", "blocked：")
+    return any(line.strip().casefold().startswith(prefixes) for line in final_message.splitlines())

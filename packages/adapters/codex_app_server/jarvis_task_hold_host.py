@@ -145,7 +145,14 @@ def hold_task(
         client = AppServerClient(NativeTaskLauncherConfig(launcher_config_path))
         report("launcher_config_loaded")
         input_binding = _turn_input_binding(request, initial_total_turn_count)
-        if str(request.get("mode") or "create") == "resume":
+        mode = str(request.get("mode") or "create")
+        if mode == "recover":
+            thread_id = str(request.get("thread_id") or "").strip()
+            turn_id = str(request.get("turn_id") or "").strip()
+            if not thread_id or not turn_id:
+                raise RuntimeError("hold recovery requires thread_id and turn_id")
+            report("recovery_attached", {"thread_id": thread_id, "turn_id": turn_id})
+        elif mode == "resume":
             thread_id = str(request.get("thread_id") or "").strip()
             if not thread_id:
                 raise RuntimeError("hold resume requires thread_id")
@@ -161,7 +168,9 @@ def hold_task(
         else:
             created = client.create_task({**request, "input_binding": input_binding}, on_phase=report)
             thread_id = str(created.get("thread_id") or "").strip()
-        turn_id = str(created.get("turn_id") or "").strip()
+            turn_id = str(created.get("turn_id") or "").strip()
+        if mode == "resume":
+            turn_id = str(created.get("turn_id") or "").strip()
         if not thread_id or not turn_id:
             raise RuntimeError("App Server task creation did not return thread_id and turn_id")
         _write_json(ack_path, {

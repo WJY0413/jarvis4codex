@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
+import math
 import os
 from pathlib import Path
 from typing import Any, Mapping, Protocol
@@ -143,6 +144,22 @@ class LoopController:
             state["children"].append(child)
 
         if state["status"] != "blocked":
+            heartbeat_id = f"{loop_id}:reconcile"
+            heartbeat = runtime.heartbeat(
+                action="create", request_id=f"{loop_id}:reconcile-heartbeat",
+                source_ref=f"jarvis_loop:{loop_id}:reconcile-heartbeat",
+                options=_reconcile_heartbeat_options(
+                    loop_id=loop_id, request_id=request["request_id"], heartbeat_id=heartbeat_id,
+                    interval_seconds=request["interval_seconds"], expires_at=request["expires_at"],
+                ),
+            )
+            state["heartbeat_id"] = heartbeat_id
+            state["heartbeat"] = heartbeat
+            if str(heartbeat.get("status") or "").lower() not in {"active", "accepted", "completed"}:
+                state["status"] = "blocked"
+                state["reason"] = str(heartbeat.get("reason") or "loop reconciliation heartbeat was not accepted")
+
+        if state["status"] != "blocked":
             self._observe(runtime, state)
             self._refresh(state)
         self._store.create(loop_id, state)
@@ -150,8 +167,7 @@ class LoopController:
         return self._result(state)
 
     def tick(self, runtime: LoopRuntime, *, loop_id: str) -> LoopResult:
-        del runtime
-        return LoopResult("invalid_request", loop_id, {}, "loop tick is disabled; Holder and Monitor own continuation")
+        return self.status(runtime, loop_id=loop_id)
 
     def status(self, runtime: LoopRuntime, *, loop_id: str) -> LoopResult:
         try:
@@ -167,7 +183,7 @@ class LoopController:
                 if state["auto_continue"]:
                     self._reconcile_holder_terminals(runtime, state)
                 else:
-                    self._finalize_observed_terminals(state)
+                    self._finalize_observed_terminals(runtime, state)
             self._store.save(loop_id, state)
         return self._result(state)
 
@@ -296,15 +312,17 @@ class LoopController:
             state["heartbeat"] = self._cancel(runtime, state)
         return True
 
-    def _finalize_observed_terminals(self, state: dict[str, Any]) -> None:
+    def _finalize_observed_terminals(self, runtime: LoopRuntime, state: dict[str, Any]) -> None:
         for child in state["children"]:
             if child.get("phase") != "terminal":
                 continue
             child["phase"] = "completed" if child.get("lifecycle") in {"completed", "turn_limit_reached"} else "blocked"
         if any(child.get("phase") == "blocked" for child in state["children"]):
             state["status"] = "blocked"
+            state["heartbeat"] = self._cancel(runtime, state)
         elif all(child.get("phase") == "completed" for child in state["children"]):
             state["status"] = "completed"
+            state["heartbeat"] = self._cancel(runtime, state)
         else:
             self._refresh(state)
 
@@ -490,3 +508,20 @@ def _parse_time(value: object) -> datetime:
 
 def _expired(value: object) -> bool:
     return _parse_time(value) <= datetime.now(timezone.utc)
+
+
+def _reconcile_heartbeat_options(
+    *, loop_id: str, request_id: str, heartbeat_id: str, interval_seconds: int, expires_at: str
+) -> dict[str, Any]:
+    remaining_seconds = max((_parse_time(expires_at) - datetime.now(timezone.utc)).total_seconds(), 0)
+    return {
+        "heartbeat_id": heartbeat_id,
+        "name": f"Jarvis loop reconciliation {loop_id}",
+        "function": "JarvisControl.loop_tick",
+        "arguments": {"loop_id": loop_id},
+        "interval_seconds": interval_seconds,
+        "max_runs": max(1, math.ceil(remaining_seconds / interval_seconds) + 1),
+        "expires_at": expires_at,
+        "source_event_key": f"jarvis_loop:{loop_id}:reconcile",
+        "confirmation_evidence": f"jarvis_loop.start:{request_id}",
+    }
