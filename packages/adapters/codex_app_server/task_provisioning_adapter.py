@@ -34,10 +34,16 @@ class CodexAppServerTaskProvisioningAdapter:
         *,
         state_dir: str | Path,
         config_loader: Callable[[Path], Any] | None = None,
+        host_initializer: Callable[..., dict[str, str]] | None = None,
+        pid_alive: Callable[[int], bool] | None = None,
+        pid_started_at: Callable[[int], datetime | str | None] | None = None,
     ) -> None:
         self._config_path = Path(config_path)
         self._state_dir = Path(state_dir)
         self._config_loader = config_loader or _runtime_symbols()["NativeTaskLauncherConfig"]
+        self._host_initializer = host_initializer or _initialize_user_host
+        self._pid_alive = pid_alive or _pid_is_alive
+        self._pid_started_at = pid_started_at or _pid_started_at
 
     def provision(self, request: TaskProvisionRequest) -> TaskProvisionReceipt:
         try:
@@ -96,7 +102,7 @@ class CodexAppServerTaskProvisioningAdapter:
         config = self._config_loader(self._config_path)
         return sorted(config.allowed_projects)
 
-    def hold_host_health(self) -> dict[str, str]:
+    def hold_host_health(self, *, required_workers: int = 1) -> dict[str, str]:
         """Check whether the fixed HoldHost can accept a Loop before it is created."""
         try:
             config = self._config_loader(self._config_path)
@@ -112,6 +118,18 @@ class CodexAppServerTaskProvisioningAdapter:
             return {"status": "host_not_ready", "reason": "HoldHost observed_at is invalid"}
         if observed_now() - observed_at > self._HOST_HEALTH_MAX_AGE:
             return {"status": "host_not_ready", "reason": "HoldHost observed_at is stale"}
+        pid = _positive_int(health.get("pid"))
+        if pid is None or not self._pid_alive(pid):
+            return {"status": "host_not_ready", "reason": "HoldHost PID is not live"}
+        host_started_at = _parse_observed_at(health.get("host_started_at"))
+        if host_started_at is None:
+            return {"status": "host_not_ready", "reason": "HoldHost PID health identity is missing"}
+        process_started_at = _parse_observed_at(self._pid_started_at(pid))
+        if process_started_at is None or process_started_at - host_started_at > timedelta(seconds=5):
+            return {"status": "host_not_ready", "reason": "HoldHost PID does not match health identity"}
+        capacity = _positive_int(health.get("worker_capacity")) or 1
+        if capacity < max(required_workers, 1):
+            return {"status": "host_not_ready", "reason": "HoldHost worker capacity is insufficient"}
         profile = str(getattr(config, "profile", "") or "").strip()
         if not profile or str(health.get("profile") or "").strip() != profile:
             return {"status": "host_not_ready", "reason": "HoldHost profile does not match"}
@@ -121,6 +139,29 @@ class CodexAppServerTaskProvisioningAdapter:
         if not _same_path(health.get("state_dir"), self._state_dir):
             return {"status": "host_not_ready", "reason": "HoldHost state_dir does not match"}
         return {"status": "ready"}
+
+    def ensure_hold_host_ready(self, *, required_workers: int) -> dict[str, str]:
+        """Reuse a live matching Host or start one before a Loop provisions work."""
+        required_workers = max(int(required_workers), 1)
+        health = self.hold_host_health(required_workers=required_workers)
+        if health.get("status") == "ready":
+            return {"status": "ready", "phase": "already_running"}
+        if health.get("reason") == "HoldHost worker capacity is insufficient":
+            return health
+        try:
+            started = self._host_initializer(
+                state_dir=self._state_dir,
+                launcher_config=self._config_path,
+                workers=required_workers,
+                poll_seconds=2.0,
+                wait_seconds=15.0,
+            )
+        except Exception as exc:
+            return {"status": "host_not_ready", "reason": f"HoldHost self-healing failed: {exc}"}
+        health = self.hold_host_health(required_workers=required_workers)
+        if health.get("status") != "ready":
+            return health
+        return {"status": "ready", "phase": str(started.get("phase") or "started")}
 
     def resume_with_monitor(self, request: TaskMonitorResumeRequest) -> TaskProvisionReceipt:
         try:
@@ -484,6 +525,24 @@ def _parse_observed_at(value: object) -> datetime | None:
     except ValueError:
         return None
     return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed.astimezone(timezone.utc)
+
+
+def _pid_is_alive(pid: int) -> bool:
+    from .jarvis_hold_host_service import _pid_is_alive as hold_host_pid_is_alive
+
+    return hold_host_pid_is_alive(pid)
+
+
+def _pid_started_at(pid: int) -> datetime | None:
+    from .jarvis_hold_host_service import _pid_started_at as hold_host_pid_started_at
+
+    return hold_host_pid_started_at(pid)
+
+
+def _initialize_user_host(**kwargs: Any) -> dict[str, str]:
+    from .jarvis_hold_host_service import initialize_user_host
+
+    return initialize_user_host(**kwargs)
 
 
 def _safe_id(value: str) -> str:

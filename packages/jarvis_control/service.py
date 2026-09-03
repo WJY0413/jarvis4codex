@@ -56,8 +56,12 @@ class JarvisControl:
                 readback={"verified": True, "terminal": False},
             )
         if action == "start":
-            health_reader = getattr(self._provisioner, "hold_host_health", None)
-            health = health_reader() if callable(health_reader) else {"status": "host_not_ready", "reason": "no HoldHost health adapter is configured"}
+            requested_workers = options.get("target_thread_count")
+            required_workers = requested_workers if isinstance(requested_workers, int) and requested_workers > 0 else 1
+            if self._provisioner is None:
+                health = {"status": "host_not_ready", "reason": "no HoldHost health adapter is configured"}
+            else:
+                health = self._provisioner.ensure_hold_host_ready(required_workers=required_workers)
             if health.get("status") != "ready":
                 return self._receipt(
                     "jarvis_loop", "host_not_ready", request_id=options.get("request_id"),

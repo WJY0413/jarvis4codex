@@ -133,6 +133,8 @@ class TaskProvisioningPort(Protocol):
 
     def provision(self, request: TaskProvisionRequest) -> TaskProvisionReceipt: ...
 
+    def ensure_hold_host_ready(self, *, required_workers: int) -> dict[str, str]: ...
+
 
 def observed_now() -> datetime:
     return datetime.now(timezone.utc)

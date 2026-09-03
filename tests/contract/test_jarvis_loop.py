@@ -317,6 +317,45 @@ class JarvisLoopContractTest(unittest.TestCase):
         self.assertEqual(self.runtime.hold_calls, [])
         self.assertEqual(self.runtime.heartbeat_calls, [])
 
+    def test_loop_start_self_heals_the_host_before_creating_workers(self):
+        class Config:
+            profile = "jarvis_test"
+            expected_codex_home = "C:/test/codex-home"
+
+            def resolve_project(self, project):
+                return project, "C:/test/project"
+
+        state_dir = Path(self.temp.name)
+        initialized = []
+
+        def initialize_host(**kwargs):
+            initialized.append(kwargs["workers"])
+            (state_dir / "hold-host.json").write_text(json.dumps({
+                "status": "ready", "pid": 1781, "worker_capacity": kwargs["workers"],
+                "observed_at": datetime.now(timezone.utc).isoformat(),
+                "host_started_at": datetime.now(timezone.utc).isoformat(),
+                "profile": "jarvis_test", "codex_home": "C:/test/codex-home",
+                "state_dir": str(state_dir.resolve()),
+            }), encoding="utf-8")
+            return {"status": "ready", "phase": "started"}
+
+        provisioner = CodexAppServerTaskProvisioningAdapter(
+            state_dir / "launcher.json", state_dir=state_dir, config_loader=lambda _: Config(),
+            host_initializer=initialize_host, pid_alive=lambda _: True,
+            pid_started_at=lambda _: datetime.now(timezone.utc),
+        )
+        control = JarvisControl(object(), object(), provisioner, loop_controller=self.controller)
+
+        receipt = control.loop(
+            action="start", request_id="self-heal", project="Jarvis4codex", title="Worker",
+            prompt="hello", business_skill="bd-search-stage6-research", target_thread_count=2,
+            max_rounds=1, expires_at="2099-01-01T00:00:00+00:00",
+        )
+
+        self.assertEqual(receipt["status"], "running")
+        self.assertEqual(initialized, [2])
+        self.assertEqual(len(list((state_dir / "task-holds").glob("*/request.json"))), 2)
+
     def test_loop_preflight_returns_start_contract_without_starting_any_hold(self):
         class Provisioner:
             def preflight_projects(self):

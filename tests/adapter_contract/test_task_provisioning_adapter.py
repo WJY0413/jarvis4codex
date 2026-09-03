@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import Mock
 
 from adapters.codex_app_server.task_provisioning_adapter import (
     CodexAppServerTaskProvisioningAdapter,
@@ -24,7 +25,7 @@ class FakeConfig:
 
 
 class TaskProvisioningAdapterContractTest(unittest.TestCase):
-    def test_hold_host_health_accepts_a_fresh_holding_identity_with_a_dead_pid(self):
+    def test_hold_host_health_blocks_a_fresh_identity_with_a_dead_pid(self):
         config = FakeConfig()
         with tempfile.TemporaryDirectory() as temp:
             state_dir = Path(temp)
@@ -39,12 +40,71 @@ class TaskProvisioningAdapterContractTest(unittest.TestCase):
                 "state_dir": str(state_dir.resolve()),
             }), encoding="utf-8")
             adapter = CodexAppServerTaskProvisioningAdapter(
-                config_path, state_dir=state_dir, config_loader=lambda _: config
+                config_path, state_dir=state_dir, config_loader=lambda _: config,
+                pid_alive=lambda _: False,
             )
 
             health = adapter.hold_host_health()
 
-        self.assertEqual(health, {"status": "ready"})
+        self.assertEqual(health, {
+            "status": "host_not_ready", "reason": "HoldHost PID is not live",
+        })
+
+    def test_ensure_hold_host_ready_starts_a_missing_host_then_rechecks_health(self):
+        config = FakeConfig()
+        with tempfile.TemporaryDirectory() as temp:
+            state_dir = Path(temp)
+            config_path = state_dir / "launcher.json"
+
+            def initialize_host(**kwargs):
+                self.assertEqual(kwargs["state_dir"], state_dir)
+                self.assertEqual(kwargs["launcher_config"], config_path)
+                self.assertEqual(kwargs["workers"], 3)
+                (state_dir / "hold-host.json").write_text(json.dumps({
+                    "status": "ready", "pid": 1781, "worker_capacity": 3,
+                    "observed_at": datetime.now(timezone.utc).isoformat(),
+                    "host_started_at": datetime.now(timezone.utc).isoformat(),
+                    "profile": config.profile, "codex_home": config.expected_codex_home,
+                    "state_dir": str(state_dir.resolve()),
+                }), encoding="utf-8")
+                return {"status": "ready", "phase": "started"}
+
+            initializer = Mock(side_effect=initialize_host)
+            adapter = CodexAppServerTaskProvisioningAdapter(
+                config_path, state_dir=state_dir, config_loader=lambda _: config,
+                host_initializer=initializer, pid_alive=lambda _: True,
+                pid_started_at=lambda _: datetime.now(timezone.utc),
+            )
+
+            health = adapter.ensure_hold_host_ready(required_workers=3)
+
+        self.assertEqual(health, {"status": "ready", "phase": "started"})
+        initializer.assert_called_once()
+
+    def test_ensure_hold_host_ready_does_not_start_a_second_live_host_for_more_capacity(self):
+        config = FakeConfig()
+        with tempfile.TemporaryDirectory() as temp:
+            state_dir = Path(temp)
+            (state_dir / "hold-host.json").write_text(json.dumps({
+                "status": "ready", "pid": 1781, "worker_capacity": 1,
+                "observed_at": datetime.now(timezone.utc).isoformat(),
+                "host_started_at": datetime.now(timezone.utc).isoformat(),
+                "profile": config.profile, "codex_home": config.expected_codex_home,
+                "state_dir": str(state_dir.resolve()),
+            }), encoding="utf-8")
+            initializer = Mock()
+            adapter = CodexAppServerTaskProvisioningAdapter(
+                state_dir / "launcher.json", state_dir=state_dir, config_loader=lambda _: config,
+                host_initializer=initializer, pid_alive=lambda _: True,
+                pid_started_at=lambda _: datetime.now(timezone.utc),
+            )
+
+            health = adapter.ensure_hold_host_ready(required_workers=3)
+
+        self.assertEqual(health, {
+            "status": "host_not_ready", "reason": "HoldHost worker capacity is insufficient",
+        })
+        initializer.assert_not_called()
 
     def test_hold_host_health_blocks_a_stale_identity(self):
         config = FakeConfig()
@@ -59,7 +119,8 @@ class TaskProvisioningAdapterContractTest(unittest.TestCase):
                 "state_dir": str(state_dir.resolve()),
             }), encoding="utf-8")
             adapter = CodexAppServerTaskProvisioningAdapter(
-                state_dir / "launcher.json", state_dir=state_dir, config_loader=lambda _: config
+                state_dir / "launcher.json", state_dir=state_dir, config_loader=lambda _: config,
+                pid_alive=lambda _: True,
             )
 
             health = adapter.hold_host_health()
@@ -75,18 +136,63 @@ class TaskProvisioningAdapterContractTest(unittest.TestCase):
                 "status": "ready",
                 "pid": 1780,
                 "observed_at": datetime.now(timezone.utc).isoformat(),
+                "host_started_at": datetime.now(timezone.utc).isoformat(),
                 "profile": "other",
                 "codex_home": config.expected_codex_home,
                 "state_dir": str(state_dir.resolve()),
             }), encoding="utf-8")
             adapter = CodexAppServerTaskProvisioningAdapter(
-                state_dir / "launcher.json", state_dir=state_dir, config_loader=lambda _: config
+                state_dir / "launcher.json", state_dir=state_dir, config_loader=lambda _: config,
+                pid_alive=lambda _: True, pid_started_at=lambda _: datetime.now(timezone.utc),
             )
 
             health = adapter.hold_host_health()
 
         self.assertEqual(health["status"], "host_not_ready")
         self.assertEqual(health["reason"], "HoldHost profile does not match")
+
+    def test_hold_host_health_blocks_a_reused_pid_with_a_different_start_time(self):
+        config = FakeConfig()
+        with tempfile.TemporaryDirectory() as temp:
+            state_dir = Path(temp)
+            now = datetime.now(timezone.utc)
+            (state_dir / "hold-host.json").write_text(json.dumps({
+                "status": "ready", "pid": 1780, "worker_capacity": 1,
+                "observed_at": now.isoformat(), "host_started_at": (now - timedelta(minutes=1)).isoformat(),
+                "profile": config.profile, "codex_home": config.expected_codex_home,
+                "state_dir": str(state_dir.resolve()),
+            }), encoding="utf-8")
+            adapter = CodexAppServerTaskProvisioningAdapter(
+                state_dir / "launcher.json", state_dir=state_dir, config_loader=lambda _: config,
+                pid_alive=lambda _: True, pid_started_at=lambda _: now,
+            )
+
+            health = adapter.hold_host_health()
+
+        self.assertEqual(health, {
+            "status": "host_not_ready", "reason": "HoldHost PID does not match health identity",
+        })
+
+    def test_hold_host_health_requires_the_persisted_pid_start_identity(self):
+        config = FakeConfig()
+        with tempfile.TemporaryDirectory() as temp:
+            state_dir = Path(temp)
+            (state_dir / "hold-host.json").write_text(json.dumps({
+                "status": "ready", "pid": 1780, "worker_capacity": 1,
+                "observed_at": datetime.now(timezone.utc).isoformat(),
+                "profile": config.profile, "codex_home": config.expected_codex_home,
+                "state_dir": str(state_dir.resolve()),
+            }), encoding="utf-8")
+            adapter = CodexAppServerTaskProvisioningAdapter(
+                state_dir / "launcher.json", state_dir=state_dir, config_loader=lambda _: config,
+                pid_alive=lambda _: True,
+            )
+
+            health = adapter.hold_host_health()
+
+        self.assertEqual(health, {
+            "status": "host_not_ready", "reason": "HoldHost PID health identity is missing",
+        })
 
     def test_create_queues_for_the_user_host_without_starting_an_app_server(self):
         config = FakeConfig()

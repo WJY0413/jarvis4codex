@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -258,6 +259,25 @@ class TaskMonitorHostTest(unittest.TestCase):
         self.assertEqual(client.resumed[2]["client_user_message_id"], "resume-1")
         self.assertEqual(client.resumed[2]["input_binding"], {"candidate_ids": [7]})
 
+    def test_recovery_attaches_the_persisted_turn_without_creating_or_resuming(self):
+        client = FakeClient(None)
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            request, ack, result = root / "request.json", root / "ack.json", root / "result.json"
+            request.write_text(json.dumps({
+                "mode": "recover", "request_id": "recover-1", "thread_id": "thread-existing-1",
+                "turn_id": "turn-existing-1", "prompt": "continue", "max_turns": 1,
+            }), encoding="utf-8")
+            with patch("adapters.codex_app_server.jarvis_task_hold_host.NativeTaskLauncherConfig", return_value=FakeConfig()), patch(
+                "adapters.codex_app_server.jarvis_task_hold_host.AppServerClient", return_value=client
+            ):
+                exit_code = hold_task(Path("launcher.json"), request, ack, result)
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(client.created_requests, [])
+        self.assertFalse(hasattr(client, "resumed"))
+        self.assertEqual(client.waited, ["turn-existing-1"])
+
     def test_normal_user_host_claims_a_queued_request(self):
         with tempfile.TemporaryDirectory() as temp:
             state_dir = Path(temp)
@@ -291,6 +311,46 @@ class TaskMonitorHostTest(unittest.TestCase):
         self.assertEqual(health["codex_home"], "C:/test/codex-home")
         self.assertEqual(health["state_dir"], str(state_dir.resolve()))
 
+    def test_running_host_refreshes_holding_health_while_a_task_is_blocked(self):
+        with tempfile.TemporaryDirectory() as temp:
+            state_dir = Path(temp)
+            launcher_config = state_dir / "launcher.json"
+            launcher_config.write_text(json.dumps({
+                "profile": "jarvis_test", "expected_codex_home": "C:/test/codex-home",
+            }), encoding="utf-8")
+            root = state_dir / "task-holds" / "hold-1"
+            root.mkdir(parents=True)
+            (root / "request.json").write_text(json.dumps({"request_id": "hold-1"}), encoding="utf-8")
+            (root / "ack.json").write_text(json.dumps({
+                "request_id": "hold-1", "status": "accepted", "phase": "queued_for_user_host",
+            }), encoding="utf-8")
+            entered, release, stop = threading.Event(), threading.Event(), threading.Event()
+
+            def blocking_hold(_config, _request, _ack, result):
+                entered.set()
+                release.wait(timeout=2)
+                result.write_text(json.dumps({"status": "completed"}), encoding="utf-8")
+                return 0
+
+            host = JarvisHoldHost(state_dir=state_dir, launcher_config=launcher_config)
+            with patch("adapters.codex_app_server.jarvis_hold_host_service.hold_task", side_effect=blocking_hold):
+                runner = threading.Thread(
+                    target=host.run_forever,
+                    kwargs={"poll_seconds": 0.25, "stop_event": stop},
+                    daemon=True,
+                )
+                runner.start()
+                self.assertTrue(entered.wait(timeout=1))
+                first = json.loads((state_dir / "hold-host.json").read_text(encoding="utf-8"))["observed_at"]
+                time.sleep(0.35)
+                second_health = json.loads((state_dir / "hold-host.json").read_text(encoding="utf-8"))
+                release.set()
+                stop.set()
+                runner.join(timeout=1)
+
+        self.assertEqual(second_health["status"], "holding")
+        self.assertNotEqual(second_health["observed_at"], first)
+
     def test_second_host_cannot_claim_the_same_accepted_hold(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp) / "task-holds" / "hold-1"
@@ -303,6 +363,96 @@ class TaskMonitorHostTest(unittest.TestCase):
             self.assertFalse(JarvisHoldHost._claim(root, ack_path, ack))
             JarvisHoldHost._release_claim(root)
             self.assertTrue(JarvisHoldHost._claim(root, ack_path, ack))
+
+    def test_new_host_requeues_a_dead_claim_as_existing_turn_recovery(self):
+        with tempfile.TemporaryDirectory() as temp:
+            state_dir = Path(temp)
+            launcher_config = state_dir / "launcher.json"
+            launcher_config.write_text(json.dumps({
+                "profile": "jarvis_test", "expected_codex_home": "C:/test/codex-home",
+            }), encoding="utf-8")
+            root = state_dir / "task-holds" / "hold-1"
+            root.mkdir(parents=True)
+            (root / "request.json").write_text(json.dumps({
+                "request_id": "hold-1", "mode": "create", "prompt": "work", "hold_id": "hold-1",
+            }), encoding="utf-8")
+            (root / "ack.json").write_text(json.dumps({
+                "request_id": "hold-1", "status": "holding", "phase": "turn_holding",
+                "thread_id": "thread-existing-1", "turn_id": "turn-existing-1",
+                "turn_count": 2, "total_turn_count": 5, "max_turns": 9,
+            }), encoding="utf-8")
+            claim = root / ".user-host-claim"
+            claim.mkdir()
+            (claim / "owner.json").write_text(json.dumps({"pid": 1780}), encoding="utf-8")
+            host = JarvisHoldHost(state_dir=state_dir, launcher_config=launcher_config)
+
+            with patch("adapters.codex_app_server.jarvis_hold_host_service._pid_is_alive", return_value=False):
+                self.assertTrue(host.run_once())
+
+            recovered_request = json.loads((root / "request.json").read_text(encoding="utf-8"))
+            recovered_ack = json.loads((root / "ack.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(recovered_request["mode"], "recover")
+        self.assertEqual(recovered_request["thread_id"], "thread-existing-1")
+        self.assertEqual(recovered_request["turn_id"], "turn-existing-1")
+        self.assertEqual(recovered_ack["status"], "accepted")
+        self.assertEqual(recovered_ack["phase"], "queued_for_user_host")
+
+    def test_new_host_marks_a_dead_claim_without_a_durable_turn_identity_as_unrecoverable(self):
+        with tempfile.TemporaryDirectory() as temp:
+            state_dir = Path(temp)
+            launcher_config = state_dir / "launcher.json"
+            launcher_config.write_text(json.dumps({
+                "profile": "jarvis_test", "expected_codex_home": "C:/test/codex-home",
+            }), encoding="utf-8")
+            root = state_dir / "task-holds" / "hold-1"
+            root.mkdir(parents=True)
+            (root / "request.json").write_text(json.dumps({
+                "request_id": "hold-1", "mode": "create", "prompt": "work", "hold_id": "hold-1",
+            }), encoding="utf-8")
+            (root / "ack.json").write_text(json.dumps({
+                "request_id": "hold-1", "status": "accepted", "phase": "queued_for_user_host",
+            }), encoding="utf-8")
+            claim = root / ".user-host-claim"
+            claim.mkdir()
+            (claim / "owner.json").write_text(json.dumps({"pid": 1780}), encoding="utf-8")
+            host = JarvisHoldHost(state_dir=state_dir, launcher_config=launcher_config)
+
+            with patch("adapters.codex_app_server.jarvis_hold_host_service._pid_is_alive", return_value=False):
+                self.assertTrue(host.run_once())
+
+            recovered_request = json.loads((root / "request.json").read_text(encoding="utf-8"))
+            recovered_ack = json.loads((root / "ack.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(recovered_request["mode"], "create")
+        self.assertEqual(recovered_ack["status"], "failed")
+        self.assertEqual(recovered_ack["phase"], "recovery_failed")
+        self.assertIn("no durable thread identity", recovered_ack["reason"])
+
+    def test_initialize_user_host_does_not_start_a_second_live_host_for_more_capacity(self):
+        with tempfile.TemporaryDirectory() as temp:
+            state_dir = Path(temp)
+            launcher_config = state_dir / "launcher.json"
+            launcher_config.write_text(json.dumps({
+                "profile": "jarvis_test", "expected_codex_home": "C:/test/codex-home",
+            }), encoding="utf-8")
+            (state_dir / "hold-host.json").write_text(json.dumps({
+                "status": "ready", "pid": 1780, "worker_capacity": 1,
+                "observed_at": "2026-09-01T00:00:00+00:00",
+                "host_started_at": "2026-09-01T00:00:00+00:00",
+                "profile": "jarvis_test", "codex_home": "C:/test/codex-home",
+                "state_dir": str(state_dir.resolve()),
+            }), encoding="utf-8")
+            start_host = Mock()
+
+            receipt = initialize_user_host(
+                state_dir=state_dir, launcher_config=launcher_config, workers=3, start_host=start_host,
+                now=lambda: "2026-09-01T00:00:10+00:00", pid_alive=lambda _: True,
+                pid_started_at=lambda _: "2026-08-31T23:59:59+00:00",
+            )
+
+        self.assertEqual(receipt, {"status": "failed", "reason": "HoldHost worker capacity is insufficient"})
+        start_host.assert_not_called()
 
     def test_ensure_hold_host_reuses_a_matching_fresh_host(self):
         with tempfile.TemporaryDirectory() as temp:

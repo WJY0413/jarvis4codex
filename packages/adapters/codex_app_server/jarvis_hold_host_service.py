@@ -74,7 +74,9 @@ def initialize_user_host(
         return {"status": "failed", "reason": "HoldHost launcher config requires profile and expected_codex_home"}
     health_checks = {"now": now, "pid_alive": pid_alive or _pid_is_alive, "pid_started_at": pid_started_at or _pid_started_at}
     if _matching_health(state_dir, profile, codex_home, **health_checks):
-        return {"status": "ready", "phase": "already_running"}
+        if _matching_health(state_dir, profile, codex_home, required_workers=workers, **health_checks):
+            return {"status": "ready", "phase": "already_running"}
+        return {"status": "failed", "reason": "HoldHost worker capacity is insufficient"}
 
     lock_path = state_dir / "hold-host-bootstrap.lock"
     try:
@@ -83,7 +85,9 @@ def initialize_user_host(
         return {"status": "blocked", "reason": "HoldHost bootstrap is already in progress"}
     try:
         if _matching_health(state_dir, profile, codex_home, **health_checks):
-            return {"status": "ready", "phase": "already_running"}
+            if _matching_health(state_dir, profile, codex_home, required_workers=workers, **health_checks):
+                return {"status": "ready", "phase": "already_running"}
+            return {"status": "failed", "reason": "HoldHost worker capacity is insufficient"}
         if start_host is None:
             _start_hold_host(
                 state_dir=state_dir,
@@ -95,7 +99,7 @@ def initialize_user_host(
             start_host()
         deadline = time.monotonic() + max(wait_seconds, 0)
         while True:
-            if _matching_health(state_dir, profile, codex_home, **health_checks):
+            if _matching_health(state_dir, profile, codex_home, required_workers=workers, **health_checks):
                 return {"status": "ready", "phase": "started"}
             if time.monotonic() >= deadline:
                 return {"status": "failed", "reason": "HoldHost did not report matching health before timeout"}
@@ -136,6 +140,7 @@ def _start_hold_host(*, state_dir: Path, launcher_config: Path, workers: int, po
 def _matching_health(
     state_dir: Path, profile: str, codex_home: str, *, now: Callable[[], datetime | str], pid_alive: Callable[[int], bool],
     pid_started_at: Callable[[int], datetime | str | None],
+    required_workers: int = 1,
 ) -> bool:
     health = _read_json(state_dir / "hold-host.json")
     if health is None or str(health.get("status") or "") not in {"ready", "holding"}:
@@ -149,6 +154,12 @@ def _matching_health(
     except (TypeError, ValueError):
         return False
     if pid <= 0 or not pid_alive(pid):
+        return False
+    try:
+        worker_capacity = max(int(health.get("worker_capacity") or 1), 1)
+    except (TypeError, ValueError):
+        return False
+    if worker_capacity < max(required_workers, 1):
         return False
     host_started_at = _parse_time(health.get("host_started_at"))
     process_started_at = _parse_time(pid_started_at(pid))
@@ -248,10 +259,16 @@ class JarvisHoldHost:
                 if request is None or ack is None or result_path.exists():
                     continue
                 if str(ack.get("status") or "") != "accepted":
+                    if self._requeue_dead_claim(root, request_path, ack_path, request, ack):
+                        return True
                     continue
                 if str(ack.get("phase") or "") != "queued_for_user_host":
+                    if self._requeue_dead_claim(root, request_path, ack_path, request, ack):
+                        return True
                     continue
                 if not self._claim(root, ack_path, ack):
+                    if self._requeue_dead_claim(root, request_path, ack_path, request, ack):
+                        return True
                     continue
                 hold_id = str(request.get("hold_id") or request.get("monitor_id") or root.name)
                 self._mark_active(hold_id)
@@ -264,6 +281,55 @@ class JarvisHoldHost:
                     self._write_health("ready")
                 return True
         return False
+
+    @staticmethod
+    def _requeue_dead_claim(
+        root: Path, request_path: Path, ack_path: Path, request: dict[str, Any], ack: dict[str, Any],
+    ) -> bool:
+        claim_dir = root / ".user-host-claim"
+        owner = _read_json(claim_dir / "owner.json")
+        try:
+            owner_pid = int((owner or {}).get("pid"))
+        except (TypeError, ValueError):
+            return False
+        thread_id = str(ack.get("thread_id") or request.get("thread_id") or "").strip()
+        turn_id = str(ack.get("turn_id") or request.get("turn_id") or "").strip()
+        if owner_pid <= 0 or _pid_is_alive(owner_pid):
+            return False
+        if not thread_id or not turn_id:
+            if str(ack.get("phase") or "") not in {"claimed_by_user_host", "queued_for_user_host"} or str(request.get("mode") or "create") != "create":
+                return False
+            JarvisHoldHost._release_claim(root)
+            _write_json(ack_path, {
+                "request_id": str(request.get("request_id") or ""),
+                "status": "failed",
+                "phase": "recovery_failed",
+                "hold_id": str(request.get("hold_id") or request.get("monitor_id") or root.name),
+                "recovered_from_pid": owner_pid,
+                "reason": "dead HoldHost claim has no durable thread identity",
+                "observed_at": _now(),
+            })
+            return True
+        recovered = {
+            **request,
+            "mode": "recover",
+            "thread_id": thread_id,
+            "turn_id": turn_id,
+            "initial_turn_count": max(int(ack.get("turn_count") or 1), 1),
+            "initial_total_turn_count": max(int(ack.get("total_turn_count") or ack.get("turn_count") or 1), 1),
+            "max_turns": max(int(ack.get("max_turns") or request.get("max_turns") or 1), 1),
+        }
+        JarvisHoldHost._release_claim(root)
+        _write_json(request_path, recovered)
+        _write_json(ack_path, {
+            "request_id": str(request.get("request_id") or ""),
+            "status": "accepted",
+            "phase": "queued_for_user_host",
+            "hold_id": str(request.get("hold_id") or request.get("monitor_id") or root.name),
+            "recovered_from_pid": owner_pid,
+            "observed_at": _now(),
+        })
+        return True
 
     @staticmethod
     def _claim(root: Path, ack_path: Path, ack: dict[str, Any]) -> bool:
@@ -290,17 +356,30 @@ class JarvisHoldHost:
         if claim_dir.is_dir():
             claim_dir.rmdir()
 
-    def run_forever(self, *, poll_seconds: float) -> None:
-        threads = [threading.Thread(target=self._run_worker, args=(poll_seconds,), daemon=True) for _ in range(self.workers)]
+    def run_forever(self, *, poll_seconds: float, stop_event: threading.Event | None = None) -> None:
+        stop = stop_event or threading.Event()
+        heartbeat = threading.Thread(target=self._run_health_heartbeat, args=(stop, poll_seconds), daemon=True)
+        threads = [threading.Thread(target=self._run_worker, args=(poll_seconds, stop), daemon=True) for _ in range(self.workers)]
+        heartbeat.start()
         for worker in threads:
             worker.start()
         for worker in threads:
             worker.join()
 
-    def _run_worker(self, poll_seconds: float) -> None:
-        while True:
-            if not self.run_once():
-                time.sleep(max(poll_seconds, 0.25))
+    def _run_health_heartbeat(self, stop_event: threading.Event, poll_seconds: float) -> None:
+        while not stop_event.is_set():
+            self._write_health("ready")
+            stop_event.wait(min(max(poll_seconds, 0.25), 5.0))
+
+    def _run_worker(self, poll_seconds: float, stop_event: threading.Event) -> None:
+        while not stop_event.is_set():
+            try:
+                handled = self.run_once()
+            except Exception:
+                self._write_health("ready")
+                handled = False
+            if not handled:
+                stop_event.wait(max(poll_seconds, 0.25))
 
     def _mark_active(self, hold_id: str) -> None:
         with self._health_lock:
