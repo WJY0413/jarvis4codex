@@ -3,11 +3,13 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import queue
+import subprocess
 import sys
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
+from types import SimpleNamespace
 
 
 TOOLS_DIR = Path(__file__).resolve().parents[1]
@@ -28,6 +30,101 @@ from jarvis_native_task_launcher import (  # noqa: E402
 
 THREAD_ID = "019f7603-a0e6-7400-8383-22ea84f2e621"
 COOPER_ID = "ou_cooper"
+
+
+class CodexResolutionTests(unittest.TestCase):
+    def test_explicit_pin_wins_and_is_version_checked(self):
+        with patch("jarvis_native_task_launcher.shutil.which", return_value="pinned.exe") as which, patch(
+            "jarvis_native_task_launcher.subprocess.run",
+            return_value=subprocess.CompletedProcess([], 0, "codex-cli 0.151.0-alpha.7.1\n", ""),
+        ) as run:
+            client = AppServerClient(SimpleNamespace(codex_cli="pinned.exe"))
+        which.assert_called_once_with("pinned.exe")
+        self.assertEqual(client.cli_version, "0.151.0-alpha.7.1")
+        self.assertEqual(run.call_args.args[0], ["pinned.exe", "--version"])
+
+    def test_missing_pin_does_not_fall_back(self):
+        with patch("jarvis_native_task_launcher.shutil.which", return_value=None) as which:
+            with self.assertRaisesRegex(NativeTaskError, "configured Codex executable not found"):
+                AppServerClient(SimpleNamespace(codex_cli="missing.exe"))
+        which.assert_called_once_with("missing.exe")
+
+    def test_bad_version_and_timeout_do_not_fall_back(self):
+        for outcome in (
+            subprocess.CompletedProcess([], 1, "", ""),
+            subprocess.CompletedProcess([], 0, "some other CLI", ""),
+            subprocess.TimeoutExpired("codex", 10),
+        ):
+            with self.subTest(outcome=outcome), patch(
+                "jarvis_native_task_launcher.shutil.which", return_value="codex.cmd",
+            ), patch("jarvis_native_task_launcher._npm_codex_command", return_value=None), patch(
+                "jarvis_native_task_launcher.subprocess.run", side_effect=[outcome],
+            ) as run:
+                with self.assertRaises(NativeTaskError):
+                    AppServerClient(SimpleNamespace(codex_cli="auto"))
+                self.assertEqual(run.call_count, 1)
+
+    def test_npm_lookup_failure_does_not_select_desktop(self):
+        with patch("jarvis_native_task_launcher.shutil.which", side_effect=lambda name: {
+            "npm.cmd": "npm.cmd", "npm": "npm", "codex.exe": "desktop.exe",
+        }.get(name)), patch("jarvis_native_task_launcher.subprocess.run", return_value=
+            subprocess.CompletedProcess([], 1, "", ""),
+        ):
+            with self.assertRaisesRegex(NativeTaskError, "npm global prefix discovery failed"):
+                AppServerClient(SimpleNamespace(codex_cli="auto"))
+
+    def test_npm_missing_node_or_entry_fails_without_fallback(self):
+        from jarvis_native_task_launcher import _npm_codex_command
+        with tempfile.TemporaryDirectory() as root:
+            package = Path(root) / "node_modules" / "@openai" / "codex"
+            package.mkdir(parents=True)
+            (package / "package.json").write_text(json.dumps({
+                "name": "@openai/codex", "bin": {"codex": "codex.js"},
+            }), encoding="utf-8")
+            with self.assertRaisesRegex(NativeTaskError, "invalid npm Codex installation"):
+                _npm_codex_command(Path(root))
+            (package / "codex.js").write_text("// fixture", encoding="utf-8")
+            with patch("jarvis_native_task_launcher.shutil.which", return_value=None):
+                with self.assertRaisesRegex(NativeTaskError, "Node executable not found"):
+                    _npm_codex_command(Path(root))
+
+    def test_start_uses_resolved_command_and_does_not_retry_initialization(self):
+        config = SimpleNamespace(codex_cli="auto", expected_codex_home="")
+        command = ["node", "path with spaces/codex.js"]
+        with patch("jarvis_native_task_launcher._resolve_codex_command", return_value=(command, "0.153.4")):
+            client = AppServerClient(config)
+        with patch("jarvis_native_task_launcher.subprocess.Popen") as popen, patch(
+            "jarvis_native_task_launcher.threading.Thread",
+        ), patch.object(client, "request", side_effect=NativeTaskError("unsupported initialize")), patch.object(
+            client, "close",
+        ) as close:
+            with self.assertRaisesRegex(NativeTaskError, "Codex 0.153.4.*failed App Server initialization"):
+                client.start()
+        popen.assert_called_once()
+        self.assertEqual(popen.call_args.args[0], command + ["app-server", "--stdio"])
+        self.assertFalse(popen.call_args.kwargs["shell"])
+        close.assert_called_once()
+
+    def test_auto_finds_npm_package_without_codex_on_path(self):
+        with tempfile.TemporaryDirectory(prefix="npm prefix ") as root:
+            package = Path(root) / "node_modules" / "@openai" / "codex"
+            (package / "bin").mkdir(parents=True)
+            (package / "bin" / "codex.js").write_text("// fixture", encoding="utf-8")
+            (package / "package.json").write_text(json.dumps({
+                "name": "@openai/codex", "bin": {"codex": "bin/codex.js"},
+            }), encoding="utf-8")
+            def which(name):
+                return {"npm.cmd": "npm.cmd", "npm": "npm", "node": "node"}.get(name)
+            with patch("jarvis_native_task_launcher.shutil.which", side_effect=which), patch(
+                "jarvis_native_task_launcher.subprocess.run", side_effect=[
+                    subprocess.CompletedProcess([], 0, root + "\n", ""),
+                    subprocess.CompletedProcess([], 0, "codex-cli 0.153.4\n", ""),
+                ],
+            ) as run:
+                client = AppServerClient(SimpleNamespace(codex_cli="auto"))
+            self.assertEqual(client.cli_command, ["node", str(package / "bin" / "codex.js")])
+            self.assertEqual(client.cli_version, "0.153.4")
+            self.assertEqual(run.call_args_list[1].args[0], client.cli_command + ["--version"])
 
 
 class FakeAppClient:

@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import logging
 import os
 from pathlib import Path
 import queue
@@ -646,17 +647,88 @@ class NativeTaskQueue:
         )
 
 
+def _cli_probe(command: list[str], purpose: str) -> str:
+    """Run a bounded, read-only discovery command; never start a task."""
+    try:
+        result = subprocess.run(
+            command, capture_output=True, text=True, encoding="utf-8",
+            errors="replace", timeout=10, shell=False,
+            **_background_subprocess_kwargs(),
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise NativeTaskError(f"{purpose} failed for {command[0]!r}: {type(exc).__name__}") from exc
+    if result.returncode:
+        raise NativeTaskError(f"{purpose} failed for {command[0]!r}: exit {result.returncode}")
+    return result.stdout.strip()
+
+
+def _npm_codex_command(prefix: Path) -> list[str] | None:
+    # Windows global packages live directly under prefix; Unix uses lib/.
+    for modules in (prefix / "node_modules", prefix / "lib" / "node_modules"):
+        package = modules / "@openai" / "codex"
+        manifest = package / "package.json"
+        if not manifest.is_file():
+            continue
+        try:
+            raw = json.loads(manifest.read_text(encoding="utf-8-sig"))
+            entry = raw.get("bin")
+            entry = entry.get("codex") if isinstance(entry, dict) else entry
+            if raw.get("name") != "@openai/codex" or not isinstance(entry, str) or not entry:
+                raise ValueError("invalid Codex package entry")
+            script = (package / entry).resolve()
+            if not script.is_relative_to(package.resolve()) or not script.is_file():
+                raise ValueError("missing or invalid Codex package entry")
+        except (OSError, ValueError, AttributeError) as exc:
+            raise NativeTaskError(f"invalid npm Codex installation at {package}") from exc
+        # Match npm's sibling-node preference, then resolve Node from PATH.
+        sibling = prefix / ("node.exe" if os.name == "nt" else "node")
+        node = str(sibling) if sibling.is_file() else shutil.which("node")
+        if not node:
+            raise NativeTaskError(f"Node executable not found for npm Codex at {package}")
+        return [node, str(script)]
+    return None
+
+
+def _resolve_codex_command(configured: str) -> tuple[list[str], str]:
+    if configured != "auto":
+        executable = shutil.which(configured)
+        if not executable:
+            raise NativeTaskError(f"configured Codex executable not found: {configured!r}")
+        command, source = [executable], "configured"
+    else:
+        # Prefer the npm shim on Windows, even when Desktop also supplies an exe.
+        shim = shutil.which("codex.cmd") if os.name == "nt" else shutil.which("codex")
+        if shim:
+            command = _npm_codex_command(Path(shim).parent) or [shim]
+            source = "PATH"
+        else:
+            npm = shutil.which("npm.cmd" if os.name == "nt" else "npm")
+            command = None
+            if npm:
+                prefix = _cli_probe([npm, "prefix", "-g"], "npm global prefix discovery")
+                if not prefix or not Path(prefix).is_absolute() or "\n" in prefix:
+                    raise NativeTaskError("npm global prefix discovery returned an invalid path")
+                command = _npm_codex_command(Path(prefix))
+            source = "npm global prefix"
+            if command is None:
+                executable = shutil.which("codex.exe" if os.name == "nt" else "codex")
+                if not executable:
+                    raise NativeTaskError("Codex executable not found on PATH or in npm global installation")
+                command, source = [executable], "PATH executable"
+    output = _cli_probe(command + ["--version"], "Codex version probe")
+    match = re.fullmatch(r"codex-cli\s+(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)", output)
+    if not match:
+        raise NativeTaskError(f"unrecognized Codex version response from {command[0]!r}")
+    version = match.group(1)
+    logging.getLogger(__name__).info("Codex CLI resolved via %s: %r (version %s)", source, command, version)
+    return command, version
+
+
 class AppServerClient:
     def __init__(self, config: NativeTaskLauncherConfig):
         self.config = config
-        names = ["codex.cmd", "codex.exe", "codex"] if os.name == "nt" else ["codex"]
-        self.executable = (
-            shutil.which(config.codex_cli)
-            if config.codex_cli != "auto"
-            else next((shutil.which(name) for name in names if shutil.which(name)), None)
-        )
-        if not self.executable:
-            raise NativeTaskError("codex executable not found")
+        self.cli_command, self.cli_version = _resolve_codex_command(config.codex_cli)
+        self.executable = self.cli_command[0]
         self.process: subprocess.Popen[str] | None = None
         self.response_queue: queue.Queue[dict[str, Any]] = queue.Queue()
         self.notifications: queue.Queue[dict[str, Any]] = queue.Queue()
@@ -676,7 +748,7 @@ class AppServerClient:
         if self.config.expected_codex_home:
             env["CODEX_HOME"] = str(self.config.expected_codex_home)
         self.process = subprocess.Popen(
-            [self.executable, "app-server", "--stdio"],
+            [*self.cli_command, "app-server", "--stdio"],
             cwd=str(WORKSPACE_ROOT),
             env=env,
             stdin=subprocess.PIPE,
@@ -715,7 +787,9 @@ class AppServerClient:
                     f"CODEX_HOME {self.config.expected_codex_home!r}; run hold from the normal "
                     "Windows user host, not the MCP sandbox."
                 ) from exc
-            raise
+            raise NativeTaskError(
+                f"Codex {self.cli_version} at {self.cli_command!r} failed App Server initialization: {detail}"
+            ) from exc
         self.notify("initialized")
         codex_home = str(result.get("codexHome") or "")
         expected = self.config.expected_codex_home

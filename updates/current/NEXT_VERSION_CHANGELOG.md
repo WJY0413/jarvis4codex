@@ -1,5 +1,25 @@
 # Jarvis 0.2.0
 
+## Codex CLI discovery
+
+- `codex_cli: "auto"` now discovers the npm global installation with
+  `npm prefix -g` when the Codex shim is absent from PATH. On Windows it
+  checks npm before falling back to a Desktop executable.
+- npm installations are launched with the resolved Node executable and the
+  package's declared Codex entrypoint. Every new client checks `--version`
+  with a bounded timeout and logs its command and version. Explicit CLI pins
+  remain authoritative; broken installations and failed probes are reported
+  without silently selecting another version.
+- App Server initialization errors include the selected command and version.
+  Initialization remains the startup protocol check; this does not certify all
+  later task operations against arbitrary future CLI versions.
+- No existing launcher configuration is changed. To enable discovery after
+  deploying this source, set the intended launcher's `codex_cli` to `"auto"`.
+  Existing running clients retain their command; no restart or install is automatic.
+- Validated with 189 runtime, adapter, and control contract tests. A live test
+  using npm CLI 0.153.4 returned `JARVIS_CLI_AUTO_OK`; the single-turn Hold stopped
+  at its configured turn limit and exact thread/turn history retained the answer.
+
 ## Managed Hold lifecycle
 
 - Added `jarvis_hold` as the public lifecycle entry. It can create a task or
