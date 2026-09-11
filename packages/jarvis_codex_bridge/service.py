@@ -47,9 +47,13 @@ class ExistingThreadBridge:
             return replace(previous, replayed=True)
 
         before = self.observe_thread(request.thread_id)
-        if before.status.strip().lower() in _ACTIVE or any(
-            turn.status.strip().lower() in _ACTIVE for turn in before.turns[-1:]
-        ):
+        if before.effective_status.strip().lower() == "unknown":
+            return BridgeReceipt(
+                request_id=request.request_id, thread_id=request.thread_id,
+                status="requires_readback", observed_at=utc_now(), source_ref=request.source_ref,
+                reason="execution state is unknown; observer status cannot authorize a new turn",
+            )
+        if before.effective_status.strip().lower() in _ACTIVE or before.status.strip().lower() in _ACTIVE:
             return BridgeReceipt(
                 request_id=request.request_id,
                 thread_id=request.thread_id,

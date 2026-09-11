@@ -1,3 +1,25 @@
+# Jarvis 0.2.1
+
+## Hold, Loop and output contracts
+
+- A shared normal-user Hold host supports capacity 10 with durable ownership, recovery and stop propagation.
+- Finite lanes support arbitrary positive batch sizes and partial final batches, with exact candidate IDs and per-item saved JSON output/receipt verification. Open-ended tasks may omit lanes.
+- Optional output schemas use Draft 2020-12, document-local references and no `$id`. A missing, mismatched or invalid saved result cannot be treated as verified output.
+- This snapshot uses the saved-file/receipt workflow. Automatic final-answer JSON intake is not included.
+
+## Observer and notification semantics
+
+- Reads expose `read_source`, `execution_source` and `execution_status`, distinguishing a native observer from authoritative Hold execution evidence. Observer interruption alone does not establish task termination; insufficient evidence remains unknown.
+- Local heartbeats reconcile terminal Holds. Optional notification delivery requires an actual delivery receipt; queued outbox entries are not delivery proof.
+- Technical lifecycle completion and saved-output verification do not establish business-quality acceptance. Existing MCP processes may need a connection refresh after a source upgrade.
+
+## Public packaging and validation
+
+- Product source matches accepted snapshot `279d92641f613b7d88b4f767f26e68359a6b24a1`; the public release commit is separately based on public main and excludes private local ancestry.
+- Templates use generic paths; the notification recipient is empty and notifications remain opt-in. Public docs and the affected test fixture no longer contain the previous machine-specific values.
+- New release content and assets are sanitized. Existing public history is retained without rewriting or purging it.
+- Existing core/adapter/runtime tests are used. The inherited host-capacity test still expects 2 instead of the implementation's 10 and is reported as a known failure, not a passing test.
+
 # Jarvis 0.1.9
 
 ## Managed Hold lifecycle

@@ -35,6 +35,44 @@ THREAD_ID = "11111111-1111-4111-8111-111111111111"
 THREAD_ID_2 = "22222222-2222-4222-8222-222222222222"
 
 
+class ObserverReadbackRegressionTest(unittest.TestCase):
+    def test_observer_interrupted_does_not_emit_terminal_change(self):
+        import jarvis_codex_bridge as bridge
+
+        response = {"thread": {"id": THREAD_ID, "status": {"type": "notLoaded"},
+                               "turns": [{"id": "previous", "status": "completed"}]}}
+
+        class ObserverClient:
+            def __init__(self, config):
+                pass
+
+            def start(self):
+                pass
+
+            def close(self):
+                pass
+
+            def request(self, method, params):
+                self_test.assertEqual(method, "thread/read")
+                return response
+
+        self_test = self
+        transport = jarvis_heartbeat_service.StandardBridgeHeartbeatTransport.__new__(
+            jarvis_heartbeat_service.StandardBridgeHeartbeatTransport)
+        transport.launcher_config = object()
+        transport.bridge = bridge
+        with tempfile.TemporaryDirectory() as temp, patch.object(
+            jarvis_heartbeat_service, "AppServerClient", ObserverClient
+        ):
+            monitor = bridge.ThreadTerminalMonitor(transport, Path(temp) / "monitor.json")
+            route = bridge.ReceiptRoute(THREAD_ID, THREAD_ID_2)
+            self.assertEqual(monitor.observe("observer-test", route).state, "baseline_terminal")
+            response["thread"]["turns"].append({"id": "current", "status": "interrupted"})
+            observed = monitor.observe("observer-test", route)
+            self.assertNotEqual(observed.state, "terminal_changed")
+            self.assertEqual(observed.reason, "unknown")
+
+
 class FakeClient:
     instances: list["FakeClient"] = []
     thread_status = "idle"
@@ -45,7 +83,7 @@ class FakeClient:
         self.__class__.instances.append(self)
 
     def start(self) -> dict[str, object]:
-        return {"codexHome": "C:\\Users\\22524\\.codex"}
+        return {"codexHome": "C:\\Users\\example\\.codex"}
 
     def request(self, method: str, params: dict[str, object]) -> dict[str, object]:
         self.calls.append((method, params))
@@ -158,7 +196,7 @@ class FakeQuotaClient:
         self.closed = False
 
     def start(self) -> dict[str, object]:
-        return {"codexHome": "C:\\Users\\22524\\.codex"}
+        return {"codexHome": "C:\\Users\\example\\.codex"}
 
     def request(self, method: str, params: dict[str, object]) -> dict[str, object]:
         if method != "account/rateLimits/read" or params != {}:
@@ -179,7 +217,7 @@ class FakeThreadReadOnlyClient:
         self.__class__.instances.append(self)
 
     def start(self) -> dict[str, object]:
-        return {"codexHome": "C:\\Users\\22524\\.codex"}
+        return {"codexHome": "C:\\Users\\example\\.codex"}
 
     def request(self, method: str, params: dict[str, object]) -> dict[str, object]:
         self.calls.append((method, params))
@@ -659,6 +697,15 @@ class HeartbeatTestCase(unittest.TestCase):
         self.assertEqual(unknown["status"], "UNKNOWN")
         self.assertIsNone(unknown["last_turn_id"])
         self.assertIsNone(unknown["terminal_fingerprint"])
+
+    def test_native_observer_interrupted_is_unknown_without_terminal_fingerprint(self):
+        FakeThreadReadOnlyClient.response = {"thread": {"id": THREAD_ID,
+            "status": "notLoaded", "turns": [{"id": "active-owner-turn", "status": "interrupted"}]}}
+        probe = NativeThreadTerminalProbe(self.config, client_factory=FakeThreadReadOnlyClient)
+        result = probe.inspect(THREAD_ID)
+        self.assertEqual(result["status"], "UNKNOWN")
+        self.assertEqual(result["last_turn_status"], "interrupted")
+        self.assertIsNone(result["terminal_fingerprint"])
 
     def test_pause_resume_and_cancel_are_audited(self) -> None:
         self.store.create(self.request())

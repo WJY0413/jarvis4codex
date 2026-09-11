@@ -1,8 +1,8 @@
 {
-  "python_executable": "C:\\Users\\22524\\Documents\\ChatGPT\\Jarvis4codex\\.venv\\Scripts\\python.exe",
-  "dispatcher_store_script": "C:\\Users\\22524\\Documents\\Chief of Staff\\tools\\coo_dispatcher_store.py",
-  "dispatcher_root": "C:\\Users\\22524\\Documents\\Chief of Staff\\coo_state\\dispatcher",
-  "recipient": "user:ou_bec95d292e6fd86051297521ca6677bd",
+  "python_executable": "../.venv/Scripts/python.exe",
+  "dispatcher_store_script": "../external-dispatcher/coo_dispatcher_store.py",
+  "dispatcher_root": "../state/notification-outbox",
+  "recipient": "",
   "delivery_wait_seconds": 20,
   "delivery_poll_seconds": 1
 }

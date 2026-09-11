@@ -20,7 +20,7 @@ class JarvisMcpServer:
         self.mcp = MCPServer(
             "jarvis-control",
             title="Jarvis Control Plane",
-            version="0.1.9",
+            version="0.2.1",
             instructions=(
                 "Use jarvis_read before a state-changing call when you need capability or thread context. "
                 "Use jarvis_hold for a managed lifecycle: Hold executes turns and Monitor issues a verified "
@@ -120,7 +120,17 @@ class JarvisMcpServer:
             business_skill: Annotated[str | None, Field(description="Optional business Skill to inject into the Worker prompt.")] = None,
             controller_skill: Annotated[str | None, Field(description="Optional controller Skill to inject into the Worker prompt.")] = None,
             target_thread_count: int | None = None,
-            threads: list[dict[str, Any]] | None = None,
+            threads: Annotated[list[dict[str, Any]] | None, Field(
+                description="Optional finite-item lanes; omit lanes for open-ended tasks without fixed batches. lane.batch_size is any positive integer (default 1). lane.result_verification.output_schema validates each saved item JSON using Draft 2020-12, document-local references only, no $id.",
+                json_schema_extra={"anyOf": [{"type": "array", "items": {"type": "object", "properties": {
+                    "lane": {"type": "object", "properties": {
+                        "batch_size": {"type": "integer", "minimum": 1, "default": 1},
+                        "result_verification": {"type": "object", "properties": {
+                            "output_schema": {"type": ["object", "boolean"]},
+                        }},
+                    }},
+                }}}, {"type": "null"}]},
+            )] = None,
             max_rounds: int | None = None,
             max_turns: int | None = None,
             auto_continue: bool | None = None,
@@ -145,11 +155,16 @@ class JarvisMcpServer:
             annotations=ToolAnnotations(readOnlyHint=True, idempotentHint=True, openWorldHint=False),
         )
         def jarvis_read(
-            subject: Literal["capabilities", "thread", "hold"],
+            subject: Literal["capabilities", "thread", "hold", "history"],
             task_id: str | None = None,
             hold_id: str | None = None,
+            thread_id: str | None = None,
+            turn_id: str | None = None,
         ) -> CallToolResult:
-            return _tool_result(self.control.read(subject=subject, task_id=task_id, hold_id=hold_id))
+            return _tool_result(self.control.read(
+                subject=subject, task_id=task_id, hold_id=hold_id,
+                thread_id=thread_id, turn_id=turn_id,
+            ))
 
         @self.mcp.tool(
             name="jarvis_resume",

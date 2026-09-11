@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from typing import Any, Mapping, Protocol
 
 from jarvis_codex_bridge import CapabilityRequest, ExistingThreadBridge, JarvisCapabilityPort
 
-from .loop import LoopController
+from .loop import LoopController, _validate_start
 from .provisioning import TaskMonitorResumeRequest, TaskProvisionRequest, TaskProvisioningPort
 
 
@@ -55,8 +56,16 @@ class JarvisControl:
                 readback={"verified": True, "terminal": False},
             )
         if action == "start":
-            health_reader = getattr(self._provisioner, "hold_host_health", None)
-            health = health_reader() if callable(health_reader) else {"status": "host_not_ready", "reason": "no HoldHost health adapter is configured"}
+            try:
+                _validate_start(options)
+            except ValueError as exc:
+                return self._receipt("jarvis_loop", "invalid_request", request_id=options.get("request_id"), reason=str(exc))
+            requested_workers = options.get("target_thread_count")
+            required_workers = requested_workers if isinstance(requested_workers, int) and requested_workers > 0 else 1
+            if self._provisioner is None:
+                health = {"status": "host_not_ready", "reason": "no HoldHost health adapter is configured"}
+            else:
+                health = self._provisioner.ensure_hold_host_ready(required_workers=required_workers)
             if health.get("status") != "ready":
                 return self._receipt(
                     "jarvis_loop", "host_not_ready", request_id=options.get("request_id"),
@@ -65,11 +74,7 @@ class JarvisControl:
                 )
             result = self._loop_controller.start(self, **options)
         elif action == "tick":
-            return self._receipt(
-                "jarvis_loop", "invalid_request", request_id=options.get("request_id"),
-                reason="loop tick is disabled; Holder and Monitor own continuation",
-                readback={"verified": False, "terminal": False},
-            )
+            result = self._loop_controller.tick(self, loop_id=str(loop_id or ""))
         elif action == "reconcile":
             result = self._loop_controller.reconcile(self)
         elif action == "status":
@@ -83,6 +88,16 @@ class JarvisControl:
             reason=result.reason, data=result.data,
             readback={"verified": result.status not in {"invalid_request", "blocked"}, "terminal": result.status in {"completed", "stopped", "expired"}},
         )
+
+    def stop_hold(self, hold_id: str) -> dict[str, Any]:
+        """Internal Loop-to-provisioner boundary; no new public MCP action."""
+        stopper = getattr(self._provisioner, "request_hold_stop", None)
+        if not callable(stopper):
+            return {"status": "unsupported", "reason": "persistent Hold stop is unavailable"}
+        try:
+            return stopper(hold_id)
+        except Exception as exc:
+            return {"status": "failed", "reason": str(exc)}
 
     def create(
         self,
@@ -241,7 +256,8 @@ class JarvisControl:
         )
 
     def read(
-        self, *, subject: str, task_id: str | None = None, hold_id: str | None = None
+        self, *, subject: str, task_id: str | None = None, hold_id: str | None = None,
+        thread_id: str | None = None, turn_id: str | None = None,
     ) -> dict[str, Any]:
         if subject == "capabilities":
             return self._receipt(
@@ -293,8 +309,13 @@ class JarvisControl:
                 data={
                     "thread_id": state.thread_id,
                     "status": state.status,
+                    "read_source": state.read_source,
+                    "execution_status": state.effective_status,
+                    "execution_source": state.execution_source,
+                    "execution_evidence": state.execution_evidence,
                     "turns": [
-                        {"turn_id": turn.turn_id, "status": turn.status, "error": turn.error}
+                        {"turn_id": turn.turn_id, "status": turn.status, "error": turn.error,
+                         "execution_status": turn.effective_status, "execution_source": turn.execution_source}
                         for turn in state.turns
                     ],
                 },
@@ -310,7 +331,16 @@ class JarvisControl:
             except Exception as exc:
                 return self._receipt("jarvis_read", "failed", reason=str(exc))
             return self._receipt("jarvis_read", "completed", data=data)
-        return self._receipt("jarvis_read", "invalid_request", reason="subject must be capabilities, thread, or hold")
+        if subject == "history":
+            reader = getattr(self._provisioner, "read_turn_history", None)
+            if not callable(reader):
+                return self._receipt("jarvis_read", "unsupported", reason="no managed-hold history adapter is configured")
+            try:
+                turns = reader(task_id=task_id, hold_id=hold_id, thread_id=thread_id, turn_id=turn_id)
+            except (RuntimeError, ValueError) as exc:
+                return self._receipt("jarvis_read", "invalid_request", reason=str(exc))
+            return self._receipt("jarvis_read", "completed", data={"turns": turns})
+        return self._receipt("jarvis_read", "invalid_request", reason="subject must be capabilities, thread, hold, or history")
 
     def monitor(
         self,
@@ -326,6 +356,7 @@ class JarvisControl:
         model: str | None = None,
         reasoning_effort: str | None = None,
         hold_id: str | None = None,
+        notification_event_type: str | None = None,
     ) -> dict[str, Any]:
         if action == "status":
             status_reader = getattr(self._provisioner, "hold_status", None)
@@ -343,7 +374,17 @@ class JarvisControl:
                 data = status_reader(target_hold_id)
             except Exception as exc:
                 return self._receipt("jarvis_monitor", "failed", request_id=request_id, reason=str(exc))
-            return self._receipt("jarvis_monitor", "completed", request_id=request_id, data=data)
+            lifecycle = str(data.get("lifecycle_status") or data.get("status") or "").lower()
+            verified = (
+                lifecycle in {"completed", "failed", "interrupted", "cancelled", "canceled", "turn_limit_reached", "blocked"}
+                and bool(str(data.get("thread_id") or "").strip())
+                and bool(str(data.get("turn_id") or "").strip())
+                and data.get("terminal_confirmed", True) is True
+            )
+            return self._receipt(
+                "jarvis_monitor", "completed", request_id=request_id, data=data,
+                readback={"verified": verified, "terminal": verified},
+            )
         if action == "deliver_hold_notifications":
             if not hold_id:
                 return self._receipt(
@@ -361,19 +402,39 @@ class JarvisControl:
                     "jarvis_monitor", "unsupported", request_id=request_id,
                     reason="no managed-hold notification event adapter is configured",
                 )
-            deliveries: list[dict[str, Any]] = []
-            for event in pending_reader(hold_id):
-                event_id = str(event.get("event_id") or "").strip()
-                if not event_id:
-                    continue
-                delivery = dict(self._notifier.notify(
-                    request_id=f"{request_id}:{event_id}",
-                    source_ref=source_ref,
-                    message=str(event.get("message") or ""),
-                ))
-                recorder(hold_id, event_id, delivery)
-                deliveries.append({"event_id": event_id, **delivery})
-            verified = bool(deliveries) and all(
+            lock_factory = getattr(self._provisioner, "hold_notification_delivery_lock", None)
+            try:
+                delivery_lock = lock_factory(hold_id) if callable(lock_factory) else nullcontext()
+                with delivery_lock:
+                    deliveries: list[dict[str, Any]] = []
+                    for event in pending_reader(hold_id):
+                        if (
+                            notification_event_type is not None
+                            and str(event.get("event_type") or "") != notification_event_type
+                        ):
+                            continue
+                        event_id = str(event.get("event_id") or "").strip()
+                        if not event_id:
+                            continue
+                        try:
+                            delivery = dict(self._notifier.notify(
+                                request_id=f"{request_id}:{event_id}",
+                                source_ref=source_ref,
+                                message=str(event.get("message") or ""),
+                            ))
+                        except Exception as exc:
+                            delivery = {"delivery_status": "failed", "reason": str(exc)}
+                        try:
+                            recorder(hold_id, event_id, delivery)
+                        except Exception as exc:
+                            delivery = {"delivery_status": "failed", "reason": str(exc)}
+                        deliveries.append({"event_id": event_id, **delivery})
+            except Exception as exc:
+                return self._receipt(
+                    "jarvis_monitor", "failed", request_id=request_id, reason=str(exc),
+                    readback={"verified": False, "terminal": False},
+                )
+            verified = all(
                 item.get("delivery_status") == "delivered" and item.get("message_id")
                 for item in deliveries
             )
@@ -404,6 +465,49 @@ class JarvisControl:
                 "model": model,
                 "reasoning_effort": reasoning_effort,
             },
+        )
+
+    def deliver_pending_hold_notifications(
+        self, *, request_id: str, source_ref: str,
+    ) -> dict[str, Any]:
+        """Drain durable terminal Hold notification events through the configured bridge."""
+        if self._notifier is None:
+            return self.unsupported(
+                tool="jarvis_monitor", reason="no verified notification adapter is configured"
+            )
+        hold_reader = getattr(self._provisioner, "pending_hold_notification_holds", None)
+        if not callable(hold_reader):
+            return self._receipt(
+                "jarvis_monitor", "unsupported", request_id=request_id,
+                reason="no managed-hold notification discovery adapter is configured",
+            )
+        try:
+            hold_ids = list(hold_reader(event_type="terminal"))
+        except Exception as exc:
+            return self._receipt("jarvis_monitor", "failed", request_id=request_id, reason=str(exc))
+        deliveries: list[dict[str, Any]] = []
+        verified = True
+        for hold_id in hold_ids:
+            try:
+                receipt = self.monitor(
+                    action="deliver_hold_notifications",
+                    request_id=f"{request_id}:{hold_id}", source_ref=source_ref,
+                    hold_id=str(hold_id), notification_event_type="terminal",
+                )
+            except Exception as exc:
+                receipt = self._receipt(
+                    "jarvis_monitor", "failed", request_id=f"{request_id}:{hold_id}", reason=str(exc),
+                    readback={"verified": False, "terminal": False},
+                )
+            data = receipt.get("data") or {}
+            for delivery in data.get("deliveries") or []:
+                deliveries.append({"hold_id": str(hold_id), **dict(delivery)})
+            verified = verified and bool((receipt.get("readback") or {}).get("verified"))
+        return self._receipt(
+            "jarvis_monitor", "completed" if verified else "requires_readback",
+            request_id=request_id,
+            data={"hold_ids": hold_ids, "deliveries": deliveries},
+            readback={"verified": verified, "terminal": False},
         )
 
     def heartbeat(

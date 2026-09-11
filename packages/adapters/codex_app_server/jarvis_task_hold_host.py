@@ -10,12 +10,17 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from jarvis_monitor import HoldTurnMonitor, HoldTurnRequest, NotificationPolicy
 from jarvis_runtime.jarvis_native_task_launcher import AppServerClient, NativeTaskLauncherConfig
+from adapters.codex_app_server.task_provisioning_adapter import append_terminal_turn_history, verify_candidate_output, _pid_is_alive
+from jarvis_runtime.coo_dispatcher_store import ProcessLock
+from jarvis_control.provisioning import lane_batch_ids, lane_batch_size
 
 
 def _now() -> str:
@@ -24,9 +29,19 @@ def _now() -> str:
 
 def _write_json(path: Path, value: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(value, ensure_ascii=False), encoding="utf-8")
-    temporary.replace(path)
+    temporary = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temporary.write_text(json.dumps(value, ensure_ascii=False), encoding="utf-8")
+        for attempt in range(20):
+            try:
+                temporary.replace(path)
+                break
+            except PermissionError:
+                if attempt == 19:
+                    raise
+                time.sleep(0.05)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -83,15 +98,34 @@ def _validate_monitor_command(decision: object, *, hold_id: str, turn_id: str) -
 
 
 def _turn_input_binding(request: dict[str, Any], total_turn_count: int) -> dict[str, Any]:
-    """Keep a full lane private to Holder while exposing one candidate per Worker turn."""
+    """Keep a full lane private to Holder while exposing only the current slice per Worker turn."""
     binding = dict(request.get("input_binding") or {})
     if "lane_item_count" not in binding:
         return binding
-    candidate_ids = binding.get("candidate_ids")
-    if not isinstance(candidate_ids, list) or not 1 <= total_turn_count <= len(candidate_ids):
-        raise RuntimeError("lane binding has no candidate for the current turn")
-    binding["candidate_ids"] = [candidate_ids[total_turn_count - 1]]
+    binding["candidate_ids"] = lane_batch_ids(binding, total_turn_count)
+    contract = binding.get("result_verification")
+    if isinstance(contract, dict):
+        candidate = binding["candidate_ids"][0]
+        binding["result_verification"] = {
+            **({"output_schema": contract["output_schema"]} if "output_schema" in contract else {}),
+            **({"receipt_path": contract["receipt_paths"][str(candidate)]} if lane_batch_size(binding) == 1 else
+               {"receipt_paths": {str(value): contract["receipt_paths"][str(value)] for value in binding["candidate_ids"]}}),
+            "terminal_statuses": contract["terminal_statuses"],
+            "request_id": request["request_id"], "turn_number": total_turn_count,
+        }
     return binding
+
+
+def _task_id(request: dict[str, Any], hold_id: str) -> str:
+    return hold_id.rsplit(":", 1)[0] if hold_id.startswith("loop-") and ":" in hold_id else hold_id
+
+
+def _candidate_id(request: dict[str, Any], total_turn_count: int) -> int | None:
+    binding = request.get("input_binding") or {}
+    if "lane_item_count" in binding and lane_batch_size(binding) > 1:
+        return None
+    value = _turn_input_binding(request, total_turn_count).get("candidate_ids")
+    return value[0] if isinstance(value, list) and len(value) == 1 and isinstance(value[0], int) else None
 
 
 def hold_task(
@@ -112,6 +146,19 @@ def hold_task(
     initial_total_turn_count = max(int(request.get("initial_total_turn_count") or initial_turn_count), 1)
     client: AppServerClient | None = None
     phase = "hold_started"
+    terminal_confirmed = request.get("mode") != "recover"
+    verification: dict[str, Any] = {"status": "not_checked"}
+
+    def stop_requested() -> bool:
+        current = _read_json(request_path)
+        if current.get("request_id") != request.get("request_id"):
+            raise RuntimeError("Hold request changed while a turn was owned")
+        return current.get("stop_requested") is True
+
+    def verify_output() -> dict[str, Any]:
+        nonlocal verification
+        verification = verify_candidate_output(request, total_turn_count)
+        return verification
 
     def report(next_phase: str, details: dict[str, Any] | None = None) -> None:
         nonlocal phase
@@ -132,28 +179,47 @@ def hold_task(
 
     try:
         report("hold_started")
-        client = AppServerClient(NativeTaskLauncherConfig(launcher_config_path))
-        report("launcher_config_loaded")
-        input_binding = _turn_input_binding(request, initial_total_turn_count)
-        if str(request.get("mode") or "create") == "resume":
-            thread_id = str(request.get("thread_id") or "").strip()
-            if not thread_id:
-                raise RuntimeError("hold resume requires thread_id")
-            created = client.resume_turn_async(
-                thread_id,
-                str(request.get("prompt") or "").strip(),
-                client_user_message_id=request_id,
-                model=request.get("model"),
-                reasoning_effort=request.get("reasoning_effort"),
-                input_binding=input_binding,
-                on_phase=report,
-            )
-        else:
-            created = client.create_task({**request, "input_binding": input_binding}, on_phase=report)
-            thread_id = str(created.get("thread_id") or "").strip()
-        turn_id = str(created.get("turn_id") or "").strip()
-        if not thread_id or not turn_id:
-            raise RuntimeError("App Server task creation did not return thread_id and turn_id")
+        with ProcessLock(request_path.with_suffix(".lock"), owner_alive=_pid_is_alive):
+            if stop_requested() and request.get("mode") != "recover":
+                cancelled = {"request_id": request_id, "hold_id": hold_id, "status": "cancelled",
+                             "phase": "stopped_before_dispatch", "terminal_confirmed": True,
+                             "total_turn_count": 0, "observed_at": _now()}
+                _write_json(result_path, cancelled)
+                _write_json(ack_path, cancelled)
+                return 0
+            client = AppServerClient(NativeTaskLauncherConfig(launcher_config_path))
+            report("launcher_config_loaded")
+            input_binding = _turn_input_binding(request, initial_total_turn_count)
+            mode = str(request.get("mode") or "create")
+            if mode == "recover":
+                thread_id = str(request.get("thread_id") or "").strip()
+                turn_id = str(request.get("turn_id") or "").strip()
+                if not thread_id or not turn_id:
+                    raise RuntimeError("hold recovery requires thread_id and turn_id")
+                report("recovery_attached", {"thread_id": thread_id, "turn_id": turn_id})
+            elif mode == "resume":
+                thread_id = str(request.get("thread_id") or "").strip()
+                if not thread_id:
+                    raise RuntimeError("hold resume requires thread_id")
+                terminal_confirmed = False
+                created = client.resume_turn_async(
+                    thread_id,
+                    str(request.get("prompt") or "").strip(),
+                    client_user_message_id=request_id,
+                    model=request.get("model"),
+                    reasoning_effort=request.get("reasoning_effort"),
+                    input_binding=input_binding,
+                    on_phase=report,
+                )
+            else:
+                terminal_confirmed = False
+                created = client.create_task({**request, "input_binding": input_binding}, on_phase=report)
+                thread_id = str(created.get("thread_id") or "").strip()
+                turn_id = str(created.get("turn_id") or "").strip()
+            if mode == "resume":
+                turn_id = str(created.get("turn_id") or "").strip()
+            if not thread_id or not turn_id:
+                raise RuntimeError("App Server task creation did not return thread_id and turn_id")
         _write_json(ack_path, {
             "request_id": request_id,
             "status": "holding",
@@ -174,7 +240,7 @@ def hold_task(
         policy = _notification_policy(request.get("notifications"))
         events_path = result_path.with_name("monitor-events.jsonl")
         while True:
-            decision = turn_monitor.observe(client, HoldTurnRequest(
+            monitor_request = HoldTurnRequest(
                 hold_id=hold_id,
                 thread_id=thread_id,
                 turn_id=turn_id,
@@ -183,61 +249,83 @@ def hold_task(
                 continuation_enabled=auto_continue,
                 continue_prompt=continue_prompt,
                 notification_policy=policy,
-            ))
-            _validate_monitor_command(decision, hold_id=hold_id, turn_id=turn_id)
-            _append_monitor_events(events_path, decision)
-            final_message = decision.final_message
-            terminal_status = decision.result_status
-            _write_json(ack_path, {
-                "request_id": request_id,
-                "status": "holding" if decision.action == "CONTINUE" else terminal_status,
-                "phase": "monitor_decision",
-                "pid": os.getpid(),
-                "hold_id": hold_id,
-                "thread_id": thread_id,
-                "turn_id": turn_id,
-                "turn_count": turn_count,
-                "session_turn_count": turn_count,
-                "total_turn_count": total_turn_count,
-                "max_turns": max_turns,
-                "monitor_command": {
-                    "action": decision.action,
-                    "command_id": decision.command_id,
-                    "expected_turn_id": decision.expected_turn_id,
-                    "reason": decision.reason,
-                },
-                "observed_at": _now(),
-            })
-            if decision.action != "CONTINUE":
-                break
-            started = client.start_turn_async(
-                thread_id,
-                str(decision.continue_prompt or continue_prompt),
-                client_user_message_id=decision.command_id,
-                model=request.get("model"),
-                reasoning_effort=request.get("reasoning_effort"),
-                input_binding=_turn_input_binding(request, total_turn_count + 1),
-                on_phase=report,
+                verify_output=verify_output,
+                stop_requested=stop_requested,
             )
-            turn_id = str(started.get("turn_id") or "").strip()
-            if not turn_id:
-                raise RuntimeError("monitor continuation command did not return turn_id")
-            turn_count += 1
-            total_turn_count += 1
-            _write_json(ack_path, {
-                "request_id": request_id,
-                "status": "holding",
-                "phase": "turn_holding",
-                "pid": os.getpid(),
-                "thread_id": thread_id,
-                "turn_id": turn_id,
-                "hold_id": hold_id,
-                "turn_count": turn_count,
-                "session_turn_count": turn_count,
-                "total_turn_count": total_turn_count,
-                "max_turns": max_turns,
-                "observed_at": _now(),
-            })
+            decision = turn_monitor.observe(client, monitor_request)
+            terminal_confirmed = True
+            with ProcessLock(request_path.with_suffix(".lock"), owner_alive=_pid_is_alive):
+                _validate_monitor_command(decision, hold_id=hold_id, turn_id=turn_id)
+                if decision.action == "CONTINUE" and stop_requested():
+                    decision = turn_monitor._stop(monitor_request, decision.command_id, "cancelled",
+                                                  decision.final_message, "stop_requested")
+                _append_monitor_events(events_path, decision)
+                final_message = decision.final_message
+                terminal_status = decision.result_status
+                phase = "history_recording"
+                history_path = Path(str(request.get("turn_history_path") or result_path.with_name("turn-history.sqlite")))
+                binding = request.get("input_binding") or {}
+                is_batch_lane = "lane_item_count" in binding and lane_batch_size(binding) > 1
+                append_terminal_turn_history(
+                    history_path, task_id=_task_id(request, hold_id), hold_id=hold_id,
+                    request_id=request_id, thread_id=thread_id, turn_id=turn_id,
+                    turn_number=total_turn_count, candidate_id=_candidate_id(request, total_turn_count),
+                    status=terminal_status, final_answer=final_message, completed_at=_now(),
+                    candidate_ids=(lane_batch_ids(request["input_binding"], total_turn_count)
+                                   if is_batch_lane else None),
+                    output_verification=verification if is_batch_lane else None,
+                )
+                _write_json(ack_path, {
+                    "request_id": request_id,
+                    "status": "holding" if decision.action == "CONTINUE" else terminal_status,
+                    "phase": "monitor_decision",
+                    "pid": os.getpid(),
+                    "hold_id": hold_id,
+                    "thread_id": thread_id,
+                    "turn_id": turn_id,
+                    "turn_count": turn_count,
+                    "session_turn_count": turn_count,
+                    "total_turn_count": total_turn_count,
+                    "max_turns": max_turns,
+                    "monitor_command": {
+                        "action": decision.action,
+                        "command_id": decision.command_id,
+                        "expected_turn_id": decision.expected_turn_id,
+                        "reason": decision.reason,
+                    },
+                    "observed_at": _now(),
+                })
+                if decision.action != "CONTINUE":
+                    break
+                terminal_confirmed = False
+                started = client.start_turn_async(
+                    thread_id,
+                    str(decision.continue_prompt or continue_prompt),
+                    client_user_message_id=decision.command_id,
+                    model=request.get("model"),
+                    reasoning_effort=request.get("reasoning_effort"),
+                    input_binding=_turn_input_binding(request, total_turn_count + 1),
+                    on_phase=report,
+                )
+                turn_id = str(started.get("turn_id") or "").strip()
+                if not turn_id:
+                    raise RuntimeError("monitor continuation command did not return turn_id")
+                turn_count += 1
+                total_turn_count += 1
+                _write_json(ack_path, {
+                    "request_id": request_id,
+                    "status": "holding",
+                    "phase": "turn_holding",
+                    "pid": os.getpid(),
+                    "thread_id": thread_id,
+                    "turn_id": turn_id,
+                    "hold_id": hold_id,
+                    "turn_count": turn_count,
+                    "session_turn_count": turn_count,
+                    "total_turn_count": total_turn_count,
+                    "max_turns": max_turns,
+                    "observed_at": _now(),
+                })
         _write_json(result_path, {
             "request_id": request_id,
             "status": terminal_status,
@@ -251,28 +339,19 @@ def hold_task(
             "total_turn_count": total_turn_count,
             "max_turns": max_turns,
             "final_message": final_message,
+            "output_verification": verification,
+            "terminal_confirmed": terminal_confirmed,
             "observed_at": _now(),
         })
         return 0
     except Exception as exc:
-        _write_json(ack_path, {
-            "request_id": request_id,
-            "status": "failed",
-            "phase": phase,
-            "pid": os.getpid(),
-            "error_code": getattr(exc, "code", None),
-            "reason": str(exc),
-            "observed_at": _now(),
-        })
-        _write_json(result_path, {
-            "request_id": request_id,
-            "status": "failed",
-            "phase": phase,
-            "pid": os.getpid(),
-            "error_code": getattr(exc, "code", None),
-            "reason": str(exc),
-            "observed_at": _now(),
-        })
+        failure = {
+            "request_id": request_id, "hold_id": hold_id, "status": "failed", "phase": phase,
+            "pid": os.getpid(), "error_code": getattr(exc, "code", None),
+            "terminal_confirmed": terminal_confirmed, "reason": str(exc), "observed_at": _now(),
+        }
+        _write_json(result_path, failure)
+        _write_json(ack_path, failure)
         return 1
     finally:
         if client is not None:

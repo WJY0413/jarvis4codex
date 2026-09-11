@@ -23,7 +23,7 @@ from .service import ExistingThreadBridge
 from .transport import ExistingThreadTransport
 
 
-_TERMINAL = {"completed", "failed", "interrupted", "cancelled", "canceled"}
+_TERMINAL = {"completed", "failed", "interrupted", "cancelled", "canceled", "blocked"}
 DEFAULT_MONITOR_INTERVAL_SECONDS = 3
 DEFAULT_MONITOR_MAX_DURATION_SECONDS = 24 * 60 * 60
 
@@ -42,7 +42,7 @@ class ThreadTerminalMonitor:
             "thread_id": state.thread_id,
             "thread_status": state.status,
             "turn_id": latest.turn_id if latest else None,
-            "turn_status": latest.status if latest else None,
+            "turn_status": state.effective_status if latest else None,
         }
         raw = json.dumps(value, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
@@ -53,7 +53,7 @@ class ThreadTerminalMonitor:
         if state.thread_id != thread_id:
             raise RuntimeError("transport readback thread id does not match the receipt route")
         latest = state.turns[-1] if state.turns else None
-        status = (latest.status if latest else state.status).strip().lower()
+        status = state.effective_status.strip().lower()
         fingerprint = self._fingerprint(state)
         previous = {}
         if self.state_path.exists():
