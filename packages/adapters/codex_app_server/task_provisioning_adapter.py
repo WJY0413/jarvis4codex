@@ -146,8 +146,6 @@ class CodexAppServerTaskProvisioningAdapter:
         health = self.hold_host_health(required_workers=required_workers)
         if health.get("status") == "ready":
             return {"status": "ready", "phase": "already_running"}
-        if health.get("reason") == "HoldHost worker capacity is insufficient":
-            return health
         try:
             started = self._host_initializer(
                 state_dir=self._state_dir,

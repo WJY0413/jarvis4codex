@@ -5,6 +5,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from adapters.feishu_outbox_notification import (
     FeishuOutboxNotificationConfig,
@@ -13,6 +14,23 @@ from adapters.feishu_outbox_notification import (
 
 
 class FeishuOutboxNotificationContractTest(unittest.TestCase):
+    def test_notification_enqueue_suppresses_windows_console(self):
+        with tempfile.TemporaryDirectory() as temp:
+            config = FeishuOutboxNotificationConfig(
+                python_executable=Path("python"), dispatcher_store_script=Path("store.py"),
+                dispatcher_root=Path(temp), recipient="user:cooper",
+            )
+            calls = []
+
+            def runner(command, **kwargs):
+                calls.append(kwargs)
+                return subprocess.CompletedProcess(command, 0, '{"ok": true}', "")
+
+            with patch.object(subprocess, "CREATE_NO_WINDOW", 0x08000000, create=True):
+                FeishuOutboxNotificationPort(config, runner=runner)._enqueue({"content": "test"})
+            self.assertEqual(calls[0].get("creationflags"), 0x08000000)
+            self.assertTrue(calls[0]["capture_output"])
+
     def test_notification_requires_exact_delivered_readback(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

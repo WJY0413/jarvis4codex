@@ -81,7 +81,7 @@ class TaskProvisioningAdapterContractTest(unittest.TestCase):
         self.assertEqual(health, {"status": "ready", "phase": "started"})
         initializer.assert_called_once()
 
-    def test_ensure_hold_host_ready_does_not_start_a_second_live_host_for_more_capacity(self):
+    def test_ensure_hold_host_ready_requests_an_idle_host_capacity_upgrade(self):
         config = FakeConfig()
         with tempfile.TemporaryDirectory() as temp:
             state_dir = Path(temp)
@@ -92,7 +92,18 @@ class TaskProvisioningAdapterContractTest(unittest.TestCase):
                 "profile": config.profile, "codex_home": config.expected_codex_home,
                 "state_dir": str(state_dir.resolve()),
             }), encoding="utf-8")
-            initializer = Mock()
+            def initialize_host(**kwargs):
+                self.assertEqual(kwargs["workers"], 3)
+                (state_dir / "hold-host.json").write_text(json.dumps({
+                    "status": "ready", "pid": 1782, "worker_capacity": 3, "active_count": 0,
+                    "observed_at": datetime.now(timezone.utc).isoformat(),
+                    "host_started_at": datetime.now(timezone.utc).isoformat(),
+                    "profile": config.profile, "codex_home": config.expected_codex_home,
+                    "state_dir": str(state_dir.resolve()),
+                }), encoding="utf-8")
+                return {"status": "ready", "phase": "capacity_upgraded"}
+
+            initializer = Mock(side_effect=initialize_host)
             adapter = CodexAppServerTaskProvisioningAdapter(
                 state_dir / "launcher.json", state_dir=state_dir, config_loader=lambda _: config,
                 host_initializer=initializer, pid_alive=lambda _: True,
@@ -101,10 +112,8 @@ class TaskProvisioningAdapterContractTest(unittest.TestCase):
 
             health = adapter.ensure_hold_host_ready(required_workers=3)
 
-        self.assertEqual(health, {
-            "status": "host_not_ready", "reason": "HoldHost worker capacity is insufficient",
-        })
-        initializer.assert_not_called()
+        self.assertEqual(health, {"status": "ready", "phase": "capacity_upgraded"})
+        initializer.assert_called_once()
 
     def test_hold_host_health_blocks_a_stale_identity(self):
         config = FakeConfig()

@@ -107,7 +107,10 @@ class FeishuOutboxNotificationPort:
             request_path.unlink(missing_ok=True)
 
     def _run(self, command: list[str]) -> Mapping[str, Any]:
-        result = self._runner(command, text=True, capture_output=True, check=False)
+        result = self._runner(
+            command, text=True, capture_output=True, check=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
         if result.returncode != 0:
             raise RuntimeError((result.stderr or result.stdout or "notification command failed").strip())
         try:

@@ -13,7 +13,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 from unittest.mock import ANY
 
-from adapters.codex_app_server.jarvis_hold_host_service import JarvisHoldHost, _pid_is_alive, ensure_hold_host, initialize_user_host, main
+from adapters.codex_app_server.jarvis_hold_host_service import JarvisHoldHost, _pid_is_alive, _start_hold_host, ensure_hold_host, initialize_user_host, main
 from adapters.codex_app_server.task_provisioning_adapter import read_turn_history
 from jarvis_native_task_launcher import HostContextRequiredError
 from adapters.codex_app_server.jarvis_task_hold_host import hold_task
@@ -332,7 +332,7 @@ class TaskMonitorHostTest(unittest.TestCase):
                 result.write_text(json.dumps({"status": "completed"}), encoding="utf-8")
                 return 0
 
-            host = JarvisHoldHost(state_dir=state_dir, launcher_config=launcher_config)
+            host = JarvisHoldHost(state_dir=state_dir, launcher_config=launcher_config, workers=1)
             with patch("adapters.codex_app_server.jarvis_hold_host_service.hold_task", side_effect=blocking_hold):
                 runner = threading.Thread(
                     target=host.run_forever,
@@ -429,7 +429,36 @@ class TaskMonitorHostTest(unittest.TestCase):
         self.assertEqual(recovered_ack["phase"], "recovery_failed")
         self.assertIn("no durable thread identity", recovered_ack["reason"])
 
-    def test_initialize_user_host_does_not_start_a_second_live_host_for_more_capacity(self):
+    def test_new_host_marks_a_dead_thread_starting_claim_without_identity_as_unrecoverable(self):
+        with tempfile.TemporaryDirectory() as temp:
+            state_dir = Path(temp)
+            launcher_config = state_dir / "launcher.json"
+            launcher_config.write_text(json.dumps({
+                "profile": "jarvis_test", "expected_codex_home": "C:/test/codex-home",
+            }), encoding="utf-8")
+            root = state_dir / "task-holds" / "hold-1"
+            root.mkdir(parents=True)
+            (root / "request.json").write_text(json.dumps({
+                "request_id": "hold-1", "mode": "create", "prompt": "work", "hold_id": "hold-1",
+            }), encoding="utf-8")
+            (root / "ack.json").write_text(json.dumps({
+                "request_id": "hold-1", "status": "accepted", "phase": "thread_starting",
+            }), encoding="utf-8")
+            claim = root / ".user-host-claim"
+            claim.mkdir()
+            (claim / "owner.json").write_text(json.dumps({"pid": 1780}), encoding="utf-8")
+            host = JarvisHoldHost(state_dir=state_dir, launcher_config=launcher_config)
+
+            with patch("adapters.codex_app_server.jarvis_hold_host_service._pid_is_alive", return_value=False):
+                self.assertTrue(host.run_once())
+
+            recovered_ack = json.loads((root / "ack.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(recovered_ack["status"], "failed")
+        self.assertEqual(recovered_ack["phase"], "recovery_failed")
+        self.assertIn("no durable thread identity", recovered_ack["reason"])
+
+    def test_initialize_user_host_restarts_an_idle_matching_host_for_more_capacity(self):
         with tempfile.TemporaryDirectory() as temp:
             state_dir = Path(temp)
             launcher_config = state_dir / "launcher.json"
@@ -437,21 +466,63 @@ class TaskMonitorHostTest(unittest.TestCase):
                 "profile": "jarvis_test", "expected_codex_home": "C:/test/codex-home",
             }), encoding="utf-8")
             (state_dir / "hold-host.json").write_text(json.dumps({
-                "status": "ready", "pid": 1780, "worker_capacity": 1,
+                "status": "ready", "pid": 1780, "worker_capacity": 1, "active_count": 0,
+                "observed_at": "2026-09-01T00:00:00+00:00",
+                "host_started_at": "2026-09-01T00:00:00+00:00",
+                "profile": "jarvis_test", "codex_home": "C:/test/codex-home",
+                "state_dir": str(state_dir.resolve()),
+            }), encoding="utf-8")
+            live_pids = {1780: True, 1781: True}
+            stopped: list[int] = []
+
+            def stop_host(pid: int):
+                stopped.append(pid)
+                live_pids[pid] = False
+
+            def start_host():
+                (state_dir / "hold-host.json").write_text(json.dumps({
+                    "status": "ready", "pid": 1781, "worker_capacity": 3,
+                    "active_count": 0,
+                    "observed_at": "2026-09-01T00:00:10+00:00",
+                    "host_started_at": "2026-09-01T00:00:00+00:00",
+                    "profile": "jarvis_test", "codex_home": "C:/test/codex-home",
+                    "state_dir": str(state_dir.resolve()),
+                }), encoding="utf-8")
+
+            with patch("adapters.codex_app_server.jarvis_hold_host_service._stop_hold_host", side_effect=stop_host):
+                receipt = initialize_user_host(
+                    state_dir=state_dir, launcher_config=launcher_config, workers=3,
+                    start_host=start_host,
+                    now=lambda: "2026-09-01T00:00:10+00:00", pid_alive=lambda pid: live_pids.get(pid, False),
+                    pid_started_at=lambda _: "2026-08-31T23:59:59+00:00",
+                )
+
+        self.assertEqual(receipt, {"status": "ready", "phase": "capacity_upgraded"})
+        self.assertEqual(stopped, [1780])
+
+    def test_initialize_user_host_does_not_replace_an_active_host_for_more_capacity(self):
+        with tempfile.TemporaryDirectory() as temp:
+            state_dir = Path(temp)
+            launcher_config = state_dir / "launcher.json"
+            launcher_config.write_text(json.dumps({
+                "profile": "jarvis_test", "expected_codex_home": "C:/test/codex-home",
+            }), encoding="utf-8")
+            (state_dir / "hold-host.json").write_text(json.dumps({
+                "status": "holding", "pid": 1780, "worker_capacity": 1, "active_count": 1,
                 "observed_at": "2026-09-01T00:00:00+00:00",
                 "host_started_at": "2026-09-01T00:00:00+00:00",
                 "profile": "jarvis_test", "codex_home": "C:/test/codex-home",
                 "state_dir": str(state_dir.resolve()),
             }), encoding="utf-8")
             start_host = Mock()
-
             receipt = initialize_user_host(
-                state_dir=state_dir, launcher_config=launcher_config, workers=3, start_host=start_host,
+                state_dir=state_dir, launcher_config=launcher_config, workers=3,
+                start_host=start_host,
                 now=lambda: "2026-09-01T00:00:10+00:00", pid_alive=lambda _: True,
                 pid_started_at=lambda _: "2026-08-31T23:59:59+00:00",
             )
 
-        self.assertEqual(receipt, {"status": "failed", "reason": "HoldHost worker capacity is insufficient"})
+        self.assertEqual(receipt, {"status": "blocked", "reason": "HoldHost capacity upgrade requires an idle Host"})
         start_host.assert_not_called()
 
     def test_ensure_hold_host_reuses_a_matching_fresh_host(self):
@@ -463,7 +534,7 @@ class TaskMonitorHostTest(unittest.TestCase):
                 "expected_codex_home": "C:/test/codex-home",
             }), encoding="utf-8")
             (state_dir / "hold-host.json").write_text(json.dumps({
-                "status": "ready", "pid": 1780,
+                "status": "ready", "pid": 1780, "worker_capacity": 5, "active_count": 0,
                 "observed_at": "2026-09-01T00:00:00+00:00",
                 "host_started_at": "2026-09-01T00:00:00+00:00",
                 "profile": "jarvis_test", "codex_home": "C:/test/codex-home",
@@ -498,7 +569,7 @@ class TaskMonitorHostTest(unittest.TestCase):
 
             def start_host():
                 (state_dir / "hold-host.json").write_text(json.dumps({
-                    "status": "ready", "pid": 1781,
+                    "status": "ready", "pid": 1781, "worker_capacity": 5, "active_count": 0,
                     "observed_at": "2026-09-01T00:00:10+00:00",
                     "host_started_at": "2026-09-01T00:00:00+00:00",
                     "profile": "jarvis_test", "codex_home": "C:/test/codex-home",
@@ -525,7 +596,7 @@ class TaskMonitorHostTest(unittest.TestCase):
 
             def start_host():
                 (state_dir / "hold-host.json").write_text(json.dumps({
-                    "status": "ready", "pid": 1781,
+                    "status": "ready", "pid": 1781, "worker_capacity": 5, "active_count": 0,
                     "observed_at": "2026-09-01T00:00:10+00:00",
                     "host_started_at": "2026-09-01T00:00:00+00:00",
                     "profile": "jarvis_test", "codex_home": "C:/test/codex-home",
@@ -561,7 +632,7 @@ class TaskMonitorHostTest(unittest.TestCase):
 
             def start_host():
                 (state_dir / "hold-host.json").write_text(json.dumps({
-                    "status": "ready", "pid": 1781,
+                    "status": "ready", "pid": 1781, "worker_capacity": 5, "active_count": 0,
                     "observed_at": "2026-09-01T00:00:10+00:00",
                     "host_started_at": "2026-09-01T00:00:00+00:00",
                     "profile": "jarvis_test", "codex_home": "C:/test/codex-home",
@@ -594,7 +665,7 @@ class TaskMonitorHostTest(unittest.TestCase):
 
             def start_host():
                 (state_dir / "hold-host.json").write_text(json.dumps({
-                    "status": "ready", "pid": 1781,
+                    "status": "ready", "pid": 1781, "worker_capacity": 5, "active_count": 0,
                     "observed_at": "2026-09-01T00:00:10+00:00",
                     "host_started_at": "2026-09-01T00:00:00+00:00",
                     "profile": "jarvis_test", "codex_home": "C:/test/codex-home",
@@ -651,6 +722,20 @@ class TaskMonitorHostTest(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertEqual(json.loads(stdout.getvalue()), {"status": "ready", "phase": "started"})
         ensure.assert_called_once()
+        self.assertEqual(ensure.call_args.kwargs["workers"], 5)
+
+    def test_self_healed_host_uses_windows_start_process(self):
+        with tempfile.TemporaryDirectory() as temp, patch(
+            "adapters.codex_app_server.jarvis_hold_host_service.os.name", "nt"
+        ), patch(
+            "adapters.codex_app_server.jarvis_hold_host_service.subprocess.Popen"
+        ) as popen:
+            _start_hold_host(
+                state_dir=Path(temp), launcher_config=Path(temp) / "launcher.json",
+                workers=3, poll_seconds=1,
+            )
+
+        self.assertEqual(popen.call_args.args[0][0].lower(), "powershell.exe")
 
 
 if __name__ == "__main__":

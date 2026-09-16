@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -31,8 +32,18 @@ def _now() -> str:
 def _write_json(path: Path, value: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + f".{os.getpid()}.{threading.get_ident()}.tmp")
-    temporary.write_text(json.dumps(value, ensure_ascii=False), encoding="utf-8")
-    temporary.replace(path)
+    try:
+        temporary.write_text(json.dumps(value, ensure_ascii=False), encoding="utf-8")
+        for attempt in range(20):
+            try:
+                temporary.replace(path)
+                break
+            except PermissionError:
+                if attempt == 19:
+                    raise
+                time.sleep(0.05)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _read_json(path: Path) -> dict[str, Any] | None:
@@ -49,7 +60,7 @@ def initialize_user_host(
     *,
     state_dir: Path,
     launcher_config: Path,
-    workers: int = 1,
+    workers: int = 5,
     poll_seconds: float = 3.0,
     wait_seconds: float = 15.0,
     start_host: Callable[[], object] | None = None,
@@ -73,10 +84,9 @@ def initialize_user_host(
     if not profile or not codex_home:
         return {"status": "failed", "reason": "HoldHost launcher config requires profile and expected_codex_home"}
     health_checks = {"now": now, "pid_alive": pid_alive or _pid_is_alive, "pid_started_at": pid_started_at or _pid_started_at}
-    if _matching_health(state_dir, profile, codex_home, **health_checks):
-        if _matching_health(state_dir, profile, codex_home, required_workers=workers, **health_checks):
-            return {"status": "ready", "phase": "already_running"}
-        return {"status": "failed", "reason": "HoldHost worker capacity is insufficient"}
+    existing_matches = _matching_health(state_dir, profile, codex_home, **health_checks)
+    if existing_matches and _matching_health(state_dir, profile, codex_home, required_workers=workers, **health_checks):
+        return {"status": "ready", "phase": "already_running"}
 
     lock_path = state_dir / "hold-host-bootstrap.lock"
     try:
@@ -84,10 +94,29 @@ def initialize_user_host(
     except FileExistsError:
         return {"status": "blocked", "reason": "HoldHost bootstrap is already in progress"}
     try:
-        if _matching_health(state_dir, profile, codex_home, **health_checks):
+        existing_matches = _matching_health(state_dir, profile, codex_home, **health_checks)
+        upgraded = False
+        if existing_matches:
             if _matching_health(state_dir, profile, codex_home, required_workers=workers, **health_checks):
                 return {"status": "ready", "phase": "already_running"}
-            return {"status": "failed", "reason": "HoldHost worker capacity is insufficient"}
+            health = _read_json(state_dir / "hold-host.json") or {}
+            try:
+                active_count = int(health.get("active_count"))
+            except (TypeError, ValueError):
+                return {"status": "blocked", "reason": "HoldHost capacity upgrade requires an idle Host"}
+            if active_count != 0:
+                return {"status": "blocked", "reason": "HoldHost capacity upgrade requires an idle Host"}
+            try:
+                existing_pid = int(health["pid"])
+            except (KeyError, TypeError, ValueError):
+                return {"status": "failed", "reason": "HoldHost capacity upgrade cannot identify the existing Host"}
+            _stop_hold_host(existing_pid)
+            deadline = time.monotonic() + max(wait_seconds, 0)
+            while health_checks["pid_alive"](existing_pid):
+                if time.monotonic() >= deadline:
+                    return {"status": "failed", "reason": "HoldHost capacity upgrade did not stop the existing Host"}
+                time.sleep(max(poll_seconds, 0.05))
+            upgraded = True
         if start_host is None:
             _start_hold_host(
                 state_dir=state_dir,
@@ -100,7 +129,7 @@ def initialize_user_host(
         deadline = time.monotonic() + max(wait_seconds, 0)
         while True:
             if _matching_health(state_dir, profile, codex_home, required_workers=workers, **health_checks):
-                return {"status": "ready", "phase": "started"}
+                return {"status": "ready", "phase": "capacity_upgraded" if upgraded else "started"}
             if time.monotonic() >= deadline:
                 return {"status": "failed", "reason": "HoldHost did not report matching health before timeout"}
             time.sleep(max(poll_seconds, 0.05))
@@ -128,6 +157,20 @@ def _start_hold_host(*, state_dir: Path, launcher_config: Path, workers: int, po
     }
     if os.name == "nt":
         kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        host_args = [
+            "-m", "adapters.codex_app_server.jarvis_hold_host_service",
+            "--state-dir", str(state_dir), "--launcher-config", str(launcher_config),
+            "--poll-seconds", str(max(poll_seconds, 0.25)), "--workers", str(max(workers, 1)),
+        ]
+        quote = lambda value: "'" + str(value).replace("'", "''") + "'"
+        command = (
+            f"$jarvisHostArgs={quote(subprocess.list2cmdline(host_args))}; "
+            f"Start-Process -FilePath {quote(sys.executable)} -ArgumentList $jarvisHostArgs "
+            f"-WorkingDirectory {quote(package_root)} -WindowStyle Hidden"
+        )
+        return subprocess.Popen([
+            "powershell.exe", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", command,
+        ], **kwargs)
     else:  # pragma: no cover - Windows user-host deployment is the supported path.
         kwargs["start_new_session"] = True
     return subprocess.Popen([
@@ -135,6 +178,10 @@ def _start_hold_host(*, state_dir: Path, launcher_config: Path, workers: int, po
         "--state-dir", str(state_dir), "--launcher-config", str(launcher_config),
         "--poll-seconds", str(max(poll_seconds, 0.25)), "--workers", str(max(workers, 1)),
     ], **kwargs)
+
+
+def _stop_hold_host(pid: int) -> None:
+    os.kill(pid, signal.SIGTERM)
 
 
 def _matching_health(
@@ -232,7 +279,7 @@ def _same_path(left: object, right: object) -> bool:
 class JarvisHoldHost:
     """One small seam: consume accepted local requests and hold their App Server turns."""
 
-    def __init__(self, *, state_dir: Path, launcher_config: Path, workers: int = 1) -> None:
+    def __init__(self, *, state_dir: Path, launcher_config: Path, workers: int = 5) -> None:
         self.state_dir = state_dir
         self.launcher_config = launcher_config
         launcher = _read_json(launcher_config) or {}
@@ -275,6 +322,14 @@ class JarvisHoldHost:
                 self._write_health("holding", request_id=str(request.get("request_id") or ""))
                 try:
                     hold_task(self.launcher_config, request_path, ack_path, result_path)
+                except Exception as exc:
+                    failed = {
+                        **(_read_json(ack_path) or ack),
+                        "status": "failed", "phase": "host_execution_error",
+                        "reason": f"Hold execution failed: {exc}", "observed_at": _now(),
+                    }
+                    _write_json(result_path, failed)
+                    _write_json(ack_path, failed)
                 finally:
                     self._mark_inactive(hold_id)
                     self._release_claim(root)
@@ -297,7 +352,7 @@ class JarvisHoldHost:
         if owner_pid <= 0 or _pid_is_alive(owner_pid):
             return False
         if not thread_id or not turn_id:
-            if str(ack.get("phase") or "") not in {"claimed_by_user_host", "queued_for_user_host"} or str(request.get("mode") or "create") != "create":
+            if str(ack.get("phase") or "") not in {"claimed_by_user_host", "queued_for_user_host", "thread_starting"} or str(request.get("mode") or "create") != "create":
                 return False
             JarvisHoldHost._release_claim(root)
             _write_json(ack_path, {
@@ -415,7 +470,7 @@ def main() -> int:
     parser.add_argument("--state-dir", type=Path, required=True)
     parser.add_argument("--launcher-config", type=Path, required=True)
     parser.add_argument("--poll-seconds", type=float, default=1.0)
-    parser.add_argument("--workers", type=int, default=1)
+    parser.add_argument("--workers", type=int, default=5)
     parser.add_argument("--initialize-user-host", "--ensure-running", dest="initialize_user_host", action="store_true", help="initialize profile-bound state and start one matching Hold Host only when needed")
     parser.add_argument("--wait-seconds", type=float, default=15.0)
     args = parser.parse_args()

@@ -128,7 +128,7 @@ class LoopController:
                 request_id=f"{loop_id}:{child['slot']}:acquire", prompt=child["prompt"],
                 source_ref=f"jarvis_loop:{loop_id}:{child['slot']}", task_id=child.get("task_id"),
                 project=request["project"] if child["acquire"] == "create" else None,
-                title=child.get("title"), hold_id=f"{loop_id}:{child['slot']}",
+                title=child.get("title"), hold_id=None if child["acquire"] == "resume" else f"{loop_id}:{child['slot']}",
                 model=request["model"], reasoning_effort=request["reasoning_effort"],
                 max_turns=_round_limit(child, request["max_rounds"]) if child["holder_owns_continuation"] else request["max_turns"],
                 auto_continue=child["holder_owns_continuation"],
