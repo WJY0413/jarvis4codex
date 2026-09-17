@@ -27,7 +27,9 @@ def build_jarvis_control(
     transport_factory: Callable[[Path], Any] | None = None,
 ) -> JarvisControl:
     """Wire deployed existing-thread and task-provisioning adapters into JarvisControl."""
-    transport = (transport_factory or _standard_transport)(config_path)
+    provisioner = CodexAppServerTaskProvisioningAdapter(launcher_config_path, state_dir=state_dir)
+    transport = (transport_factory(config_path) if transport_factory else
+                 _standard_transport(config_path, execution_reader=provisioner.thread_execution_evidence))
     state_dir.mkdir(parents=True, exist_ok=True)
     runtime_dir = Path(__file__).resolve().parents[2] / "jarvis_runtime"
     if str(runtime_dir) not in sys.path:
@@ -43,10 +45,7 @@ def build_jarvis_control(
     return JarvisControl(
         capabilities,
         bridge,
-        provisioner=CodexAppServerTaskProvisioningAdapter(
-            launcher_config_path,
-            state_dir=state_dir,
-        ),
+        provisioner=provisioner,
         loop_controller=LoopController(LoopStore(state_dir / "loops")),
         notifier=(
             FeishuOutboxNotificationPort(FeishuOutboxNotificationConfig.load(notification_config_path))
@@ -55,7 +54,7 @@ def build_jarvis_control(
     )
 
 
-def _standard_transport(config_path: Path) -> Any:
+def _standard_transport(config_path: Path, *, execution_reader: Callable[..., Any] | None = None) -> Any:
     runtime_dir = Path(__file__).resolve().parents[2] / "jarvis_runtime"
     if str(runtime_dir) not in sys.path:
         sys.path.insert(0, str(runtime_dir))
@@ -68,4 +67,5 @@ def _standard_transport(config_path: Path) -> Any:
 
     config = HeartbeatConfig.load(config_path)
     controller = WakeController(config)
-    return StandardBridgeHeartbeatTransport(config, controller, load_standard_bridge(config))
+    return StandardBridgeHeartbeatTransport(config, controller, load_standard_bridge(config),
+                                            execution_reader=execution_reader)

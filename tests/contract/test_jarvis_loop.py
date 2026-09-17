@@ -20,7 +20,7 @@ class FakeRuntime:
 
     def hold(self, **kwargs):
         self.hold_calls.append(kwargs)
-        hold_id = kwargs["hold_id"]
+        hold_id = kwargs["hold_id"] or f"hold-{kwargs['request_id']}"
         self.states.setdefault(hold_id, {"status": "holding", "thread_id": kwargs.get("task_id") or "thread-1"})
         return {"status": "holding", "target_thread_id": self.states[hold_id]["thread_id"], "data": {"monitor_id": hold_id}}
 
@@ -33,6 +33,322 @@ class FakeRuntime:
 
 
 class JarvisLoopContractTest(unittest.TestCase):
+    def test_thread_quota_rotates_each_seat_and_preserves_round_budget_after_reload(self):
+        for quota in (1, 2):
+            with self.subTest(quota=quota):
+                runtime = FakeRuntime()
+                started = self.controller.start(runtime, request_id=f"rotation-{quota}", project="test", title="test",
+                    prompt="FIRST", continue_prompt="NEXT", turns_per_thread=quota,
+                    max_rounds=3, target_thread_count=2, expires_at="2099-01-01T00:00:00+00:00")
+                loop_id = started.loop_id
+                for offset in range(0, 3, quota):
+                    state = self.controller._store.load(loop_id)
+                    for child in state["children"]:
+                        runtime.states[child["hold_id"]] = {"status": "turn_limit_reached",
+                            "session_turn_count": min(quota, 3 - offset), "total_turn_count": 99,
+                            "hold_released": True, "terminal_confirmed": True}
+                    # A new controller exercises persisted offset rather than in-memory progress.
+                    result = LoopController(self.controller._store).tick(runtime, loop_id=loop_id)
+                self.assertEqual(result.status, "completed")
+                self.assertEqual([child["round"] for child in result.data["children"]], [3, 3])
+                self.assertEqual([call["max_turns"] for call in runtime.hold_calls],
+                    [min(quota, 3 - offset) for offset in range(0, 3, quota) for _ in range(2)])
+                self.assertEqual(len({call["hold_id"] for call in runtime.hold_calls}), len(runtime.hold_calls))
+                for call in runtime.hold_calls:
+                    self.assertTrue(call["prompt"].endswith("FIRST"))
+                    self.assertTrue(call["continue_prompt"].endswith("NEXT"))
+                    self.assertIsNone(call["task_id"])
+                before = len(runtime.hold_calls)
+                self.controller.tick(runtime, loop_id=loop_id)
+                self.assertEqual(len(runtime.hold_calls), before)
+
+    def test_rotation_requires_released_success_and_respects_manual_stop_and_expiry(self):
+        cases = ["failed", "cancelled", "unknown", "unreleased", "unconfirmed", "short", "manual", "stop", "expiry"]
+        for case in cases:
+            with self.subTest(case=case):
+                runtime = FakeRuntime()
+                started = self.controller.start(runtime, request_id=f"no-rotate-{case}", project="test", title="test",
+                    prompt="FIRST", turns_per_thread=2, max_rounds=3, auto_continue=case != "manual",
+                    target_thread_count=1, expires_at="2099-01-01T00:00:00+00:00")
+                hold_id = started.data["children"][0]["hold_id"]
+                runtime.states[hold_id] = {"status": case if case in {"failed", "cancelled", "unknown"} else "turn_limit_reached",
+                    "session_turn_count": 1 if case == "short" else 2,
+                    "hold_released": case != "unreleased", "terminal_confirmed": case != "unconfirmed"}
+                if case == "stop":
+                    self.controller.stop(runtime, loop_id=started.loop_id)
+                if case == "expiry":
+                    state = self.controller._store.load(started.loop_id)
+                    state["expires_at"] = "2000-01-01T00:00:00+00:00"
+                    self.controller._store.save(started.loop_id, state)
+                self.controller.tick(runtime, loop_id=started.loop_id)
+                self.assertEqual(len(runtime.hold_calls), 1)
+                if case == "unreleased":
+                    runtime.states[hold_id]["hold_released"] = True
+                    self.controller.tick(runtime, loop_id=started.loop_id)
+                    self.assertEqual(len(runtime.hold_calls), 2)
+
+    def test_rotation_options_validate_and_old_state_remains_compatible(self):
+        for field, values in (("turns_per_thread", (0, -1, True, "2", 1.5)), ("continue_prompt", ("", " ", 2))):
+            for value in values:
+                result = self.controller.start(self.runtime, request_id="bad-rotation", project="test", title="test",
+                    prompt="test", max_rounds=2, target_thread_count=1,
+                    expires_at="2099-01-01T00:00:00+00:00", **{field: value})
+                self.assertEqual(result.status, "invalid_request")
+        started = self.controller.start(self.runtime, request_id="legacy-state", project="test", title="test",
+            prompt="test", max_rounds=2, target_thread_count=1, expires_at="2099-01-01T00:00:00+00:00")
+        state = self.controller._store.load(started.loop_id)
+        state.pop("turns_per_thread")
+        state["children"][0].pop("thread_turn_limit")
+        self.controller._store.save(started.loop_id, state)
+        self.runtime.states[state["children"][0]["hold_id"]] = {"status": "turn_limit_reached", "total_turn_count": 2}
+        result = LoopController(self.controller._store).tick(self.runtime, loop_id=started.loop_id)
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(len(self.runtime.hold_calls), 1)
+
+    def test_open_ended_tasks_need_no_candidate_count_or_batch(self):
+        started = self.controller.start(self.runtime, request_id="open-search", project="test", title="Explore",
+            prompt="Explore this coding question and record findings; no predetermined item list.",
+            max_rounds=3, target_thread_count=1, expires_at="2099-01-01T00:00:00+00:00")
+        self.assertEqual(started.status, "running")
+        call = self.runtime.hold_calls[0]
+        self.assertIsNone(call["input_binding"])
+        self.assertNotIn("公司", call["prompt"])
+        self.assertNotIn("binding", call["prompt"])
+        self.assertEqual(call["max_turns"], 3)
+        hold_id = started.data["children"][0]["hold_id"]
+        self.runtime.states[hold_id] = {"status": "turn_limit_reached", "total_turn_count": 3}
+        self.assertEqual(self.controller.tick(self.runtime, loop_id=started.loop_id).status, "completed")
+
+    def test_batch_contract_rejects_invalid_size_budget_and_lane_overlap(self):
+        from copy import deepcopy
+        template = {"slot": "one", "lane": {"candidate_ids": [11, 22, 33], "batch_size": 2,
+            "database_path": "test.sqlite", "output_boundary": "out", "result_verification": {
+                "receipt_paths": {str(i): f"{i}.json" for i in (11, 22, 33)}, "terminal_statuses": ["completed"]}}}
+        for size in (0, -1, True, 1.5, "2", None):
+            child = deepcopy(template); child["lane"]["batch_size"] = size
+            result = self.controller.start(self.runtime, request_id="bad-size", project="test", title="test", prompt="test",
+                max_rounds=3, target_thread_count=1, expires_at="2099-01-01T00:00:00+00:00", threads=[child])
+            self.assertEqual(result.status, "invalid_request")
+            self.assertIn("batch_size", result.reason)
+        for children, budget in (([template], 1), ([template, {**deepcopy(template), "slot": "two"}], 2)):
+            result = self.controller.start(self.runtime, request_id="bad-binding", project="test", title="test", prompt="test",
+                max_rounds=budget, target_thread_count=len(children), expires_at="2099-01-01T00:00:00+00:00", threads=children)
+            self.assertEqual(result.status, "invalid_request")
+        self.assertEqual(self.runtime.hold_calls, [])
+
+    def test_invalid_output_schema_does_not_initialize_host(self):
+        from unittest.mock import Mock
+        provisioner = Mock()
+        control = JarvisControl(object(), object(), provisioner, loop_controller=self.controller)
+        receipt = control.loop(action="start", request_id="invalid-schema", project="test", title="test",
+            prompt="test", target_thread_count=1, max_rounds=1, expires_at="2099-01-01T00:00:00+00:00",
+            threads=[{"slot": "one", "lane": {"candidate_ids": [1], "database_path": "test.sqlite",
+                "output_boundary": "outputs", "result_verification": {
+                    "receipt_paths": {"1": "receipt.json"}, "terminal_statuses": ["completed"],
+                    "output_schema": {"properties": {"score": {"type": "invalid"}}}}}}])
+        self.assertEqual(receipt["status"], "invalid_request")
+        self.assertIn("/properties/score/type", receipt["reason"])
+        provisioner.ensure_hold_host_ready.assert_not_called()
+        provisioner.provision.assert_not_called()
+
+    def test_optional_output_schema_is_validated_and_persisted_before_dispatch(self):
+        for index, schema in enumerate((None, {"type": "invalid"}, {"$ref": "https://example.invalid"},
+                                        False, True, {"type": "object"})):
+            with self.subTest(schema=schema):
+                runtime = FakeRuntime()
+                before = len(list(Path(self.temp.name).rglob("state.json")))
+                result = self.controller.start(runtime, request_id=f"schema-{index}", project="test", title="test",
+                    prompt="test", max_rounds=1, target_thread_count=1, expires_at="2099-01-01T00:00:00+00:00",
+                    threads=[{"slot": "one", "lane": {"candidate_ids": [1], "database_path": "test.sqlite",
+                        "output_boundary": "outputs", "result_verification": {
+                            "receipt_paths": {"1": "receipt.json"}, "terminal_statuses": ["completed"],
+                            "output_schema": schema}}}])
+                if index < 3:
+                    self.assertEqual(result.status, "invalid_request")
+                    self.assertEqual(runtime.hold_calls, [])
+                    self.assertEqual(runtime.heartbeat_calls, [])
+                    self.assertEqual(len(list(Path(self.temp.name).rglob("state.json"))), before)
+                else:
+                    self.assertEqual(result.status, "running")
+                    self.assertEqual(runtime.hold_calls[0]["input_binding"]["result_verification"]["output_schema"], schema)
+                    saved = self.controller._store.load(result.loop_id)
+                    self.assertEqual(saved["children"][0]["lane"]["result_verification"]["output_schema"], schema)
+
+    def test_stale_tick_cannot_overwrite_a_persisted_stop(self):
+        started = self.controller.start(self.runtime, request_id="stop-race", project="test", title="test", prompt="test",
+                                        target_thread_count=1, max_rounds=2, expires_at="2099-01-01T00:00:00+00:00")
+        stale_tick = self.controller._store.load(started.loop_id)
+        self.runtime.stop_hold = lambda _: {"status": "stop_requested"}
+        self.controller.stop(self.runtime, loop_id=started.loop_id)
+        self.controller._store.save(started.loop_id, stale_tick)
+        persisted = self.controller._store.load(started.loop_id)
+        self.assertEqual(persisted["status"], "stopping")
+        self.assertEqual(persisted["cleanup"]["target"], "stopped")
+
+    def test_pilot_and_remaining_lane_use_new_requests_and_fresh_budgets(self):
+        for request_id, candidates in (("pilot", [7]), ("remaining", [9, 11])):
+            started = self.controller.start(self.runtime, request_id=request_id, project="test", prompt="test",
+                max_rounds=len(candidates), max_turns=len(candidates), target_thread_count=1,
+                expires_at="2099-01-01T00:00:00+00:00", threads=[{
+                    "slot": "worker-1", "acquire": "resume", "task_id": "same-task", "lane": {
+                        "candidate_ids": candidates, "database_path": "unused.sqlite", "output_boundary": "unused",
+                        "result_verification": {"receipt_paths": {str(value): f"{value}.json" for value in candidates},
+                                                "terminal_statuses": ["completed"]}}}])
+            self.assertEqual(started.status, "running")
+            hold_id = started.data["children"][0]["hold_id"]
+            self.runtime.states[hold_id] = {"status": "turn_limit_reached", "total_turn_count": len(candidates),
+                "thread_id": "same-task", "output_verification": {"status": "verified", "candidate_id": candidates[-1]}}
+            self.assertEqual(self.controller.tick(self.runtime, loop_id=started.loop_id).status, "completed")
+        self.assertEqual([call["max_turns"] for call in self.runtime.hold_calls], [1, 2])
+        self.assertEqual([call["task_id"] for call in self.runtime.hold_calls], ["same-task", "same-task"])
+        self.assertNotEqual(self.runtime.hold_calls[0]["request_id"], self.runtime.hold_calls[1]["request_id"])
+        self.assertTrue(all(call["hold_id"] is None for call in self.runtime.hold_calls))
+
+    def test_new_bound_lane_without_verification_is_rejected(self):
+        result = self.controller.start(self.runtime, request_id="missing-contract", project="test", title="test", prompt="test",
+            max_rounds=1, target_thread_count=1, expires_at="2099-01-01T00:00:00+00:00", threads=[{
+                "slot": "worker-1", "lane": {"candidate_ids": [7], "database_path": "unused", "output_boundary": "unused"}}])
+        self.assertEqual(result.status, "invalid_request")
+        self.assertIn("result_verification", result.reason)
+        self.assertEqual(self.runtime.hold_calls, [])
+
+    def test_new_bound_loop_never_counts_turn_limit_alone_as_business_completion(self):
+        started = self.controller.start(self.runtime, request_id="missing-output", project="test", title="test", prompt="test",
+            max_rounds=1, target_thread_count=1, expires_at="2099-01-01T00:00:00+00:00", threads=[{
+                "slot": "worker-1", "lane": {"candidate_ids": [7], "database_path": "unused", "output_boundary": "unused",
+                    "result_verification": {"receipt_paths": {"7": "7.json"}, "terminal_statuses": ["completed"]}}}])
+        self.runtime.states[started.data["children"][0]["hold_id"]] = {"status": "turn_limit_reached", "total_turn_count": 1}
+        result = self.controller.tick(self.runtime, loop_id=started.loop_id)
+        self.assertEqual(result.status, "blocked")
+        self.assertEqual(result.data["children"][0]["business_status"], "unverified")
+
+    def test_stop_round_boundary_uses_real_adapter_host_and_releases_only_its_hold(self):
+        import threading
+        from unittest.mock import patch
+        from tests.jarvis_runtime.test_jarvis_task_hold_host import FakeClient, FakeConfig, TerminalGateClient
+        from adapters.codex_app_server.jarvis_hold_host_service import JarvisHoldHost
+        from jarvis_control import TaskProvisionRequest
+
+        class Config(FakeConfig):
+            def resolve_project(self, project):
+                return project, str(Path(self_temp))
+
+        class Heartbeats:
+            heartbeat_available = True
+
+            def invoke(self, request):
+                return SimpleNamespace(status="completed" if request.capability == "heartbeat.cancel" else "active",
+                                       request_id=request.request_id, target_thread_id=None, turn_id=None,
+                                       reason=None, data={})
+
+        self_temp = self.temp.name
+        root = Path(self_temp)
+        adapter = CodexAppServerTaskProvisioningAdapter(root / "unused.json", state_dir=root, config_loader=lambda _: Config())
+        control = JarvisControl(Heartbeats(), object(), adapter, loop_controller=self.controller)
+        started = self.controller.start(control, request_id="boundary", project="test", title="test", prompt="test",
+                                        target_thread_count=1, max_rounds=2, expires_at="2099-01-01T00:00:00+00:00")
+        hold_id = started.data["children"][0]["hold_id"]
+        gate = TerminalGateClient(None)
+        host = JarvisHoldHost(state_dir=root, launcher_config=root / "unused.json")
+        with patch("adapters.codex_app_server.jarvis_task_hold_host.NativeTaskLauncherConfig", return_value=FakeConfig()), patch(
+            "adapters.codex_app_server.jarvis_task_hold_host.AppServerClient", return_value=gate,
+        ):
+            runner = threading.Thread(target=host.run_once)
+            runner.start()
+            try:
+                self.assertTrue(gate.terminal_waiting.wait(timeout=1))
+                stopping = control.loop(action="stop", loop_id=started.loop_id)
+                self.assertEqual(stopping["status"], "stopping")
+                self.assertFalse(stopping["readback"]["terminal"])
+                self.assertFalse(adapter.hold_status(hold_id)["hold_released"])
+                self.assertTrue(json.loads(adapter._existing_paths(hold_id)["request"].read_text(encoding="utf-8"))["stop_requested"])
+            finally:
+                gate.allow_terminal.set()
+                runner.join(timeout=3)
+            self.assertFalse(runner.is_alive())
+        stopped = control.loop(action="status", loop_id=started.loop_id)
+        self.assertEqual(stopped["status"], "stopped")
+        self.assertTrue(stopped["readback"]["terminal"])
+        self.assertEqual(gate.started_turns, [])
+        self.assertTrue(adapter.hold_status(hold_id)["hold_released"])
+        self.assertEqual(stopped["data"]["cleanup"]["host"], "retained")
+        self.assertEqual(control.loop(action="stop", loop_id=started.loop_id)["data"], stopped["data"])
+        adapter.provision(TaskProvisionRequest(request_id="other", project="test", title="test", prompt="test", source_ref="test"))
+        other = FakeClient(None)
+        with patch("adapters.codex_app_server.jarvis_task_hold_host.NativeTaskLauncherConfig", return_value=FakeConfig()), patch(
+            "adapters.codex_app_server.jarvis_task_hold_host.AppServerClient", return_value=other,
+        ):
+            self.assertTrue(host.run_once())
+        self.assertEqual(adapter.hold_status("hold-other")["status"], "turn_limit_reached")
+        self.assertEqual(len(other.created_requests), 1)
+        self.assertEqual(json.loads((root / "hold-host.json").read_text(encoding="utf-8"))["active_count"], 0)
+
+    def test_expiry_and_blocked_sibling_use_the_same_pending_cleanup(self):
+        for target in ("expired", "blocked"):
+            with self.subTest(target=target):
+                stopped = []
+                self.runtime.stop_hold = lambda hold_id: stopped.append(hold_id) or {"status": "stop_requested"}
+                started = self.controller.start(self.runtime, request_id=target, project="test", title="test", prompt="test",
+                                                target_thread_count=2, max_rounds=2, expires_at="2099-01-01T00:00:00+00:00")
+                children = started.data["children"]
+                if target == "expired":
+                    state = self.controller._store.load(started.loop_id)
+                    state["expires_at"] = "2000-01-01T00:00:00+00:00"
+                    self.controller._store.save(started.loop_id, state)
+                else:
+                    self.runtime.states[children[0]["hold_id"]] = {"status": "blocked", "thread_id": "thread-1"}
+                pending = self.controller.tick(self.runtime, loop_id=started.loop_id)
+                if target == "blocked":
+                    self.assertEqual(pending.status, "running")
+                    self.assertEqual(stopped, [])
+                    self.assertEqual(pending.data["children"][0]["phase"], "blocked")
+                    # A seat-local block cannot stop its still-running sibling.
+                    self.runtime.states[children[1]["hold_id"]] = {"status": "completed"}
+                    pending = self.controller.tick(self.runtime, loop_id=started.loop_id)
+                    self.assertEqual(pending.status, "blocked")
+                    self.assertEqual(pending.data["business_status"], "review")
+                    continue
+                self.assertEqual(pending.status, "finalizing")
+                self.assertEqual(pending.data["cleanup"]["target"], target)
+                self.assertEqual(set(stopped), {child["hold_id"] for child in children})
+                for child in children:
+                    self.runtime.states[child["hold_id"]] = {"status": "cancelled", "thread_id": "thread-1", "hold_released": True}
+                self.controller.reconcile(self.runtime)
+                self.assertEqual(self.controller._store.load(started.loop_id)["status"], target)
+                self.assertEqual(len(stopped), 2)
+
+    def test_old_bound_loop_is_explicitly_unverified_without_rewriting_its_binding(self):
+        started = self.controller.start(self.runtime, request_id="legacy-bound", project="test", title="test", prompt="test",
+                                        target_thread_count=1, max_rounds=1, expires_at="2099-01-01T00:00:00+00:00")
+        state = self.controller._store.load(started.loop_id)
+        lane = {"candidate_ids": [7], "database_path": "legacy.sqlite", "output_boundary": "legacy-output"}
+        state["children"][0]["lane"] = lane
+        self.controller._store.save(started.loop_id, state)
+        self.runtime.states[state["children"][0]["hold_id"]] = {"status": "turn_limit_reached", "thread_id": "thread-1"}
+        result = self.controller.status(self.runtime, loop_id=started.loop_id)
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(result.data["children"][0]["business_status"], "legacy_unverified")
+        self.assertEqual(result.data["children"][0]["lane"], lane)
+
+    def test_first_existing_task_acquire_does_not_invent_a_hold(self):
+        self.controller.start(
+            self.runtime, request_id="first-resume", project="Jarvis4codex", prompt="test",
+            target_thread_count=1, max_rounds=1, expires_at="2099-01-01T00:00:00+00:00",
+            threads=[{"slot": "worker-1", "acquire": "resume", "task_id": "existing-task"}],
+        )
+        self.assertIsNone(self.runtime.hold_calls[0]["hold_id"])
+
+    def test_stop_waits_for_persistent_hold_terminal_readback(self):
+        stopped_holds = []
+        self.runtime.stop_hold = lambda hold_id: stopped_holds.append(hold_id) or {"status": "stop_requested"}
+        started = self.controller.start(
+            self.runtime, request_id="stop-boundary", project="Jarvis4codex", title="Worker", prompt="test",
+            target_thread_count=1, max_rounds=2, expires_at="2099-01-01T00:00:00+00:00",
+        )
+        stopping = self.controller.stop(self.runtime, loop_id=started.loop_id)
+        self.assertEqual(stopping.status, "stopping")
+        self.assertEqual(stopped_holds, [started.data["children"][0]["hold_id"]])
+
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.runtime = FakeRuntime()
@@ -120,7 +436,7 @@ class JarvisLoopContractTest(unittest.TestCase):
         prompt = (
             "你是本次 Jarvis Worker。\n\n"
             "执行、续跑和回执规则，必须严格遵守 $jarvis-run-controller。\n"
-            "处理公司和完成本次业务工作，必须严格遵守 $bd-search-stage6-research。\n\n"
+            "处理任务项并完成本次工作，必须严格遵守 $bd-search-stage6-research。\n\n"
             "任务：从 1 数到 20"
         )
         started = self.controller.start(
@@ -145,7 +461,7 @@ class JarvisLoopContractTest(unittest.TestCase):
 
         prompt = self.runtime.hold_calls[0]["prompt"]
         self.assertTrue(prompt.endswith("任务：从 1 数到 20。"))
-        self.assertNotIn("binding 中的一家公司", prompt)
+        self.assertNotIn("binding 中的一个任务项", prompt)
         self.assertEqual(started.data["children"][0]["prompt"], prompt)
 
     def test_loop_delegates_unbound_auto_continue_to_holder(self):
@@ -213,6 +529,7 @@ class JarvisLoopContractTest(unittest.TestCase):
 
     def test_loop_exposes_one_stable_lane_candidate_per_worker_turn(self):
         lane = {"candidate_ids": [7, 9], "database_path": "C:/collection.sqlite", "output_boundary": "C:/outputs/worker-1"}
+        lane["result_verification"] = {"receipt_paths": {"7": "7.json", "9": "9.json"}, "terminal_statuses": ["completed"]}
         started = self.controller.start(
             self.runtime, request_id="lane", project="Jarvis4codex", title="Worker", prompt="test task",
             business_skill="marketing-collection-mining", target_thread_count=1, max_rounds=2,
@@ -225,7 +542,7 @@ class JarvisLoopContractTest(unittest.TestCase):
         self.assertTrue(self.runtime.hold_calls[0]["auto_continue"])
         self.assertEqual(self.runtime.hold_calls[0]["max_turns"], 2)
         self.assertEqual(started.data["children"][0]["lane"], lane)
-        self.assertIn("每个 Worker 回合仅处理 binding 中的一家公司", self.runtime.hold_calls[0]["prompt"])
+        self.assertIn("每个 Worker 回合仅处理 binding 中的一个任务项", self.runtime.hold_calls[0]["prompt"])
 
     def test_loop_completes_uneven_lanes_without_an_unbound_extra_turn(self):
         lanes = [
@@ -240,6 +557,8 @@ class JarvisLoopContractTest(unittest.TestCase):
                 {"slot": f"worker-{number}", "acquire": "create", "title": "Worker", "lane": {
                     "candidate_ids": lane, "database_path": "C:/collection.sqlite",
                     "output_boundary": f"C:/outputs/worker-{number}",
+                    "result_verification": {"receipt_paths": {str(value): f"{value}.json" for value in lane},
+                                            "terminal_statuses": ["completed"]},
                 }}
                 for number, lane in enumerate(lanes, 1)
             ],
@@ -248,6 +567,7 @@ class JarvisLoopContractTest(unittest.TestCase):
         for child, lane in zip(started.data["children"], lanes):
             self.runtime.states[child["hold_id"]] = {
                 "status": "turn_limit_reached", "thread_id": "thread-1", "total_turn_count": len(lane),
+                "output_verification": {"status": "verified", "candidate_id": lane[-1]},
             }
         result = self.controller.status(self.runtime, loop_id=started.loop_id)
 
@@ -502,8 +822,10 @@ class JarvisLoopContractTest(unittest.TestCase):
                 "lane": {
                     "optional": True,
                     "candidate_ids": "unique positive integers",
+                    "batch_size": "optional positive integer, default 1; any size, tail batch uses remaining IDs",
                     "database_path": "non-empty path",
                     "output_boundary": "non-empty path",
+                    "result_verification": "receipt_paths by candidate id and explicit terminal_statuses; optional output_schema (Draft 2020-12, document-local refs, no $id)",
                     "lane_identity": "read-only worker slot injected by Loop",
                     "lane_item_count": "read-only total candidate count injected by Loop",
                 },
@@ -540,11 +862,12 @@ class JarvisLoopContractTest(unittest.TestCase):
         arguments = {argument.arg for argument in functions[0].args.args}
         self.assertTrue({"model", "reasoning_effort", "notifications", "business_skill", "controller_skill"}.issubset(arguments))
         self.assertIn("prompt", arguments)
-        self.assertNotIn("continue_prompt", arguments)
+        self.assertTrue({"continue_prompt", "turns_per_thread"}.issubset(arguments))
         loop_calls = [node for node in ast.walk(functions[0]) if isinstance(node, ast.Call)
                       and isinstance(node.func, ast.Attribute) and node.func.attr == "loop"]
         self.assertEqual(len(loop_calls), 1)
         forwarded = {keyword.arg for keyword in loop_calls[0].keywords}
+        self.assertTrue({"continue_prompt", "turns_per_thread"}.issubset(forwarded))
         self.assertTrue({"model", "reasoning_effort", "notifications", "prompt", "business_skill", "controller_skill"}.issubset(forwarded))
 
 

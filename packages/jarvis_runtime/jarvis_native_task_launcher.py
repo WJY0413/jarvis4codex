@@ -1191,16 +1191,21 @@ class AppServerClient:
         turn_id: str,
         *,
         wait_forever: bool = False,
+        control_poll: Callable[[], None] | None = None,
     ) -> dict[str, Any]:
         deadline = None if wait_forever else (
             time.monotonic() + self.config.turn_completion_timeout_seconds
         )
         while deadline is None or time.monotonic() < deadline:
+            if control_poll is not None:
+                control_poll()
             remaining = (
                 self.config.poll_seconds
                 if deadline is None
                 else max(deadline - time.monotonic(), 0.05)
             )
+            if control_poll is not None:
+                remaining = min(remaining, 0.25)
             try:
                 item = self.notifications.get(timeout=remaining)
             except queue.Empty:

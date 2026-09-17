@@ -1,6 +1,8 @@
 from pathlib import Path
 import tempfile
 import unittest
+import hashlib
+import json
 
 from jarvis_codex_bridge import (
     CapabilityRequest,
@@ -63,6 +65,23 @@ class FakeHeartbeatControl:
 
 
 class CodexBridgeContractTest(unittest.TestCase):
+    def test_legacy_monitor_fingerprints_do_not_replay_or_trust_observer_interruptions(self):
+        for raw_status, execution_status, expected in (
+            ("completed", "completed", "no_change"),
+            ("interrupted", "unknown", "active_or_unknown_changed"),
+        ):
+            with self.subTest(raw_status=raw_status), tempfile.TemporaryDirectory() as temp:
+                legacy = {"thread_id": "thread-1", "thread_status": "notLoaded",
+                          "turn_id": "turn-1", "turn_status": raw_status}
+                fingerprint = hashlib.sha256(json.dumps(legacy, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+                path = Path(temp) / "monitor.json"
+                path.write_text(json.dumps({"version": 2, "fingerprint": fingerprint, "event": "terminal_changed"}))
+                state = ThreadState("thread-1", "notLoaded", (TurnState("turn-1", raw_status),),
+                                    read_source="native_observer", execution_status=execution_status)
+                monitor = ThreadTerminalMonitor(FakeTransport(state), path)
+                self.assertEqual(monitor.observe("m", ReceiptRoute("thread-1", "parent")).state, expected)
+                self.assertEqual(json.loads(path.read_text())["version"], 2)
+
     def test_terminal_then_one_idempotent_same_thread_resume(self):
         state = ThreadState("thread-1", "idle", (TurnState("turn-1", "completed"),))
         transport = FakeTransport(state)

@@ -19,6 +19,9 @@ from jarvis_control.provisioning import (
     TaskProvisionReceipt,
     TaskProvisionRequest,
     observed_now,
+    validate_saved_output,
+    lane_batch_ids,
+    lane_batch_size,
 )
 
 
@@ -54,6 +57,7 @@ class CodexAppServerTaskProvisioningAdapter:
             _write_json(paths["request"], {
                 "mode": "create",
                 "request_id": request.request_id,
+                "source_ref": request.source_ref,
                 "hold_id": hold_id,
                 "project": project,
                 "project_path": str(project_path),
@@ -150,7 +154,7 @@ class CodexAppServerTaskProvisioningAdapter:
             started = self._host_initializer(
                 state_dir=self._state_dir,
                 launcher_config=self._config_path,
-                workers=required_workers,
+                workers=max(1, required_workers),
                 poll_seconds=2.0,
                 wait_seconds=15.0,
             )
@@ -163,16 +167,36 @@ class CodexAppServerTaskProvisioningAdapter:
 
     def resume_with_monitor(self, request: TaskMonitorResumeRequest) -> TaskProvisionReceipt:
         try:
+            input_binding = dict(request.input_binding or {})
             config = self._config_loader(self._config_path)
             hold_id = request.hold_id or request.monitor_id or f"hold-{request.request_id}"
             if request.hold_id or request.monitor_id:
                 previous = self.hold_status(hold_id)
                 if str(previous.get("status") or "") in {"accepted", "holding", "running"}:
                     raise RuntimeError("hold already owns an active turn")
+                if previous.get("thread_id") != request.task_id or previous.get("hold_released") is not True:
+                    raise RuntimeError("existing Hold identity or terminal release is unverified")
                 existing_total = _positive_int(previous.get("total_turn_count")) or _positive_int(previous.get("turn_count")) or 0
+                previous_paths = self._existing_paths(hold_id)
+                saved_request = _read_json_file(previous_paths["request"]) if previous_paths else None
+                saved_binding = (saved_request or {}).get("input_binding") or {}
+                if "result_verification" in saved_binding or "result_verification" in (request.input_binding or {}):
+                    if (not saved_request or "result_verification" not in saved_binding
+                            or previous.get("output_verification", {}).get("status") != "verified"
+                            or verify_candidate_output(saved_request, existing_total).get("status") != "verified"):
+                        raise RuntimeError("bound Hold current candidate is unverified; use a new request including the unfinished item")
+                if "output_schema" in saved_binding.get("result_verification", {}) or "lane_item_count" in saved_binding:
+                    if input_binding and input_binding != saved_binding:
+                        raise RuntimeError("existing Hold batch/output_schema binding cannot change on resume; use a new request")
+                    input_binding = dict(saved_binding)
                 max_turns = _positive_int(previous.get("max_turns")) or request.max_turns
                 initial_turn_count = 1
                 initial_total_turn_count = existing_total + 1
+                if "lane_item_count" in input_binding:
+                    # Total count indexes the finite lane; Monitor budgets this session only.
+                    lane_batch_ids(input_binding, initial_total_turn_count)
+                    size = lane_batch_size(input_binding)
+                    max_turns = (len(input_binding["candidate_ids"]) + size - 1) // size - existing_total
             else:
                 max_turns = request.max_turns
                 initial_turn_count = 1
@@ -182,6 +206,7 @@ class CodexAppServerTaskProvisioningAdapter:
             _write_json(paths["request"], {
                 "mode": "resume",
                 "request_id": request.request_id,
+                "source_ref": request.source_ref,
                 "hold_id": hold_id,
                 "thread_id": request.task_id,
                 "prompt": request.prompt,
@@ -191,7 +216,7 @@ class CodexAppServerTaskProvisioningAdapter:
                 "auto_continue": request.auto_continue,
                 "continue_prompt": request.continue_prompt,
                 "notifications": dict(request.notifications or {}),
-                "input_binding": dict(request.input_binding or {}),
+                "input_binding": input_binding,
                 "turn_history_path": str(self._state_dir / "turn-history.sqlite"),
                 "initial_turn_count": initial_turn_count,
                 "initial_total_turn_count": initial_total_turn_count,
@@ -258,12 +283,105 @@ class CodexAppServerTaskProvisioningAdapter:
                 if path.is_file():
                     value = json.loads(path.read_text(encoding="utf-8"))
                     if isinstance(value, dict):
-                        return value
+                        binding = (_read_json_file(root / "request.json") or {}).get("input_binding") or {}
+                        if "lane_item_count" in binding and "result_verification" not in binding:
+                            value.setdefault("output_verification", {"status": "legacy_unverified"})
+                        terminal = str(value.get("status") or "") in {
+                            "completed", "failed", "interrupted", "cancelled", "canceled", "turn_limit_reached", "blocked",
+                        }
+                        return {**value, "hold_released": (
+                            terminal and path.name == "result.json" and value.get("terminal_confirmed", True) is True
+                            and not (root / ".user-host-claim").exists()
+                        )}
         raise RuntimeError("hold state was not found")
 
     def monitor_status(self, monitor_id: str) -> dict[str, Any]:
         """Compatibility alias for lifecycle callers using the old field name."""
         return self.hold_status(monitor_id)
+
+    def thread_execution_evidence(self, thread_id: str, turn_id: str) -> dict[str, Any] | None:
+        """Read existing owner receipts; a claim/PID never proves a running turn."""
+        matches = []
+        for name in ("task-holds", "task-monitors"):
+            parent = self._state_dir / name
+            if not parent.is_dir():
+                continue
+            for root in parent.iterdir():
+                if not root.is_dir():
+                    continue
+                request = _read_json_file(root / "request.json") or {}
+                ack = _read_json_file(root / "ack.json") or {}
+                result = _read_json_file(root / "result.json") or {}
+                if thread_id not in {request.get("thread_id"), ack.get("thread_id"), result.get("thread_id")}:
+                    continue
+                historical_identity = {"request_id": request.get("request_id"), "thread_id": thread_id,
+                                       "turn_id": ack.get("turn_id")}
+                if request.get("hold_id"):
+                    historical_identity["hold_id"] = request["hold_id"]
+                if (turn_id and ack.get("turn_id") and ack["turn_id"] != turn_id
+                        and request.get("request_id") and request.get("thread_id") in (None, "", thread_id)
+                        and all(ack.get(k) == v and result.get(k) == v for k, v in historical_identity.items())
+                        and result.get("terminal_confirmed") is True
+                        and result.get("status") in {"completed", "failed", "interrupted", "cancelled",
+                                                     "canceled", "blocked", "turn_limit_reached"}
+                        and not (root / ".user-host-claim").exists()
+                        and _read_json_file(root / "request.json") == request
+                        and _read_json_file(root / "ack.json") == ack):
+                    continue  # A released older Hold does not own a later ordinary native turn.
+                matches.append((root, request, ack, result))
+        if not matches:
+            return None
+        unknown = {"status": "unknown", "source": "hold_evidence", "thread_id": thread_id,
+                   "turn_id": turn_id, "reason": "no unambiguous current owner terminal evidence"}
+        if any(request.get("thread_id") and request["thread_id"] != thread_id for _, request, _, _ in matches):
+            return {**unknown, "reason": "current Hold request thread identity mismatch"}
+        exact = [row for row in matches if row[2].get("turn_id") == turn_id]
+        if len(exact) != 1 or not turn_id:
+            return unknown
+        root, request, ack, result = exact[0]
+        if any(other != root and not saved.get("terminal_confirmed")
+               for other, _, _, saved in matches):
+            return unknown
+        owner = _read_json_file(root / ".user-host-claim" / "owner.json") or {}
+        pid = owner.get("pid")
+        alive = self._pid_alive(pid) if isinstance(pid, int) and pid > 0 else None
+        evidence = {**unknown, "hold_id": request.get("hold_id") or request.get("monitor_id"),
+                    "owner_pid": pid, "owner_alive": alive, "owner_status": ack.get("status")}
+        if alive is False:
+            evidence["reason"] = "owner process is not alive; current turn outcome is unknown"
+        identity = {"request_id": request.get("request_id"), "thread_id": thread_id, "turn_id": turn_id}
+        if request.get("hold_id"):
+            identity["hold_id"] = request["hold_id"]
+        if (not identity["request_id"] or any(ack.get(k) != v or result.get(k) != v for k, v in identity.items())
+                or result.get("terminal_confirmed") is not True):
+            return evidence
+        if (_read_json_file(root / "request.json") != request
+                or _read_json_file(root / "ack.json") != ack):
+            return {**unknown, "reason": "owner state changed during read"}
+        status = str(result.get("status") or "").lower()
+        verification = result.get("output_verification") or {}
+        if verification.get("status") == "blocked":
+            status = "blocked"
+        elif status == "turn_limit_reached":
+            status = "completed"
+        if status not in {"completed", "failed", "cancelled", "canceled", "interrupted", "blocked"}:
+            return evidence
+        return {**evidence, "status": status, "source": "hold_terminal_result",
+                "reason": result.get("reason"), "output_verification": verification,
+                "terminal_confirmed": True}
+
+    def request_hold_stop(self, hold_id: str) -> dict[str, Any]:
+        """Latch stop intent in the existing request, serialized with turn dispatch."""
+        paths = self._existing_paths(hold_id)
+        if paths is None:
+            raise RuntimeError("hold state was not found")
+        with ProcessLock(paths["request"].with_suffix(".lock"), owner_alive=self._pid_alive):
+            request = json.loads(paths["request"].read_text(encoding="utf-8"))
+            if str(request.get("hold_id") or request.get("monitor_id") or "") != hold_id:
+                raise RuntimeError("stop request hold identity mismatch")
+            if not request.get("stop_requested"):
+                _write_json(paths["request"], {**request, "stop_requested": True})
+        return {"status": "stop_requested", "hold_id": hold_id}
 
     def read_turn_history(
         self, *, task_id: str | None = None, hold_id: str | None = None,
@@ -352,6 +470,93 @@ class CodexAppServerTaskProvisioningAdapter:
         })
 
 
+def verify_candidate_output(request: dict[str, Any], turn_number: int) -> dict[str, Any]:
+    """Verify every real ID in this turn before declaring a batch complete."""
+    binding = request.get("input_binding") or {}
+    if "lane_item_count" not in binding:
+        return {"status": "not_required"}
+    try:
+        ids = lane_batch_ids(binding, turn_number)
+        if lane_batch_size(binding) == 1:
+            return _verify_candidate_output_item(request, turn_number, ids[0])
+        identity = {"candidate_ids": ids, "request_id": request["request_id"], "turn_number": turn_number}
+        items = []
+        for candidate in ids:
+            checked = _verify_candidate_output_item(request, turn_number, candidate)
+            items.append(checked)
+            if checked.get("status") == "blocked":
+                return {"status": "blocked", **identity, "items": items,
+                        "reason": f"batch candidate {candidate} unverified: "
+                                  f"{checked.get('reason') or checked.get('terminal_status') or checked.get('status')}"}
+        return {"status": "review" if any(item["status"] == "review" for item in items) else "verified",
+                **identity, "items": items}
+    except (ValueError, KeyError, TypeError, IndexError) as exc:
+        return {"status": "blocked", "reason": f"candidate_output_unverified: {exc}"}
+
+
+def _verify_candidate_output_item(request: dict[str, Any], turn_number: int, candidate: int) -> dict[str, Any]:
+    """Read the bound business receipt and saved JSON output; never infer from text."""
+    binding = request.get("input_binding") or {}
+    if "lane_item_count" not in binding:
+        return {"status": "not_required"}
+    contract = binding.get("result_verification")
+    if contract is None:
+        return {"status": "legacy_unverified", "reason": "bound request predates saved-output verification"}
+    expected = {"candidate_id": candidate, "request_id": request["request_id"], "turn_number": turn_number}
+    evidence: dict[str, Any] = {}
+    safety_error = False
+    try:
+        boundary = Path(binding["output_boundary"]).resolve(strict=True)
+
+        def read_output(value: str) -> tuple[Path, dict[str, Any]]:
+            nonlocal safety_error
+            path = Path(value)
+            path = (path if path.is_absolute() else boundary / path).resolve()
+            if not path.is_relative_to(boundary):
+                safety_error = True
+                raise ValueError("output path is outside the allowed boundary")
+            raw = path.read_text(encoding="utf-8-sig")
+            evidence[str(path)] = raw
+            data = json.loads(raw)
+            if not isinstance(data, dict):
+                raise ValueError("saved output must be a JSON object")
+            if (type(data.get("candidate_id")) not in {int, str}
+                    or str(data["candidate_id"]) != str(candidate)):
+                safety_error = True
+                raise ValueError("saved candidate_id does not match current candidate")
+            return path, data
+
+        receipt_path, receipt = read_output(contract["receipt_paths"][str(candidate)])
+        output_path, output = read_output(receipt["output_path"])
+        allowed = contract["terminal_statuses"]
+        if not isinstance(allowed, list) or not allowed or any(
+            not isinstance(value, str) or not value.strip() or value.casefold() in
+            {"accepted", "holding", "running", "pending", "inprogress", "queued"} for value in allowed
+        ):
+            raise ValueError("terminal_statuses must explicitly name valid business terminal states")
+        for label, data in (("receipt", receipt), ("output", output)):
+            for key, value in expected.items():
+                if type(data.get(key)) is not type(value) or data.get(key) != value:
+                    raise ValueError(f"{label} {key} does not match current candidate/run/turn")
+            if data.get("status") not in allowed:
+                raise ValueError(f"{label} has no allowed terminal status")
+        if receipt["status"] != output["status"]:
+            raise ValueError("receipt and output terminal status mismatch")
+        if "output_schema" in contract:
+            validate_saved_output(contract["output_schema"], output)
+        if receipt["status"].strip().casefold() in {
+            "failed", "blocked", "partial", "partially_completed", "incomplete", "error",
+            "cancelled", "canceled", "interrupted",
+        }:
+            raise ValueError(f"business terminal status: {receipt['status']}")
+        return {"status": "verified", **expected, "receipt_path": str(receipt_path),
+                "output_path": str(output_path), "terminal_status": receipt["status"]}
+    except (OSError, ValueError, KeyError, TypeError, IndexError) as exc:
+        return {"status": "blocked" if safety_error else "review", **expected,
+                "scheduler_outcome": "blocked" if safety_error else "failed",
+                "reason": f"candidate_output_unverified: {exc}", "original_evidence": evidence}
+
+
 def _write_json(path: Path, value: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
@@ -409,11 +614,14 @@ def append_terminal_turn_history(
     status: str,
     final_answer: str,
     completed_at: str,
+    candidate_ids: list[int] | None = None,
+    output_verification: dict[str, Any] | None = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(path, timeout=10)
     try:
         connection.execute("PRAGMA busy_timeout=10000")
+        connection.execute("BEGIN IMMEDIATE")
         connection.execute(
             """CREATE TABLE IF NOT EXISTS turn_history (
                 hold_id TEXT NOT NULL, turn_id TEXT NOT NULL,
@@ -424,13 +632,19 @@ def append_terminal_turn_history(
                 PRIMARY KEY (hold_id, turn_id)
             )"""
         )
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(turn_history)")}
+        for name in ("candidate_ids_json", "output_verification_json"):
+            if name not in columns:
+                connection.execute(f"ALTER TABLE turn_history ADD COLUMN {name} TEXT")
         connection.execute(
             """INSERT OR IGNORE INTO turn_history(
                 hold_id,turn_id,task_id,request_id,thread_id,turn_number,candidate_id,
-                status,final_answer,has_final_answer,completed_at,recorded_at
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                status,final_answer,has_final_answer,completed_at,recorded_at,candidate_ids_json,output_verification_json
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (hold_id, turn_id, task_id, request_id, thread_id, turn_number, candidate_id,
-             status, final_answer or None, int(bool(final_answer)), completed_at, observed_now().isoformat()),
+             status, final_answer or None, int(bool(final_answer)), completed_at, observed_now().isoformat(),
+             json.dumps(candidate_ids) if candidate_ids is not None else None,
+             json.dumps(output_verification, ensure_ascii=False) if output_verification is not None else None),
         )
         connection.commit()
     finally:
@@ -457,14 +671,25 @@ def read_turn_history(
     connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
     try:
         connection.row_factory = sqlite3.Row
+        connection.execute("BEGIN")
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(turn_history)")}
+        extra = ",candidate_ids_json,output_verification_json" if "candidate_ids_json" in columns else ""
         rows = connection.execute(
             "SELECT task_id,hold_id,request_id,thread_id,turn_id,turn_number,candidate_id,"
-            "status,final_answer,has_final_answer,completed_at,recorded_at FROM turn_history"
+            "status,final_answer,has_final_answer,completed_at,recorded_at" + extra + " FROM turn_history"
             + where + " ORDER BY recorded_at, turn_number", parameters,
         ).fetchall()
     finally:
         connection.close()
-    return [dict(row) for row in rows]
+    result = []
+    for row in rows:
+        value = dict(row)
+        for name in ("candidate_ids", "output_verification"):
+            raw = value.pop(name + "_json", None)
+            if raw is not None:
+                value[name] = json.loads(raw)
+        result.append(value)
+    return result
 
 
 def _accepted_ack(

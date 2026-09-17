@@ -79,6 +79,52 @@ class LocalHeartbeatTest(unittest.TestCase):
         heartbeat = self.store.create(request)["heartbeat"]
         self.assertEqual(heartbeat["function_name"], "JarvisControl.loop_tick")
 
+    def test_loop_transitions_do_not_disable_reconciliation(self) -> None:
+        heartbeat = self.store.create({**self.request(), "function": "JarvisControl.loop_tick", "max_runs": 20})["heartbeat"]
+        for status in ["acquiring"] * 3 + ["stopping", "finalizing"]:
+            result = self.store.record(heartbeat, {"status": status})
+            self.assertEqual(result["outcome"], "function_completed")
+        stored = self.store.get(str(heartbeat["heartbeat_id"]))
+        self.assertEqual(stored["status"], "ACTIVE")
+        self.assertEqual(stored["failure_count"], 0)
+        self.assertEqual(stored["run_count"], 5)
+
+    def test_non_loop_transition_is_still_a_failure(self) -> None:
+        heartbeat = self.store.create(self.request())["heartbeat"]
+        for _ in range(3):
+            self.store.record(heartbeat, {"status": "acquiring"})
+        self.assertEqual(self.store.get(str(heartbeat["heartbeat_id"]))["status"], "FAILED")
+
+    def test_cancel_confirms_existing_terminal_state_without_rewriting_it(self) -> None:
+        for terminal in ("FAILED", "COMPLETED", "CANCELLED", "RETIRED"):
+            with self.subTest(terminal=terminal):
+                heartbeat = self.store.create({**self.request(), "heartbeat_id": terminal})["heartbeat"]
+                with self.store._session() as db:
+                    db.execute("UPDATE jarvis_local_heartbeats SET status=?,next_run_epoch=NULL WHERE heartbeat_id=?", (terminal, terminal))
+                control = JarvisControlHeartbeat(self.config_path)
+                receipt = control.invoke_heartbeat("cancel", "heartbeat.cancel", "test", {"heartbeat_id": terminal})
+                self.assertEqual(receipt["status"], "cancelled" if terminal == "CANCELLED" else "not_required")
+                self.assertEqual(receipt["heartbeat"]["status"], terminal)
+                self.assertIsNone(receipt["heartbeat"]["next_run_epoch"])
+                self.assertEqual(self.store.cancel(terminal), receipt["heartbeat"])
+
+    def test_cancel_missing_or_inconsistently_scheduled_terminal_is_not_success(self) -> None:
+        with self.assertRaisesRegex(ValueError, "heartbeat not found"):
+            self.store.cancel("missing")
+        heartbeat = self.store.create(self.request())["heartbeat"]
+        with self.store._session() as db:
+            db.execute("UPDATE jarvis_local_heartbeats SET status='FAILED'")
+        with self.assertRaisesRegex(ValueError, "not confirmed inactive"):
+            self.store.cancel(str(heartbeat["heartbeat_id"]))
+
+    def test_inflight_result_preserves_cancelled_state_at_run_limit(self) -> None:
+        heartbeat = self.store.create(self.request())["heartbeat"]
+        self.store.cancel(str(heartbeat["heartbeat_id"]))
+        self.store.record(heartbeat, {"status": "completed"})
+        stored = self.store.get(str(heartbeat["heartbeat_id"]))
+        self.assertEqual(stored["status"], "CANCELLED")
+        self.assertIsNone(stored["next_run_epoch"])
+
 
 if __name__ == "__main__":
     unittest.main()

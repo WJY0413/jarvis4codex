@@ -6,7 +6,7 @@ logs, credentials, and every other production state object.
 
 ## Imported source
 
-- Source root: `C:\Users\22524\Documents\Chief of Staff\tools`
+- Source: the previously maintained standalone Jarvis runtime modules.
 - Runtime modules: `packages/jarvis_runtime/`
 - Existing tests: `tests/jarvis_runtime/`
 - Verified source date: 2026-08-21

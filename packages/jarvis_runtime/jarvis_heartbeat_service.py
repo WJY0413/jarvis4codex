@@ -12,7 +12,7 @@ import importlib
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 import ctypes
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -1899,7 +1899,7 @@ class NativeThreadTerminalProbe:
             status = "FAILED"
         elif normalized == "completed" and not last_error:
             status = "TURN_COMPLETED_UNVERIFIED"
-        elif normalized in {"aborted", "canceled", "cancelled", "interrupted"} or (
+        elif normalized in {"aborted", "canceled", "cancelled"} or (
             normalized == "completed" and bool(last_error)
         ):
             status = "NEEDS_ATTENTION"
@@ -1940,6 +1940,8 @@ class NativeThreadTerminalProbe:
             "thread_status": thread_status,
             "last_turn_id": str(last_turn.get("id") or "") if last_turn else None,
             "last_turn_status": last_status if last_turn else None,
+            "read_source": "native_observer",
+            "execution_status": "unknown" if normalized in {"interrupted", "notloaded"} else last_status,
             "error": last_error,
             "started_at": started_at,
             "completed_at": completed_at,
@@ -1990,11 +1992,13 @@ class StandardBridgeHeartbeatTransport:
 
     name = "jarvis-existing-codex-thread"
 
-    def __init__(self, config: HeartbeatConfig, controller: WakeController, bridge: Any):
+    def __init__(self, config: HeartbeatConfig, controller: WakeController, bridge: Any,
+                 *, execution_reader: Callable[[str, str], dict[str, Any] | None] | None = None):
         self.config = config
         self.controller = controller
         self.bridge = bridge
         self.launcher_config = NativeTaskLauncherConfig(config.launcher_config_path)
+        self.execution_reader = execution_reader
 
     def health(self) -> dict[str, object]:
         return {"adapter": self.name, "status": "configured"}
@@ -2015,14 +2019,36 @@ class StandardBridgeHeartbeatTransport:
                 status=WakeController.status_text(turn.get("status")),
                 items=tuple(item for item in (turn.get("items") or []) if isinstance(item, dict)),
                 error=str(turn.get("error")) if turn.get("error") is not None else None,
+                execution_status=("unknown" if WakeController.status_text(turn.get("status")).casefold()
+                                  in {"interrupted", "notloaded"} else WakeController.status_text(turn.get("status"))),
+                execution_source="native_observer",
             )
             for turn in (thread.get("turns") or [])
             if isinstance(turn, dict)
         )
+        execution_status = turns[-1].effective_status if turns else "unknown"
+        execution_source = "native_observer"
+        evidence = None
+        reader = getattr(self, "execution_reader", None)
+        if reader is not None:
+            try:
+                evidence = reader(thread_id, turns[-1].turn_id if turns else "")
+            except Exception as exc:
+                evidence = {"status": "unknown", "source": "hold_evidence", "reason": str(exc)}
+            if evidence is not None:
+                execution_status = str(evidence.get("status") or "unknown")
+                execution_source = str(evidence.get("source") or "hold_evidence")
+                if turns:
+                    turns = (*turns[:-1], replace(turns[-1], execution_status=execution_status,
+                                                 execution_source=execution_source))
         return self.bridge.ThreadState(
             thread_id=thread_id,
             status=WakeController.status_text(thread.get("status")),
             turns=turns,
+            read_source="native_observer",
+            execution_status=execution_status,
+            execution_source=execution_source,
+            execution_evidence=evidence,
         )
 
     def resume_existing(self, request: Any) -> Any:

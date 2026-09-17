@@ -80,6 +80,27 @@ class HoldTurnMonitorTest(unittest.TestCase):
         self.assertEqual(decision.action, "STOP")
         self.assertEqual(decision.reason, "worker_reported_blocked")
 
+    def test_review_cannot_override_explicit_worker_safety_block(self):
+        client = FakeHeldTurnClient(content=
+            "JARVIS_RUN_STATUS: blocked\ncandidate identity cannot be confirmed; cross-company binding detected")
+        decision = HoldTurnMonitor().observe(client, self.request(max_turns=5,
+            verify_output=lambda: {"status": "review", "reason": "missing receipt"}))
+        self.assertEqual(decision.action, "STOP")
+        self.assertEqual(decision.result_status, "blocked")
+        self.assertEqual(decision.reason, "worker_reported_blocked")
+        self.assertIsNone(decision.continue_prompt)
+
+    def test_business_review_without_runtime_control_signal_continues(self):
+        for content in ('{"status":"failed","reason":"schema mismatch"}',
+                        "blocked: schema validation failed",
+                        "Receipt missing after schema validation error; result requires review."):
+            with self.subTest(content=content):
+                decision = HoldTurnMonitor().observe(FakeHeldTurnClient(content=content),
+                    self.request(max_turns=5,
+                        verify_output=lambda: {"status": "review", "reason": "missing receipt"}))
+                self.assertEqual(decision.action, "CONTINUE")
+                self.assertEqual(decision.result_status, "holding")
+
     def test_non_status_use_of_blocked_does_not_stop_the_turn(self):
         client = FakeHeldTurnClient(content="The previous message was not blocked.")
         decision = HoldTurnMonitor().observe(client, self.request())

@@ -1,3 +1,14 @@
+# Jarvis 0.2.2
+
+## Integrated official capability snapshot
+
+- Optional `turns_per_thread` adds bounded thread rotation while preserving logical task identity, lane progress and remaining budgets.
+- Reviewable business output failures do not independently stop scheduling. Explicit runtime safety stops remain authoritative.
+- Host-owned exact-turn stop and recovery requires matching identity, terminal readback, holder/client exit and claim cleanup. Unknown or mismatched evidence remains unreleased; repeat requests are idempotent.
+- Preserve production final-answer JSON intake, existing-thread adoption, notification behavior and explicit worker capacities. Active hosts are not restarted for resizing.
+- Restore portable package dependencies, generic disabled-by-default configuration examples and current installation documentation.
+- Installation, loaded-process activation and release publication are separate checks. Existing MCP connections must be refreshed and healthy work drained before replacing a running source snapshot.
+
 # Jarvis 0.2.0
 
 ## Codex CLI discovery

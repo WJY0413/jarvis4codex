@@ -1,4 +1,4 @@
-# Jarvis MCP v0.2.0 (in progress)
+# Jarvis MCP v0.2.2
 
 ## Scope
 
@@ -6,6 +6,7 @@ The first MCP surface uses the official Python `mcp` SDK over stdio and exposes:
 
 - `jarvis_create`
 - `jarvis_hold`
+- `jarvis_loop`
 - `jarvis_read`
 - `jarvis_resume`
 - `jarvis_monitor`
@@ -30,15 +31,6 @@ Milestone and terminal events are durable but disabled by default. If a verified
 notification adapter is configured, `jarvis_monitor` can deliver pending events
 and records the returned delivery receipt before marking an event sent.
 
-## TEST-only normal-user Host bootstrap
-
-The existing Hold Host entry point accepts `--initialize-user-host` for a
-normal-user TEST bootstrapper. It initializes `task-holds/` and
-`task-monitors/`, validates the explicit `profile` and `expected_codex_home`,
-then reuses a matching fresh Host or starts exactly one Host and waits for a
-matching health readback. MCP does not invoke this entry point or own the Host
-process.
-
 `jarvis_heartbeat` uses a separate local scheduler database and the computer's
 clock; it accepts only bounded structured calls to `JarvisControl.monitor`,
 `JarvisControl.resume`, or `JarvisControl.notify`. It never stores or builds a
@@ -53,3 +45,5 @@ The local TEST installer starts the official stdio entry point with deployed
 existing-thread and task-provisioning adapters. It keeps runtime state under a
 separate MCP state directory. Scheduler state and notification delivery each
 have their own configured adapter and contract tests.
+
+Loop requests accept optional `turns_per_thread` for bounded thread rotation. Host-aware recovery is exposed through the existing Hold Host CLI `--stop-hold` with exact `--thread-id` and `--turn-id` bindings, followed by `--reconcile-hold` for independent readback; inspect `--help` for options. An observer terminal alone is insufficient for release: owner readback, holder/client exit and claim cleanup must independently agree.

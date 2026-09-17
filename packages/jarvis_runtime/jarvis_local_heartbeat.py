@@ -185,7 +185,10 @@ class LocalHeartbeatStore:
         with self._session() as db:
             changed = db.execute("UPDATE jarvis_local_heartbeats SET status='CANCELLED',next_run_epoch=NULL,updated_at=? WHERE heartbeat_id=? AND status='ACTIVE'", (_now().isoformat(), heartbeat_id)).rowcount
         if changed != 1:
-            raise ValueError("active heartbeat not found")
+            existing = self.get(heartbeat_id)
+            if existing["status"] not in TERMINAL or existing["next_run_epoch"] is not None:
+                raise ValueError("heartbeat is not confirmed inactive")
+            return existing
         return self.get(heartbeat_id)
 
     def claim_due(self) -> list[dict[str, Any]]:
@@ -199,12 +202,16 @@ class LocalHeartbeatStore:
 
     def record(self, heartbeat: Mapping[str, Any], result: Mapping[str, Any]) -> dict[str, Any]:
         success = str(result.get("status") or "") in {"completed", "holding", "running", "active", "accepted"}
+        if heartbeat.get("function_name") == "JarvisControl.loop_tick":
+            success = success or result.get("status") in {"acquiring", "stopping", "finalizing"}
         now = _now().isoformat()
         with self._session() as db:
             current = self.get(str(heartbeat["heartbeat_id"]))
             run_count = int(current["run_count"]) + (1 if success else 0)
             failures = 0 if success else int(current["failure_count"]) + 1
-            status = "COMPLETED" if success and run_count >= int(current["max_runs"]) else ("FAILED" if failures >= 3 else current["status"])
+            status = current["status"] if current["status"] in TERMINAL else (
+                "COMPLETED" if success and run_count >= int(current["max_runs"]) else (
+                    "FAILED" if failures >= 3 else current["status"]))
             next_epoch = None if status in TERMINAL else current["next_run_epoch"]
             outcome = "function_completed" if success else "function_failed"
             db.execute("INSERT INTO jarvis_local_heartbeat_runs(heartbeat_id,started_at,completed_at,outcome,receipt_json,error) VALUES (?,?,?,?,?,?)", (heartbeat["heartbeat_id"], now, now, outcome, json.dumps(dict(result), ensure_ascii=False), str(result.get("error") or "")))
@@ -272,7 +279,8 @@ class JarvisControlHeartbeat:
             raise ValueError("local heartbeat update is not implemented; cancel then create a new bounded schedule")
         if capability == "heartbeat.cancel":
             heartbeat = self.store.cancel(str(arguments.get("heartbeat_id") or ""))
-            return {"status": "cancelled", "heartbeat_id": heartbeat["heartbeat_id"], "heartbeat": heartbeat}
+            return {"status": "cancelled" if heartbeat["status"] == "CANCELLED" else "not_required",
+                    "heartbeat_id": heartbeat["heartbeat_id"], "heartbeat": heartbeat}
         raise ValueError("unsupported heartbeat capability")
 
 

@@ -20,7 +20,7 @@ class JarvisMcpServer:
         self.mcp = MCPServer(
             "jarvis-control",
             title="Jarvis Control Plane",
-            version="0.2.0",
+            version="0.2.1",
             instructions=(
                 "Use jarvis_read before a state-changing call when you need capability or thread context. "
                 "Use jarvis_hold for a managed lifecycle: Hold executes turns and Monitor issues a verified "
@@ -120,9 +120,21 @@ class JarvisMcpServer:
             business_skill: Annotated[str | None, Field(description="Optional business Skill to inject into the Worker prompt.")] = None,
             controller_skill: Annotated[str | None, Field(description="Optional controller Skill to inject into the Worker prompt.")] = None,
             target_thread_count: int | None = None,
-            threads: list[dict[str, Any]] | None = None,
+            threads: Annotated[list[dict[str, Any]] | None, Field(
+                description="Optional finite-item lanes; omit lanes for open-ended tasks without fixed batches. lane.batch_size is any positive integer (default 1). lane.result_verification.output_schema validates each saved item JSON using Draft 2020-12, document-local references only, no $id.",
+                json_schema_extra={"anyOf": [{"type": "array", "items": {"type": "object", "properties": {
+                    "lane": {"type": "object", "properties": {
+                        "batch_size": {"type": "integer", "minimum": 1, "default": 1},
+                        "result_verification": {"type": "object", "properties": {
+                            "output_schema": {"type": ["object", "boolean"]},
+                        }},
+                    }},
+                }}}, {"type": "null"}]},
+            )] = None,
             max_rounds: int | None = None,
             max_turns: int | None = None,
+            turns_per_thread: Annotated[int | None, Field(description="Optional positive turn quota per thread, including its first turn. Rotate to a new thread in the same seat; max_rounds remains the total per seat.")] = None,
+            continue_prompt: Annotated[str | None, Field(description="Optional continuation task prompt. New threads use prompt; omitted continuation reuses prompt.")] = None,
             auto_continue: bool | None = None,
             interval_seconds: int | None = None,
             expires_at: str | None = None,
@@ -134,6 +146,7 @@ class JarvisMcpServer:
                 action=action, loop_id=loop_id, request_id=request_id, project=project,
                 title=title, prompt=prompt, business_skill=business_skill, controller_skill=controller_skill, target_thread_count=target_thread_count,
                 threads=threads, max_rounds=max_rounds, max_turns=max_turns,
+                turns_per_thread=turns_per_thread, continue_prompt=continue_prompt,
                 auto_continue=auto_continue, interval_seconds=interval_seconds,
                 expires_at=expires_at, model=model, reasoning_effort=reasoning_effort,
                 notifications=notifications,

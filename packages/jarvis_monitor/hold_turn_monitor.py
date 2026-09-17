@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 
 class HeldTurnClient(Protocol):
@@ -34,6 +34,9 @@ class HoldTurnRequest:
     continuation_enabled: bool
     continue_prompt: str
     notification_policy: NotificationPolicy
+    verify_output: Callable[[], dict[str, Any]] | None = None
+    stop_requested: Callable[[], bool] | None = None
+    control_poll: Callable[[], None] | None = None
 
 
 @dataclass(frozen=True)
@@ -66,7 +69,8 @@ class HoldTurnMonitor:
 
     def observe(self, client: HeldTurnClient, request: HoldTurnRequest) -> HoldTurnDecision:
         terminal = client.wait_for_turn_terminal(
-            request.thread_id, request.turn_id, wait_forever=True
+            request.thread_id, request.turn_id, wait_forever=True,
+            **({"control_poll": request.control_poll} if request.control_poll is not None else {}),
         )
         terminal_status = str(terminal.get("status") or "unknown")
         final_message = ""
@@ -77,7 +81,15 @@ class HoldTurnMonitor:
         command_id = f"monitor:{request.hold_id}:{request.turn_id}:{request.turn_count}"
         if terminal_status != "completed":
             return self._stop(request, command_id, terminal_status, final_message, "non_completed_terminal")
-        if _worker_reported_blocked(final_message):
+        verification = {}
+        if request.verify_output is not None:
+            verification = request.verify_output()
+            if verification.get("status") not in {"verified", "review", "legacy_unverified", "not_required"}:
+                return self._stop(request, command_id, "blocked", final_message,
+                                  str(verification.get("reason") or "candidate_output_unverified"))
+        if request.stop_requested is not None and request.stop_requested():
+            return self._stop(request, command_id, "cancelled", final_message, "stop_requested")
+        if _worker_reported_blocked(final_message, explicit_only=verification.get("status") == "review"):
             return self._stop(request, command_id, "blocked", final_message, "worker_reported_blocked")
         if request.turn_count >= request.max_turns:
             return self._stop(request, command_id, "turn_limit_reached", final_message, "turn_budget_consumed")
@@ -145,6 +157,6 @@ class HoldTurnMonitor:
         ),)
 
 
-def _worker_reported_blocked(final_message: str) -> bool:
-    prefixes = ("jarvis_run_status: blocked", "blocked:", "blocked：")
+def _worker_reported_blocked(final_message: str, *, explicit_only: bool = False) -> bool:
+    prefixes = ("jarvis_run_status: blocked",) if explicit_only else ("jarvis_run_status: blocked", "blocked:", "blocked：")
     return any(line.strip().casefold().startswith(prefixes) for line in final_message.splitlines())

@@ -10,15 +10,19 @@ import os
 from pathlib import Path
 from typing import Any, Mapping, Protocol
 
+from jarvis_runtime.coo_dispatcher_store import ProcessLock
+from .provisioning import output_schema_validator, lane_batch_size, lane_batch_ids
+
 
 ACTIVE = {"accepted", "holding", "running"}
-TERMINAL = {"completed", "failed", "interrupted", "cancelled", "canceled", "turn_limit_reached"}
+TERMINAL = {"completed", "failed", "interrupted", "cancelled", "canceled", "turn_limit_reached", "blocked"}
 
 
 class LoopRuntime(Protocol):
     def hold(self, **kwargs: Any) -> dict[str, Any]: ...
     def monitor(self, **kwargs: Any) -> dict[str, Any]: ...
     def heartbeat(self, **kwargs: Any) -> dict[str, Any]: ...
+    def stop_hold(self, hold_id: str) -> dict[str, Any]: ...
 
 
 @dataclass(frozen=True)
@@ -71,16 +75,29 @@ class LoopStore:
                 loop_ids.append(loop_id)
         return loop_ids
 
-    def save(self, loop_id: str, state: Mapping[str, Any]) -> None:
+    def save(self, loop_id: str, state: dict[str, Any]) -> None:
         path = self._path(loop_id)
         path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-        try:
-            temporary.write_text(json.dumps(dict(state), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-            os.replace(temporary, path)
-        finally:
-            if temporary.exists():
-                temporary.unlink()
+        with ProcessLock(path.with_suffix(".lock")):
+            # A concurrent tick must not undo a persisted terminal/stop intent.
+            if path.exists():
+                latest = self.load(loop_id)
+                prior_cleanup = latest.get("cleanup") or {}
+                incoming_cleanup = state.get("cleanup") or {}
+                if prior_cleanup and (
+                    not incoming_cleanup or prior_cleanup["target"] != incoming_cleanup.get("target")
+                    or (prior_cleanup.get("status") == "completed" and incoming_cleanup.get("status") != "completed")
+                ):
+                    state.clear()
+                    state.update(latest)
+                    return
+            temporary = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+            try:
+                temporary.write_text(json.dumps(dict(state), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+                os.replace(temporary, path)
+            finally:
+                if temporary.exists():
+                    temporary.unlink()
 
     def _path(self, loop_id: str) -> Path:
         safe = "".join(char if char.isalnum() or char in "._-" else "_" for char in loop_id).strip("._")
@@ -113,6 +130,7 @@ class LoopController:
             "schema": "jarvis-loop-state/v1", "loop_id": loop_id, "request_id": request["request_id"],
             "project": request["project"], "max_rounds": request["max_rounds"], "max_turns": request["max_turns"],
             "auto_continue": request["auto_continue"], "continue_prompt": request["continue_prompt"],
+            "turns_per_thread": request["turns_per_thread"],
             "controller_skill": request["controller_skill"], "business_skill": request["business_skill"],
             "model": request["model"], "reasoning_effort": request["reasoning_effort"],
             "notifications": request["notifications"],
@@ -124,24 +142,11 @@ class LoopController:
             child = {**spec, "thread_id": spec.get("task_id"), "hold_id": None, "round": 0,
                      "phase": "acquiring", "lifecycle": None, "last_receipt": None}
             child["holder_owns_continuation"] = bool(request["auto_continue"])
-            receipt = runtime.hold(
-                request_id=f"{loop_id}:{child['slot']}:acquire", prompt=child["prompt"],
-                source_ref=f"jarvis_loop:{loop_id}:{child['slot']}", task_id=child.get("task_id"),
-                project=request["project"] if child["acquire"] == "create" else None,
-                title=child.get("title"), hold_id=None if child["acquire"] == "resume" else f"{loop_id}:{child['slot']}",
-                model=request["model"], reasoning_effort=request["reasoning_effort"],
-                max_turns=_round_limit(child, request["max_rounds"]) if child["holder_owns_continuation"] else request["max_turns"],
-                auto_continue=child["holder_owns_continuation"],
-                continue_prompt=request["continue_prompt"], notifications=request["notifications"],
-                input_binding=_holder_lane_binding(child),
-            )
-            child["last_receipt"] = receipt
-            child["hold_id"] = _nested_text(receipt, "data", "monitor_id") or _nested_text(receipt, "data", "hold_id")
-            child["thread_id"] = receipt.get("target_thread_id") or child["thread_id"]
-            if receipt.get("status") not in ACTIVE or not child["hold_id"]:
-                child["phase"] = "blocked"
-                state["status"] = "blocked"
+            self._acquire(runtime, state, child)
             state["children"].append(child)
+
+        if all(child["phase"] == "blocked" for child in state["children"]):
+            state["status"] = "blocked"
 
         if state["status"] != "blocked":
             heartbeat_id = f"{loop_id}:reconcile"
@@ -162,9 +167,40 @@ class LoopController:
         if state["status"] != "blocked":
             self._observe(runtime, state)
             self._refresh(state)
+        else:
+            self._finish(runtime, state, "blocked")
         self._store.create(loop_id, state)
         self._store.save(loop_id, state)
         return self._result(state)
+
+    @staticmethod
+    def _acquire(runtime: LoopRuntime, state: Mapping[str, Any], child: dict[str, Any]) -> None:
+        offset = child.get("completed_rounds", 0)
+        key = f"{state['loop_id']}:{child['slot']}" + (f":after-{offset}" if offset else "")
+        resume = child["acquire"] == "resume" and not offset
+        budget = (_round_limit(child, state["max_rounds"]) - offset
+                  if child["holder_owns_continuation"] else state["max_turns"])
+        if state.get("turns_per_thread") is not None:
+            budget = min(budget, state["turns_per_thread"], _round_limit(child, state["max_rounds"]) - offset)
+        child["thread_turn_limit"] = budget
+        receipt = runtime.hold(
+            request_id=f"{key}:acquire", prompt=child["prompt"],
+            source_ref=(f"jarvis_loop_task:{state['loop_id']}" if state.get("turns_per_thread") is not None
+                        else f"jarvis_loop:{state['loop_id']}:{child['slot']}"),
+            task_id=child.get("task_id") if resume else None,
+            project=None if resume else state["project"],
+            title=child.get("title") or (f"Jarvis loop {state['request_id']} {child['slot']}" if offset else None),
+            hold_id=None if resume else key,
+            model=state["model"], reasoning_effort=state["reasoning_effort"],
+            max_turns=budget, auto_continue=child["holder_owns_continuation"],
+            continue_prompt=child.get("continue_prompt", child["prompt"] if child.get("lane") else state["continue_prompt"]),
+            notifications=state["notifications"], input_binding=_holder_lane_binding(child),
+        )
+        child["last_receipt"] = receipt
+        child["hold_id"] = _nested_text(receipt, "data", "monitor_id") or _nested_text(receipt, "data", "hold_id")
+        child["thread_id"] = receipt.get("target_thread_id") or (child.get("task_id") if resume else None)
+        child["lifecycle"] = None
+        child["phase"] = "acquiring" if receipt.get("status") in ACTIVE and child["hold_id"] else "blocked"
 
     def tick(self, runtime: LoopRuntime, *, loop_id: str) -> LoopResult:
         return self.status(runtime, loop_id=loop_id)
@@ -174,10 +210,12 @@ class LoopController:
             state = self._store.load(loop_id)
         except ValueError as exc:
             return LoopResult("invalid_request", loop_id, {}, str(exc))
-        if state["status"] not in {"blocked", "completed", "stopped", "expired"}:
+        if state.get("cleanup", {}).get("status") == "pending":
+            self._finish(runtime, state, state["cleanup"]["target"])
+            self._store.save(loop_id, state)
+        elif state["status"] not in {"blocked", "completed", "stopped", "expired"}:
             if _expired(state["expires_at"]):
-                state["status"] = "expired"
-                state["heartbeat"] = self._cancel(runtime, state)
+                self._finish(runtime, state, "expired")
             else:
                 self._observe(runtime, state)
                 if state["auto_continue"]:
@@ -191,14 +229,8 @@ class LoopController:
         """Close Holder-owned terminal slots without scheduling another Worker turn."""
         reconciled: list[dict[str, Any]] = []
         for loop_id in self._store.active_loop_ids():
-            try:
-                state = self._store.load(loop_id)
-            except ValueError:
-                continue
-            if not self._reconcile_holder_terminals(runtime, state):
-                continue
-            self._store.save(loop_id, state)
-            reconciled.append({"loop_id": loop_id, "status": state["status"]})
+            result = self.status(runtime, loop_id=loop_id)
+            reconciled.append({"loop_id": loop_id, "status": result.status})
         return LoopResult("completed", None, {"reconciled": reconciled})
 
     @staticmethod
@@ -214,6 +246,8 @@ class LoopController:
                     "controller_skill": None,
                     "business_skill": None,
                     "max_turns": 999,
+                    "turns_per_thread": None,
+                    "continue_prompt": "same as prompt when omitted",
                     "auto_continue": True,
                     "interval_seconds": 1800,
                     "model": "gpt-5.6-luna",
@@ -229,8 +263,10 @@ class LoopController:
                         "lane": {
                             "optional": True,
                             "candidate_ids": "unique positive integers",
+                            "batch_size": "optional positive integer, default 1; any size, tail batch uses remaining IDs",
                             "database_path": "non-empty path",
                             "output_boundary": "non-empty path",
+                            "result_verification": "receipt_paths by candidate id and explicit terminal_statuses; optional output_schema (Draft 2020-12, document-local refs, no $id)",
                             "lane_identity": "read-only worker slot injected by Loop",
                             "lane_item_count": "read-only total candidate count injected by Loop",
                         },
@@ -245,12 +281,55 @@ class LoopController:
             state = self._store.load(loop_id)
         except ValueError as exc:
             return LoopResult("invalid_request", loop_id, {}, str(exc))
-        state["status"] = "stopped"; state["heartbeat"] = self._cancel(runtime, state)
+        if state.get("cleanup", {}).get("status") == "completed":
+            return self._result(state)
+        self._finish(runtime, state, state.get("cleanup", {}).get("target", "stopped"))
         self._store.save(loop_id, state)
         return self._result(state)
 
+    def _finish(self, runtime: LoopRuntime, state: dict[str, Any], target: str) -> None:
+        """Latch cleanup before effects; all terminal paths drain the same owned Holds."""
+        cleanup = state.setdefault("cleanup", {
+            "target": target, "status": "pending",
+            "host": "retained", "host_reason": "shared_or_unproven_exclusive_ownership",
+        })
+        state["status"] = "stopping" if target == "stopped" else "finalizing"
+        self._store.save(state["loop_id"], state)
+        cleanup = state["cleanup"]
+        if cleanup.get("status") == "completed":
+            return
+        if not cleanup.get("heartbeat_cancelled"):
+            state["heartbeat"] = self._cancel(runtime, state)
+            cleanup["heartbeat_cancelled"] = state["heartbeat"].get("status") in {
+                "completed", "cancelled", "canceled", "not_required",
+            }
+        released = True
+        for child in state["children"]:
+            hold_id = child.get("hold_id")
+            if not hold_id:
+                # Failed acquisition can still have left a persistent queued request.
+                released = released and child.get("last_receipt", {}).get("status") not in ACTIVE
+                continue
+            if child.get("stop_receipt", {}).get("status") != "stop_requested":
+                stopper = getattr(runtime, "stop_hold", None)
+                child["stop_receipt"] = stopper(hold_id) if callable(stopper) else {"status": "unsupported"}
+            receipt = runtime.monitor(action="status", request_id=f"{state['loop_id']}:{child['slot']}:cleanup",
+                                      source_ref=f"jarvis_loop:{state['loop_id']}:{child['slot']}", hold_id=hold_id)
+            child["last_receipt"] = receipt
+            data = receipt.get("data") or {}
+            lifecycle = data.get("lifecycle_status") or data.get("status")
+            child["hold_released"] = (receipt.get("status") == "completed" and lifecycle in TERMINAL
+                                      and data.get("hold_released", True) is True
+                                      and data.get("terminal_confirmed", True) is True)
+            released = released and child["hold_released"]
+        if released and cleanup.get("heartbeat_cancelled"):
+            cleanup["status"] = "completed"
+            state["status"] = cleanup["target"]
+
     def _observe(self, runtime: LoopRuntime, state: dict[str, Any]) -> None:
         for child in state["children"]:
+            if child.get("phase") in {"completed", "blocked"}:
+                continue
             hold_id = child.get("hold_id")
             if not hold_id:
                 continue
@@ -270,7 +349,7 @@ class LoopController:
             elif lifecycle in TERMINAL:
                 if child.get("holder_owns_continuation"):
                     try:
-                        child["round"] = max(int(child.get("round") or 0), int(data.get("total_turn_count") or 0))
+                        child["round"] = max(int(child.get("round") or 0), _completed_turns(child, data, state))
                     except (TypeError, ValueError):
                         pass
                 child["phase"] = "terminal"
@@ -278,7 +357,7 @@ class LoopController:
     def _reconcile_holder_terminals(self, runtime: LoopRuntime, state: dict[str, Any]) -> bool:
         changed = False
         for child in state["children"]:
-            if not child.get("holder_owns_continuation") or child.get("phase") == "completed":
+            if not child.get("holder_owns_continuation") or child.get("phase") in {"completed", "blocked"}:
                 continue
             hold_id = child.get("hold_id")
             if not hold_id:
@@ -296,20 +375,36 @@ class LoopController:
             child["last_receipt"] = receipt
             child["lifecycle"] = lifecycle
             child["thread_id"] = receipt.get("target_thread_id") or data.get("thread_id") or child.get("thread_id")
+            completed_turns = None
             try:
-                child["round"] = max(int(child.get("round") or 0), int(data.get("total_turn_count") or 0))
+                completed_turns = _completed_turns(child, data, state)
+                child["round"] = max(int(child.get("round") or 0), completed_turns)
             except (TypeError, ValueError):
                 pass
             child["phase"] = "completed" if lifecycle in {"completed", "turn_limit_reached"} else "blocked"
+            if state.get("turns_per_thread") is not None and child["phase"] == "completed":
+                if data.get("hold_released") is not True or data.get("terminal_confirmed") is not True:
+                    child["phase"] = "terminal"
+                    continue
+                if completed_turns != child.get("completed_rounds", 0) + child["thread_turn_limit"]:
+                    child["phase"] = "blocked"
+                elif child.get("lane"):
+                    self._check_bound_terminal(child, {**data, "total_turn_count": child["round"]}, rounds=child["round"])
+                if child["phase"] == "completed" and child["round"] < _round_limit(child, state["max_rounds"]):
+                    child["completed_rounds"] = child["round"]
+                    self._acquire(runtime, state, child)
+                changed = True
+                continue
+            if child.get("lane"):
+                self._check_bound_terminal(child, data)
             changed = True
         if not changed:
             return False
-        if any(child.get("phase") == "blocked" for child in state["children"]):
-            state["status"] = "blocked"
-            state["heartbeat"] = self._cancel(runtime, state)
-        elif all(child.get("phase") == "completed" for child in state["children"]):
-            state["status"] = "completed"
-            state["heartbeat"] = self._cancel(runtime, state)
+        if all(child.get("phase") in {"completed", "blocked"} for child in state["children"]):
+            self._finish(runtime, state, "blocked" if any(child.get("phase") == "blocked"
+                         for child in state["children"]) else "completed")
+        else:
+            self._refresh(state)
         return True
 
     def _finalize_observed_terminals(self, runtime: LoopRuntime, state: dict[str, Any]) -> None:
@@ -317,12 +412,11 @@ class LoopController:
             if child.get("phase") != "terminal":
                 continue
             child["phase"] = "completed" if child.get("lifecycle") in {"completed", "turn_limit_reached"} else "blocked"
-        if any(child.get("phase") == "blocked" for child in state["children"]):
-            state["status"] = "blocked"
-            state["heartbeat"] = self._cancel(runtime, state)
-        elif all(child.get("phase") == "completed" for child in state["children"]):
-            state["status"] = "completed"
-            state["heartbeat"] = self._cancel(runtime, state)
+            if child.get("lane"):
+                self._check_bound_terminal(child, child.get("last_receipt", {}).get("data") or {})
+        if all(child.get("phase") in {"completed", "blocked"} for child in state["children"]):
+            self._finish(runtime, state, "blocked" if any(child.get("phase") == "blocked"
+                         for child in state["children"]) else "completed")
         else:
             self._refresh(state)
 
@@ -336,6 +430,26 @@ class LoopController:
         else:
             state["status"] = "running"
 
+    @staticmethod
+    def _check_bound_terminal(child: dict[str, Any], data: Mapping[str, Any], *, rounds: int | None = None) -> None:
+        if "result_verification" not in child["lane"]:
+            child["business_status"] = "legacy_unverified"
+            return
+        verification = data.get("output_verification") or {}
+        candidate_ids = child["lane"]["candidate_ids"]
+        size = lane_batch_size(child["lane"])
+        rounds = rounds or (len(candidate_ids) + size - 1) // size
+        identity_matches = (verification.get("candidate_id") == candidate_ids[rounds - 1] if size == 1 else
+                            verification.get("candidate_ids") == lane_batch_ids(child["lane"], rounds))
+        if (verification.get("status") in {"verified", "review"}
+                and identity_matches and data.get("total_turn_count") == rounds):
+            child["business_status"] = ("review" if verification["status"] == "review"
+                or data.get("scheduler_failed_items") or child.get("business_status") == "review"
+                else "mechanically_verified")
+        else:
+            child["business_status"] = "unverified"
+            child["phase"] = "blocked"
+
     def _cancel(self, runtime: LoopRuntime, state: Mapping[str, Any]) -> dict[str, Any]:
         if not state.get("heartbeat_id") or not state.get("heartbeat"):
             return {"status": "not_required"}
@@ -344,7 +458,9 @@ class LoopController:
 
     @staticmethod
     def _result(state: Mapping[str, Any]) -> LoopResult:
-        data = {key: state.get(key) for key in ("loop_id", "project", "status", "target_thread_count", "heartbeat_id", "heartbeat", "max_rounds", "max_turns", "auto_continue", "continue_prompt", "controller_skill", "business_skill", "model", "reasoning_effort", "notifications", "interval_seconds", "expires_at", "children")}
+        data = {key: state.get(key) for key in ("loop_id", "project", "status", "target_thread_count", "heartbeat_id", "heartbeat", "max_rounds", "max_turns", "turns_per_thread", "auto_continue", "continue_prompt", "controller_skill", "business_skill", "model", "reasoning_effort", "notifications", "interval_seconds", "expires_at", "children", "cleanup")}
+        data["business_status"] = ("review" if any(child.get("business_status") in {"review", "unverified"}
+            or child.get("phase") == "blocked" for child in state["children"]) else "not_evaluated")
         return LoopResult(str(state["status"]), str(state["loop_id"]), data)
 
 
@@ -359,6 +475,9 @@ def _validate_start(raw: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(max_rounds, int) or max_rounds < 1:
         raise ValueError("max_rounds must be a positive integer")
     max_turns = raw.get("max_turns", 999)
+    turns_per_thread = raw.get("turns_per_thread")
+    if turns_per_thread is not None and (type(turns_per_thread) is not int or turns_per_thread < 1):
+        raise ValueError("turns_per_thread must be a positive integer")
     interval = raw.get("interval_seconds", 1800)
     if max_turns is None:
         max_turns = 999
@@ -381,6 +500,9 @@ def _validate_start(raw: Mapping[str, Any]) -> dict[str, Any]:
     task_prompt = str(raw["prompt"]).strip()
     if not task_prompt:
         raise ValueError("prompt is required")
+    continuation = raw.get("continue_prompt")
+    if continuation is not None and (not isinstance(continuation, str) or not continuation.strip()):
+        raise ValueError("continue_prompt must be a non-empty string")
     threads = raw.get("threads")
     if threads is None:
         title = str(raw.get("title") or f"Jarvis loop {raw['request_id']}").strip()
@@ -408,15 +530,38 @@ def _validate_start(raw: Mapping[str, Any]) -> dict[str, Any]:
             database_path = str(lane.get("database_path") or "").strip()
             output_boundary = str(lane.get("output_boundary") or "").strip()
             if (not isinstance(candidate_ids, list) or not candidate_ids
-                    or any(not isinstance(value, int) or value < 1 for value in candidate_ids)
+                    or any(type(value) is not int or value < 1 for value in candidate_ids)
                     or len(set(candidate_ids)) != len(candidate_ids)
                     or not database_path or not output_boundary):
                 raise ValueError("thread lane requires unique positive candidate_ids, database_path, and output_boundary")
-            if max_rounds < len(candidate_ids):
+            batch_size = lane_batch_size(lane)
+            rounds = (len(candidate_ids) + batch_size - 1) // batch_size
+            if max_rounds < rounds:
                 raise ValueError("max_rounds must cover every candidate in each thread lane")
+            verification = lane.get("result_verification")
+            if (not isinstance(verification, Mapping)
+                    or not isinstance(verification.get("receipt_paths"), Mapping)
+                    or set(verification["receipt_paths"]) != {str(value) for value in candidate_ids}
+                    or any(not isinstance(value, str) or not value.strip() for value in verification["receipt_paths"].values())
+                    or not isinstance(verification.get("terminal_statuses"), list)
+                    or not verification["terminal_statuses"]
+                    or any(not isinstance(value, str) or not value.strip() or value.casefold() in
+                           {"accepted", "holding", "running", "pending", "inprogress", "queued"}
+                           for value in verification["terminal_statuses"])):
+                raise ValueError("new bound lanes require result_verification receipt_paths and terminal_statuses")
+            if "output_schema" in verification:
+                output_schema_validator(verification["output_schema"])
+            if batch_size > 1:
+                if len(set(verification["receipt_paths"].values())) != len(candidate_ids):
+                    raise ValueError("batch lanes require separate receipt_paths for every candidate")
             child["lane"] = {"candidate_ids": list(candidate_ids), "database_path": database_path,
-                             "output_boundary": output_boundary}
-        child["prompt"] = _worker_prompt(task_prompt, controller_skill, business_skill, lane_bound="lane" in child)
+                             "output_boundary": output_boundary, "result_verification": dict(verification),
+                             **({"batch_size": batch_size} if "batch_size" in lane else {})}
+        child["prompt"] = _worker_prompt(task_prompt, controller_skill, business_skill, lane_bound="lane" in child,
+                                         batched=lane_batch_size(child.get("lane") or {}) > 1)
+        if continuation is not None:
+            child["continue_prompt"] = _worker_prompt(continuation.strip(), controller_skill, business_skill,
+                lane_bound="lane" in child, batched=lane_batch_size(child.get("lane") or {}) > 1)
         if acquire == "create":
             child["title"] = str(raw_child.get("title") or raw.get("title") or "").strip()
             if not child["title"]:
@@ -426,6 +571,14 @@ def _validate_start(raw: Mapping[str, Any]) -> dict[str, Any]:
             if not child["task_id"]:
                 raise ValueError("resume thread requires task_id")
         normalized.append(child)
+    seen_candidates: set[tuple[str, int]] = set()
+    for child in normalized:
+        lane = child.get("lane")
+        if lane is not None:
+            keys = {(str(Path(lane["database_path"]).resolve()).casefold(), value) for value in lane["candidate_ids"]}
+            if seen_candidates & keys:
+                raise ValueError("thread lanes must not overlap candidate_ids in the same database")
+            seen_candidates.update(keys)
     notifications = raw.get("notifications", True)
     if notifications is None:
         notifications = True
@@ -435,10 +588,12 @@ def _validate_start(raw: Mapping[str, Any]) -> dict[str, Any]:
         notifications = dict(notifications)
     else:
         raise ValueError("notifications must be a boolean or object")
-    continue_prompt = _worker_prompt(task_prompt, controller_skill, business_skill,
-                                     lane_bound=any("lane" in child for child in normalized))
+    continue_prompt = _worker_prompt(continuation.strip() if continuation is not None else task_prompt, controller_skill, business_skill,
+                                     lane_bound=any("lane" in child for child in normalized),
+                                     batched=any(lane_batch_size(child.get("lane") or {}) > 1 for child in normalized))
     return {"request_id": str(raw["request_id"]).strip(), "project": str(raw["project"]).strip(), "threads": normalized,
             "target_thread_count": target_count, "max_rounds": max_rounds, "max_turns": max_turns,
+            "turns_per_thread": turns_per_thread,
             "auto_continue": auto_continue, "continue_prompt": continue_prompt,
             "controller_skill": controller_skill, "business_skill": business_skill,
             "model": str(raw.get("model") or "gpt-5.6-luna").strip() or "gpt-5.6-luna",
@@ -446,45 +601,71 @@ def _validate_start(raw: Mapping[str, Any]) -> dict[str, Any]:
             "notifications": notifications, "interval_seconds": interval, "expires_at": expires.isoformat()}
 
 
-def _worker_prompt(task_prompt: str, controller_skill: str, business_skill: str, *, lane_bound: bool) -> str:
+def _worker_prompt(task_prompt: str, controller_skill: str, business_skill: str, *, lane_bound: bool, batched: bool = False) -> str:
     binding_rule = (
-        "每个 Worker 回合仅处理 binding 中的一家公司；安全写回后输出结构化单公司回执并等待下一回合，"
+        "每个 Worker 回合仅处理 binding 中的一个任务项；安全写回后输出结构化单项回执并等待下一回合，"
         "不得遍历、预取、并行处理或宣称整条 lane 已完成。\n"
+        "按 result_verification 指定位置保存现有 JSON 正式回执，output_path 指向已保存的 JSON 结果；"
+        "两者均须包含本候选 candidate_id、注入的 request_id、turn_number 和约定终态 status。\n"
         if lane_bound else ""
     )
+    if lane_bound and batched:
+        binding_rule = (
+            "每个 Worker 回合仅处理本回合 binding.candidate_ids 中的全部真实任务项 ID，不得预取或处理下批。\n"
+            "每个任务项分别按 receipt_paths 保存 JSON 正式回执及 output_path 指向的 JSON 结果；"
+            "两者均包含该任务项 candidate_id、本回合 request_id、turn_number 和约定终态 status。"
+            "output_schema 仍逐项校验，不校验整批包装。\n"
+            "全部任务项产物和正式回执完成后结束本回合，Holder 按真实 ID 覆盖生成并保存本轮整批核验回执。"
+            "缺项、错项、重复或部分失败不得宣称整批完成；尾批按实际注入数量处理。\n"
+        )
+    if lane_bound:
+        binding_rule += ("仅身份无法确认、串公司、越界或重复执行风险等运行安全异常，单独输出 JARVIS_RUN_STATUS: blocked；"
+                         "普通字段、计数、枚举或业务结果失败使用 failed/review，不输出该运行安全控制行。\n")
     rules = []
     if controller_skill:
         rules.append(f"执行、续跑和回执规则，必须严格遵守 ${controller_skill}。")
     if binding_rule:
         rules.append(binding_rule.rstrip())
     if business_skill:
-        rules.append(f"处理公司和完成本次业务工作，必须严格遵守 ${business_skill}。")
+        rules.append(f"处理任务项并完成本次工作，必须严格遵守 ${business_skill}。")
     rule_text = "\n".join(rules)
     rules_prefix = f"{rule_text}\n\n" if rule_text else ""
     return f"你是本次 Jarvis Worker。\n\n{rules_prefix}任务：{task_prompt}"
 
 
 def _holder_lane_binding(child: Mapping[str, Any]) -> dict[str, Any] | None:
-    """Persist the lane for Holder; Holder exposes only its current candidate to Workers."""
+    """Persist a finite lane; Holder exposes only the current slice to Workers."""
     lane = child.get("lane")
     if not isinstance(lane, Mapping):
         return None
     candidate_ids = lane.get("candidate_ids")
     if not isinstance(candidate_ids, list):
         return None
+    candidate_ids = candidate_ids[child.get("completed_rounds", 0) * lane_batch_size(lane):]
     return {
         "candidate_ids": list(candidate_ids),
         "database_path": lane["database_path"],
         "output_boundary": lane["output_boundary"],
         "lane_identity": child["slot"],
         "lane_item_count": len(candidate_ids),
+        **({"batch_size": lane["batch_size"]} if "batch_size" in lane else {}),
+        **({"result_verification": {**lane["result_verification"], "receipt_paths": {
+            str(value): lane["result_verification"]["receipt_paths"][str(value)] for value in candidate_ids
+        }}} if "result_verification" in lane else {}),
     }
+
+
+def _completed_turns(child: Mapping[str, Any], data: Mapping[str, Any], state: Mapping[str, Any]) -> int:
+    if state.get("turns_per_thread") is not None:
+        return child.get("completed_rounds", 0) + int(data.get("session_turn_count", data.get("turn_count", data.get("total_turn_count"))) or 0)
+    return int(data.get("total_turn_count") or 0)
 
 
 def _round_limit(child: Mapping[str, Any], default: int) -> int:
     lane = child.get("lane")
     if isinstance(lane, Mapping) and isinstance(lane.get("candidate_ids"), list):
-        return len(lane["candidate_ids"])
+        size = lane_batch_size(lane)
+        return (len(lane["candidate_ids"]) + size - 1) // size
     return default
 
 

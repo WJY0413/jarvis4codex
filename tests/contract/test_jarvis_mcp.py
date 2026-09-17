@@ -90,7 +90,22 @@ class JarvisMcpContractTest(unittest.TestCase):
         return asyncio.run(run())
 
     def test_initialize_reports_the_current_mcp_version(self):
-        self.assertEqual(self.server.mcp.version, "0.2.0")
+        self.assertEqual(self.server.mcp.version, "0.2.1")
+
+    def test_loop_mcp_preserves_nested_output_schema(self):
+        from unittest.mock import Mock
+        control = Mock()
+        control.loop.return_value = {"status": "invalid_request", "reason": "capture only"}
+        self.server = JarvisMcpServer(control)
+        schema = {"$defs": {"score": {"type": "integer"}},
+                  "properties": {"score": {"$ref": "#/$defs/score"}}, "required": ["score"]}
+        threads = [{"slot": "one", "lane": {"result_verification": {"output_schema": schema}}}]
+        self.call("jarvis_loop", {"action": "start", "threads": threads})
+        self.assertEqual(control.loop.call_args.kwargs["threads"], threads)
+        tool = next(tool for tool in self.list_tools().tools if tool.name == "jarvis_loop")
+        self.assertIn("output_schema", tool.input_schema["properties"]["threads"]["description"])
+        lane = tool.input_schema["properties"]["threads"]["anyOf"][0]["items"]["properties"]["lane"]
+        self.assertEqual(lane["properties"]["batch_size"], {"type": "integer", "minimum": 1, "default": 1})
 
     def call(self, name, arguments):
         async def run():
@@ -120,7 +135,7 @@ class JarvisMcpContractTest(unittest.TestCase):
         self.assertTrue({"business_skill", "controller_skill"}.issubset(loop_tool.input_schema["properties"]))
         self.assertIn("preflight", loop_tool.input_schema["properties"]["action"]["enum"])
         self.assertEqual(loop_tool.input_schema["properties"]["prompt"]["description"], "Required when action=start.")
-        self.assertNotIn("continue_prompt", loop_tool.input_schema["properties"])
+        self.assertTrue({"continue_prompt", "turns_per_thread"}.issubset(loop_tool.input_schema["properties"]))
         self.assertIn("Optional business Skill", loop_tool.input_schema["properties"]["business_skill"]["description"])
         self.assertIn("action=start requires a prompt", loop_tool.description)
 

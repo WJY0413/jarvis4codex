@@ -17,7 +17,7 @@ import uuid
 from contextlib import AbstractContextManager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 
 WORKSPACE_ROOT = Path(__file__).resolve().parents[1]
@@ -121,11 +121,13 @@ def iter_jsonl(path: Path) -> Iterable[dict[str, Any]]:
 class ProcessLock(AbstractContextManager["ProcessLock"]):
     """Small cross-process single-writer lock using atomic file creation."""
 
-    def __init__(self, path: Path, timeout_seconds: float = 10.0, stale_seconds: float = 300.0):
+    def __init__(self, path: Path, timeout_seconds: float = 10.0, stale_seconds: float = 300.0,
+                 *, owner_alive: Callable[[int], bool] | None = None):
         self.path = path
         self.timeout_seconds = timeout_seconds
         self.stale_seconds = stale_seconds
         self.acquired = False
+        self.owner_alive = owner_alive
 
     def __enter__(self) -> "ProcessLock":
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -145,7 +147,10 @@ class ProcessLock(AbstractContextManager["ProcessLock"]):
             except (FileExistsError, PermissionError):
                 try:
                     age = time.time() - self.path.stat().st_mtime
-                    if age > self.stale_seconds:
+                    if self.owner_alive is not None:
+                        if self._remove_dead_owner():
+                            continue
+                    elif age > self.stale_seconds:
                         try:
                             self.path.unlink(missing_ok=True)
                         except PermissionError:
@@ -153,13 +158,73 @@ class ProcessLock(AbstractContextManager["ProcessLock"]):
                         continue
                 except FileNotFoundError:
                     continue
+                except PermissionError:
+                    pass
                 if time.monotonic() >= deadline:
                     raise DispatcherError(f"dispatcher lock timeout: {self.path}")
                 time.sleep(0.025)
 
+    def _remove_dead_owner(self) -> bool:
+        """Delete only the inspected dead-owner file, excluding competing reclaimers."""
+        def dead(raw: str) -> bool:
+            owner = json.loads(raw)
+            pid = owner.get("pid") if isinstance(owner, dict) else None
+            return type(pid) is int and pid > 0 and self.owner_alive(pid) is False
+
+        try:
+            if os.name == "nt":
+                import ctypes
+                from ctypes import wintypes
+                kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+                kernel.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                    wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+                kernel.CreateFileW.restype = wintypes.HANDLE
+                kernel.ReadFile.argtypes = [wintypes.HANDLE, wintypes.LPVOID, wintypes.DWORD,
+                                           ctypes.POINTER(wintypes.DWORD), wintypes.LPVOID]
+                kernel.SetFileInformationByHandle.argtypes = [wintypes.HANDLE, ctypes.c_int,
+                                                             wintypes.LPVOID, wintypes.DWORD]
+                kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+                # Exclusive handle prevents a stale read/unlink race with a new live owner.
+                handle = kernel.CreateFileW(str(self.path), 0x80000000 | 0x10000, 0, None, 3, 0x80, None)
+                if handle == wintypes.HANDLE(-1).value:
+                    return False
+                try:
+                    buffer, count = ctypes.create_string_buffer(4096), wintypes.DWORD()
+                    if not kernel.ReadFile(handle, buffer, len(buffer), ctypes.byref(count), None):
+                        return False
+                    if not dead(buffer.raw[:count.value].decode("utf-8")):
+                        return False
+                    disposition = wintypes.BOOL(True)
+                    return bool(kernel.SetFileInformationByHandle(handle, 4, ctypes.byref(disposition),
+                                                                  ctypes.sizeof(disposition)))
+                finally:
+                    kernel.CloseHandle(handle)
+            else:
+                import fcntl
+                with self.path.open("r", encoding="utf-8") as handle:
+                    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    opened, current = os.fstat(handle.fileno()), self.path.stat()
+                    if (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino):
+                        return False
+                    if not dead(handle.read()):
+                        return False
+                    self.path.unlink()
+                    return True
+        except (OSError, ValueError, TypeError):
+            return False
+
     def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
         if self.acquired:
-            self.path.unlink(missing_ok=True)
+            deadline = time.monotonic() + self.timeout_seconds
+            while True:
+                try:
+                    self.path.unlink(missing_ok=True)
+                    break
+                except PermissionError:
+                    # A dead-owner inspector may briefly hold an exclusive read handle.
+                    if self.owner_alive is None or time.monotonic() >= deadline:
+                        raise
+                    time.sleep(0.025)
             self.acquired = False
 
 

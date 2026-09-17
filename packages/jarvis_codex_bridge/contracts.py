@@ -42,6 +42,13 @@ class TurnState:
     status: str
     items: tuple[dict[str, Any], ...] = ()
     error: str | None = None
+    execution_status: str | None = None
+    execution_source: str = "transport"
+
+    @property
+    def effective_status(self) -> str:
+        """Execution evidence can override, but never rewrite, native status."""
+        return self.execution_status if self.execution_status is not None else self.status
 
 
 @dataclass(frozen=True)
@@ -49,6 +56,16 @@ class ThreadState:
     thread_id: str
     status: str
     turns: tuple[TurnState, ...] = ()
+    read_source: str = "transport"
+    execution_status: str | None = None
+    execution_source: str = "transport"
+    execution_evidence: dict[str, Any] | None = None
+
+    @property
+    def effective_status(self) -> str:
+        if self.execution_status is not None:
+            return self.execution_status
+        return self.turns[-1].effective_status if self.turns else self.status
 
 
 @dataclass(frozen=True)

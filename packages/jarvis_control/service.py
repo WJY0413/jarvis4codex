@@ -7,7 +7,7 @@ from typing import Any, Mapping, Protocol
 
 from jarvis_codex_bridge import CapabilityRequest, ExistingThreadBridge, JarvisCapabilityPort
 
-from .loop import LoopController
+from .loop import LoopController, _validate_start
 from .provisioning import TaskMonitorResumeRequest, TaskProvisionRequest, TaskProvisioningPort
 
 
@@ -56,6 +56,10 @@ class JarvisControl:
                 readback={"verified": True, "terminal": False},
             )
         if action == "start":
+            try:
+                _validate_start(options)
+            except ValueError as exc:
+                return self._receipt("jarvis_loop", "invalid_request", request_id=options.get("request_id"), reason=str(exc))
             requested_workers = options.get("target_thread_count")
             required_workers = requested_workers if isinstance(requested_workers, int) and requested_workers > 0 else 1
             if self._provisioner is None:
@@ -84,6 +88,16 @@ class JarvisControl:
             reason=result.reason, data=result.data,
             readback={"verified": result.status not in {"invalid_request", "blocked"}, "terminal": result.status in {"completed", "stopped", "expired"}},
         )
+
+    def stop_hold(self, hold_id: str) -> dict[str, Any]:
+        """Internal Loop-to-provisioner boundary; no new public MCP action."""
+        stopper = getattr(self._provisioner, "request_hold_stop", None)
+        if not callable(stopper):
+            return {"status": "unsupported", "reason": "persistent Hold stop is unavailable"}
+        try:
+            return stopper(hold_id)
+        except Exception as exc:
+            return {"status": "failed", "reason": str(exc)}
 
     def create(
         self,
@@ -295,8 +309,13 @@ class JarvisControl:
                 data={
                     "thread_id": state.thread_id,
                     "status": state.status,
+                    "read_source": state.read_source,
+                    "execution_status": state.effective_status,
+                    "execution_source": state.execution_source,
+                    "execution_evidence": state.execution_evidence,
                     "turns": [
-                        {"turn_id": turn.turn_id, "status": turn.status, "error": turn.error}
+                        {"turn_id": turn.turn_id, "status": turn.status, "error": turn.error,
+                         "execution_status": turn.effective_status, "execution_source": turn.execution_source}
                         for turn in state.turns
                     ],
                 },
@@ -357,9 +376,10 @@ class JarvisControl:
                 return self._receipt("jarvis_monitor", "failed", request_id=request_id, reason=str(exc))
             lifecycle = str(data.get("lifecycle_status") or data.get("status") or "").lower()
             verified = (
-                lifecycle in {"completed", "failed", "interrupted", "cancelled", "canceled", "turn_limit_reached"}
+                lifecycle in {"completed", "failed", "interrupted", "cancelled", "canceled", "turn_limit_reached", "blocked"}
                 and bool(str(data.get("thread_id") or "").strip())
                 and bool(str(data.get("turn_id") or "").strip())
+                and data.get("terminal_confirmed", True) is True
             )
             return self._receipt(
                 "jarvis_monitor", "completed", request_id=request_id, data=data,

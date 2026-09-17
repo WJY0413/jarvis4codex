@@ -82,7 +82,7 @@ def main() -> int:
     parser.add_argument("--config", type=Path, required=True, help="existing App Server transport config")
     parser.add_argument("--local-heartbeat-config", type=Path, required=True)
     parser.add_argument("--launcher-config", type=Path, required=True)
-    parser.add_argument("--notification-config", type=Path, required=True)
+    parser.add_argument("--notification-config", type=Path)
     parser.add_argument("--state-dir", type=Path, required=True)
     parser.add_argument("command", choices=("run-once", "run-forever", "health-check"))
     args = parser.parse_args()
