@@ -11,7 +11,7 @@ class HeldTurnClient(Protocol):
         self, thread_id: str, turn_id: str, **kwargs: Any
     ) -> dict[str, object]: ...
 
-    def wait_for_turn_readback(self, thread_id: str, turn_id: str) -> str: ...
+    def wait_for_turn_readback(self, thread_id: str, turn_id: str, **kwargs: Any) -> str: ...
 
 
 @dataclass(frozen=True)
@@ -37,6 +37,7 @@ class HoldTurnRequest:
     verify_output: Callable[[], dict[str, Any]] | None = None
     stop_requested: Callable[[], bool] | None = None
     control_poll: Callable[[], None] | None = None
+    receive_final_answer: Callable[[str], dict[str, Any]] | None = None
 
 
 @dataclass(frozen=True)
@@ -76,20 +77,24 @@ class HoldTurnMonitor:
         final_message = ""
         if terminal_status == "completed":
             final_message = str(
-                client.wait_for_turn_readback(request.thread_id, request.turn_id) or ""
+                client.wait_for_turn_readback(request.thread_id, request.turn_id,
+                    **({"require_final_answer": True} if request.receive_final_answer else {})) or ""
             )
         command_id = f"monitor:{request.hold_id}:{request.turn_id}:{request.turn_count}"
         if terminal_status != "completed":
             return self._stop(request, command_id, terminal_status, final_message, "non_completed_terminal")
         verification = {}
-        if request.verify_output is not None:
-            verification = request.verify_output()
+        if request.receive_final_answer is not None and not final_message:
+            return self._stop(request, command_id, "blocked", final_message, "final_answer_unavailable")
+        if request.receive_final_answer is not None or request.verify_output is not None:
+            verification = (request.receive_final_answer(final_message) if request.receive_final_answer
+                            else request.verify_output())
             if verification.get("status") not in {"verified", "review", "legacy_unverified", "not_required"}:
                 return self._stop(request, command_id, "blocked", final_message,
                                   str(verification.get("reason") or "candidate_output_unverified"))
         if request.stop_requested is not None and request.stop_requested():
             return self._stop(request, command_id, "cancelled", final_message, "stop_requested")
-        if _worker_reported_blocked(final_message, explicit_only=verification.get("status") == "review"):
+        if _worker_reported_blocked(final_message, explicit_only=(request.receive_final_answer is not None or verification.get("status") == "review")):
             return self._stop(request, command_id, "blocked", final_message, "worker_reported_blocked")
         if request.turn_count >= request.max_turns:
             return self._stop(request, command_id, "turn_limit_reached", final_message, "turn_budget_consumed")

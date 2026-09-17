@@ -83,7 +83,7 @@ class FakeClient:
         self.__class__.instances.append(self)
 
     def start(self) -> dict[str, object]:
-        return {"codexHome": "C:\\Users\\22524\\.codex"}
+        return {"codexHome": "C:\\Users\\example\\.codex"}
 
     def request(self, method: str, params: dict[str, object]) -> dict[str, object]:
         self.calls.append((method, params))
@@ -196,7 +196,7 @@ class FakeQuotaClient:
         self.closed = False
 
     def start(self) -> dict[str, object]:
-        return {"codexHome": "C:\\Users\\22524\\.codex"}
+        return {"codexHome": "C:\\Users\\example\\.codex"}
 
     def request(self, method: str, params: dict[str, object]) -> dict[str, object]:
         if method != "account/rateLimits/read" or params != {}:
@@ -217,7 +217,7 @@ class FakeThreadReadOnlyClient:
         self.__class__.instances.append(self)
 
     def start(self) -> dict[str, object]:
-        return {"codexHome": "C:\\Users\\22524\\.codex"}
+        return {"codexHome": "C:\\Users\\example\\.codex"}
 
     def request(self, method: str, params: dict[str, object]) -> dict[str, object]:
         self.calls.append((method, params))

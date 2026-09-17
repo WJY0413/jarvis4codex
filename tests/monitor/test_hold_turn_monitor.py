@@ -16,12 +16,42 @@ class FakeHeldTurnClient:
         self.terminal_calls.append((thread_id, turn_id))
         return {"id": turn_id, "status": self.status}
 
-    def wait_for_turn_readback(self, thread_id: str, turn_id: str):
+    def wait_for_turn_readback(self, thread_id: str, turn_id: str, **kwargs):
         self.readback_calls.append((thread_id, turn_id))
+        self.readback_options = kwargs
         return self.content
 
 
 class HoldTurnMonitorTest(unittest.TestCase):
+    def test_final_answer_intake_runs_only_after_completion_and_allows_review(self):
+        from unittest.mock import Mock
+        for terminal, raw, expected, received in [
+            ("completed", '{"notes":"failed / blocked"}', "CONTINUE", True),
+            ("completed", "BLOCKED: invalid JSON still retained", "CONTINUE", True),
+            ("completed", "JARVIS_RUN_STATUS: blocked", "STOP", True),
+            ("completed", "", "STOP", False), ("failed", "{}", "STOP", False),
+            ("interrupted", "{}", "STOP", False),
+        ]:
+            with self.subTest(terminal=terminal, raw=raw):
+                receiver = Mock(return_value={"status": "verified", "terminal_status": "received", "review_needed": True})
+                client = FakeHeldTurnClient(terminal, raw)
+                decision = HoldTurnMonitor().observe(client, self.request(receive_final_answer=receiver))
+                self.assertEqual(decision.action, expected)
+                self.assertEqual(receiver.called, received)
+                if received:
+                    receiver.assert_called_once_with(raw)
+                    self.assertEqual(client.readback_options, {"require_final_answer": True})
+
+    def test_final_answer_write_failure_blocks_and_stop_still_saves_completed_output(self):
+        from unittest.mock import Mock
+        receiver = Mock(return_value={"status": "blocked", "reason": "disk full"})
+        decision = HoldTurnMonitor().observe(FakeHeldTurnClient(), self.request(receive_final_answer=receiver))
+        self.assertEqual((decision.action, decision.result_status, decision.reason), ("STOP", "blocked", "disk full"))
+        receiver.return_value = {"status": "verified", "terminal_status": "received"}
+        decision = HoldTurnMonitor().observe(FakeHeldTurnClient(), self.request(receive_final_answer=receiver, stop_requested=lambda: True))
+        self.assertEqual(decision.result_status, "cancelled")
+        self.assertEqual(receiver.call_count, 2)
+
     def request(self, **overrides) -> HoldTurnRequest:
         values = {
             "hold_id": "hold-1",

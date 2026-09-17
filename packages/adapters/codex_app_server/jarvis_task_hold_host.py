@@ -18,9 +18,9 @@ from typing import Any
 
 from jarvis_monitor import HoldTurnMonitor, HoldTurnRequest, NotificationPolicy
 from jarvis_runtime.jarvis_native_task_launcher import AppServerClient, NativeTaskLauncherConfig
-from adapters.codex_app_server.task_provisioning_adapter import append_terminal_turn_history, read_turn_history, verify_candidate_output, _pid_is_alive
+from adapters.codex_app_server.task_provisioning_adapter import append_terminal_turn_history, read_turn_history, verify_candidate_output, receive_candidate_final_answer, _pid_is_alive
 from jarvis_runtime.coo_dispatcher_store import ProcessLock
-from jarvis_control.provisioning import lane_batch_ids, lane_batch_size
+from jarvis_control.provisioning import lane_batch_ids, lane_batch_size, final_answer_mode
 
 
 def _now() -> str:
@@ -117,9 +117,16 @@ def _turn_input_binding(request: dict[str, Any], total_turn_count: int) -> dict[
     binding = dict(request.get("input_binding") or {})
     if "lane_item_count" not in binding:
         return binding
+    pocket = final_answer_mode(binding)
     binding["candidate_ids"] = lane_batch_ids(binding, total_turn_count)
     contract = binding.get("result_verification")
     if isinstance(contract, dict):
+        if pocket:
+            binding["result_verification"] = {
+                "mode": "final_answer_json",
+                **({"output_schema": contract["output_schema"]} if "output_schema" in contract else {}),
+            }
+            return binding
         candidate = binding["candidate_ids"][0]
         binding["result_verification"] = {
             **({"output_schema": contract["output_schema"]} if "output_schema" in contract else {}),
@@ -218,6 +225,12 @@ def hold_task(
         verification = verify_candidate_output(request, total_turn_count)
         return verification
 
+    def receive_final_answer(raw: str) -> dict[str, Any]:
+        nonlocal verification
+        verification = receive_candidate_final_answer(request, total_turn_count,
+            thread_id=thread_id, turn_id=turn_id, raw=raw)
+        return verification
+
     def report(next_phase: str, details: dict[str, Any] | None = None) -> None:
         nonlocal phase, thread_id, turn_id
         phase = next_phase
@@ -244,6 +257,9 @@ def hold_task(
         })
 
     try:
+        pocket = final_answer_mode(request.get("input_binding") or {})
+        if pocket and "lane_item_count" not in request["input_binding"]:
+            raise ValueError("final_answer_json requires a finite lane binding")
         report("hold_started")
         with ProcessLock(request_path.with_suffix(".lock"), owner_alive=_pid_is_alive):
             if stop_requested() and request.get("mode") != "recover":
@@ -320,6 +336,7 @@ def hold_task(
                 verify_output=verify_output,
                 stop_requested=stop_requested,
                 control_poll=control_poll,
+                receive_final_answer=receive_final_answer if pocket else None,
             )
             decision = turn_monitor.observe(client, monitor_request)
             terminal_confirmed = decision.result_status in {

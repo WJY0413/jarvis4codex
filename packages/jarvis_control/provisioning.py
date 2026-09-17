@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Literal, Mapping, Protocol
 
 from jsonschema import Draft202012Validator
@@ -22,6 +23,32 @@ def lane_batch_size(binding: Mapping[str, Any]) -> int:
     if type(size) is not int or size < 1:
         raise ValueError("lane.batch_size must be a positive integer")
     return size
+
+
+def final_answer_mode(binding: Mapping[str, Any]) -> bool:
+    contract = binding.get("result_verification") or {}
+    if not isinstance(contract, Mapping):
+        raise ValueError("result_verification must be an object")
+    mode = contract.get("mode", "file_receipt")
+    if not isinstance(mode, str) or mode not in {"file_receipt", "final_answer_json"}:
+        raise ValueError("result_verification.mode must be file_receipt or final_answer_json")
+    if mode == "file_receipt":
+        return False
+    ids = binding.get("candidate_ids")
+    if (lane_batch_size(binding) != 1 or not isinstance(ids, list) or not ids
+            or any(type(value) is not int or value < 1 for value in ids) or len(set(ids)) != len(ids)):
+        raise ValueError("final_answer_json requires a finite single-item lane (batch_size=1)")
+    paths = contract.get("receipt_paths")
+    if (not isinstance(paths, Mapping) or set(paths) != {str(value) for value in ids}
+            or any(not isinstance(value, str) or not value.strip() for value in paths.values())
+            or len(set(paths.values())) != len(ids) or contract.get("terminal_statuses") != ["received"]
+            or not binding.get("output_boundary")):
+        raise ValueError("final_answer_json requires separate receipt_paths and terminal_statuses=['received']")
+    boundary = Path(binding["output_boundary"]).resolve()
+    resolved = [(Path(value) if Path(value).is_absolute() else boundary / value).resolve() for value in paths.values()]
+    if len(set(resolved)) != len(ids) or any(not path.is_relative_to(boundary) for path in resolved):
+        raise ValueError("final_answer_json requires distinct receipt paths inside output_boundary")
+    return True
 
 
 def lane_batch_ids(binding: Mapping[str, Any], turn_number: int) -> list[int]:
@@ -123,6 +150,8 @@ class TaskProvisionRequest:
         notifications = dict(self.notifications or {})
         if self.input_binding is not None and not isinstance(self.input_binding, Mapping):
             raise ValueError("input_binding must be an object")
+        if final_answer_mode(self.input_binding or {}) and "lane_item_count" not in self.input_binding:
+            raise ValueError("final_answer_json requires a finite lane binding")
         milestones = notifications.get("milestones") or []
         if not isinstance(milestones, list):
             raise ValueError("notifications.milestones must be a list")
@@ -170,6 +199,8 @@ class TaskMonitorResumeRequest:
         notifications = dict(self.notifications or {})
         if self.input_binding is not None and not isinstance(self.input_binding, Mapping):
             raise ValueError("input_binding must be an object")
+        if final_answer_mode(self.input_binding or {}) and "lane_item_count" not in self.input_binding:
+            raise ValueError("final_answer_json requires a finite lane binding")
         milestones = notifications.get("milestones") or []
         if not isinstance(milestones, list):
             raise ValueError("notifications.milestones must be a list")

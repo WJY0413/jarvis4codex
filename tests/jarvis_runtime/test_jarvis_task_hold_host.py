@@ -444,6 +444,48 @@ class HostContextFailureClient(FakeClient):
 
 
 class TaskMonitorHostTest(unittest.TestCase):
+    def test_final_answer_lane_receives_each_turn_without_worker_file_writes(self):
+        class PocketClient(FakeClient):
+            def wait_for_turn_readback(self, thread_id, turn_id, **kwargs):
+                self.readback_options = kwargs
+                self.bound_read = (thread_id, turn_id)
+                return ' \n{"people":"wrong type", "candidate_id": 999}\n' if turn_id == "turn-1" else "BLOCKED: final raw is preserved"
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            request, ack, result = root / "request.json", root / "ack.json", root / "result.json"
+            request.write_text(json.dumps({"request_id": "pocket-run", "prompt": "final JSON only", "max_turns": 2,
+                "auto_continue": True, "input_binding": {"candidate_ids": [7, 9], "lane_item_count": 2,
+                    "database_path": "unused.sqlite", "output_boundary": str(root / "out"),
+                    "result_verification": {"mode": "final_answer_json", "terminal_statuses": ["received"],
+                        "receipt_paths": {"7": "7.json", "9": "9.json"},
+                        "output_schema": {"type": "object", "properties": {"people": {"type": "array"}}}}}}))
+            client = PocketClient(None)
+            with patch("adapters.codex_app_server.jarvis_task_hold_host.NativeTaskLauncherConfig", return_value=FakeConfig()), patch(
+                "adapters.codex_app_server.jarvis_task_hold_host.AppServerClient", return_value=client):
+                self.assertEqual(hold_task(Path("unused"), request, ack, result), 0)
+            final = json.loads(result.read_text())
+            self.assertEqual(final["status"], "turn_limit_reached")
+            self.assertEqual(final["total_turn_count"], 2)
+            self.assertEqual(final["output_verification"]["candidate_id"], 9)
+            self.assertEqual(final["output_verification"]["terminal_status"], "received")
+            self.assertEqual(client.readback_options, {"require_final_answer": True})
+            self.assertEqual(client.bound_read, ("thread-1", "turn-2"))
+            first_binding = client.created_requests[0]["input_binding"]
+            second_binding = client.started_turns[0]["input_binding"]
+            self.assertEqual(first_binding["candidate_ids"], [7])
+            self.assertEqual(second_binding["candidate_ids"], [9])
+            self.assertNotIn("receipt_path", first_binding["result_verification"])
+            self.assertNotIn("request_id", first_binding["result_verification"])
+            for number, candidate in enumerate([7, 9], 1):
+                receipt = json.loads((root / "out" / f"{candidate}.json").read_text())
+                self.assertEqual((receipt["candidate_id"], receipt["turn_number"], receipt["turn_id"]),
+                                 (candidate, number, f"turn-{number}"))
+                self.assertTrue(receipt["schema_issues"])
+                self.assertTrue(receipt["review_needed"])
+            history = read_turn_history(root / "turn-history.sqlite", hold_id="hold-pocket-run")
+            self.assertEqual([row["candidate_id"] for row in history], [7, 9])
+            self.assertEqual(history[-1]["final_answer"], "BLOCKED: final raw is preserved")
+
     def test_reports_holding_before_the_exact_turn_reaches_a_terminal_state(self):
         client = TerminalGateClient(None)
         with tempfile.TemporaryDirectory() as temp:

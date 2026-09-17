@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Mapping, Protocol
 
 from jarvis_runtime.coo_dispatcher_store import ProcessLock
-from .provisioning import output_schema_validator, lane_batch_size, lane_batch_ids
+from .provisioning import output_schema_validator, lane_batch_size, lane_batch_ids, final_answer_mode
 
 
 ACTIVE = {"accepted", "holding", "running"}
@@ -443,9 +443,18 @@ class LoopController:
                             verification.get("candidate_ids") == lane_batch_ids(child["lane"], rounds))
         if (verification.get("status") in {"verified", "review"}
                 and identity_matches and data.get("total_turn_count") == rounds):
-            child["business_status"] = ("review" if verification["status"] == "review"
-                or data.get("scheduler_failed_items") or child.get("business_status") == "review"
-                else "mechanically_verified")
+            if final_answer_mode(child["lane"]):
+                if (verification.get("terminal_status") != "received" or verification.get("review_needed") is not True
+                        or verification.get("verification_status") != "not_verified"):
+                    child["business_status"] = "unverified"
+                    child["phase"] = "blocked"
+                    return
+                child["intake_status"] = "received"
+                child["business_status"] = "review_needed"
+            else:
+                child["business_status"] = ("review" if verification["status"] == "review"
+                    or data.get("scheduler_failed_items") or child.get("business_status") == "review"
+                    else "mechanically_verified")
         else:
             child["business_status"] = "unverified"
             child["phase"] = "blocked"
@@ -551,6 +560,7 @@ def _validate_start(raw: Mapping[str, Any]) -> dict[str, Any]:
                 raise ValueError("new bound lanes require result_verification receipt_paths and terminal_statuses")
             if "output_schema" in verification:
                 output_schema_validator(verification["output_schema"])
+            final_answer_mode(lane)
             if batch_size > 1:
                 if len(set(verification["receipt_paths"].values())) != len(candidate_ids):
                     raise ValueError("batch lanes require separate receipt_paths for every candidate")
@@ -558,10 +568,12 @@ def _validate_start(raw: Mapping[str, Any]) -> dict[str, Any]:
                              "output_boundary": output_boundary, "result_verification": dict(verification),
                              **({"batch_size": batch_size} if "batch_size" in lane else {})}
         child["prompt"] = _worker_prompt(task_prompt, controller_skill, business_skill, lane_bound="lane" in child,
-                                         batched=lane_batch_size(child.get("lane") or {}) > 1)
+                                         batched=lane_batch_size(child.get("lane") or {}) > 1,
+                                         final_answer=final_answer_mode(child.get("lane") or {}))
         if continuation is not None:
             child["continue_prompt"] = _worker_prompt(continuation.strip(), controller_skill, business_skill,
-                lane_bound="lane" in child, batched=lane_batch_size(child.get("lane") or {}) > 1)
+                lane_bound="lane" in child, batched=lane_batch_size(child.get("lane") or {}) > 1,
+                final_answer=final_answer_mode(child.get("lane") or {}))
         if acquire == "create":
             child["title"] = str(raw_child.get("title") or raw.get("title") or "").strip()
             if not child["title"]:
@@ -601,7 +613,7 @@ def _validate_start(raw: Mapping[str, Any]) -> dict[str, Any]:
             "notifications": notifications, "interval_seconds": interval, "expires_at": expires.isoformat()}
 
 
-def _worker_prompt(task_prompt: str, controller_skill: str, business_skill: str, *, lane_bound: bool, batched: bool = False) -> str:
+def _worker_prompt(task_prompt: str, controller_skill: str, business_skill: str, *, lane_bound: bool, batched: bool = False, final_answer: bool = False) -> str:
     binding_rule = (
         "每个 Worker 回合仅处理 binding 中的一个任务项；安全写回后输出结构化单项回执并等待下一回合，"
         "不得遍历、预取、并行处理或宣称整条 lane 已完成。\n"
@@ -618,11 +630,18 @@ def _worker_prompt(task_prompt: str, controller_skill: str, business_skill: str,
             "全部任务项产物和正式回执完成后结束本回合，Holder 按真实 ID 覆盖生成并保存本轮整批核验回执。"
             "缺项、错项、重复或部分失败不得宣称整批完成；尾批按实际注入数量处理。\n"
         )
+    if final_answer:
+        binding_rule = (
+            "每回合只处理 binding.candidate_ids 中的一个任务项，不预取或处理其他项。\n"
+            "唯一交付是最终回复中的 JSON，保持发现原貌；业务字段可省略，缺来源不阻止接收。"
+            "不要写文件、运行收尾脚本、填写 QA 或正式回执；ID 与运行身份由 Holder 绑定。"
+            "Holder 自动保留原文、保存 JSON 和接收回执并推进；接收不代表业务核实通过。\n"
+        )
     if lane_bound:
         binding_rule += ("仅身份无法确认、串公司、越界或重复执行风险等运行安全异常，单独输出 JARVIS_RUN_STATUS: blocked；"
                          "普通字段、计数、枚举或业务结果失败使用 failed/review，不输出该运行安全控制行。\n")
     rules = []
-    if controller_skill:
+    if controller_skill and not final_answer:
         rules.append(f"执行、续跑和回执规则，必须严格遵守 ${controller_skill}。")
     if binding_rule:
         rules.append(binding_rule.rstrip())

@@ -99,13 +99,15 @@ class JarvisMcpContractTest(unittest.TestCase):
         self.server = JarvisMcpServer(control)
         schema = {"$defs": {"score": {"type": "integer"}},
                   "properties": {"score": {"$ref": "#/$defs/score"}}, "required": ["score"]}
-        threads = [{"slot": "one", "lane": {"result_verification": {"output_schema": schema}}}]
+        threads = [{"slot": "one", "lane": {"result_verification": {"mode": "final_answer_json", "output_schema": schema}}}]
         self.call("jarvis_loop", {"action": "start", "threads": threads})
         self.assertEqual(control.loop.call_args.kwargs["threads"], threads)
         tool = next(tool for tool in self.list_tools().tools if tool.name == "jarvis_loop")
         self.assertIn("output_schema", tool.input_schema["properties"]["threads"]["description"])
         lane = tool.input_schema["properties"]["threads"]["anyOf"][0]["items"]["properties"]["lane"]
         self.assertEqual(lane["properties"]["batch_size"], {"type": "integer", "minimum": 1, "default": 1})
+        self.assertEqual(lane["properties"]["result_verification"]["properties"]["mode"]["enum"],
+                         ["file_receipt", "final_answer_json"])
 
     def call(self, name, arguments):
         async def run():

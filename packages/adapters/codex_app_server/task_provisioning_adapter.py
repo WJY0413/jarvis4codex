@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import sqlite3
@@ -22,6 +23,7 @@ from jarvis_control.provisioning import (
     validate_saved_output,
     lane_batch_ids,
     lane_batch_size,
+    final_answer_mode,
 )
 
 
@@ -470,6 +472,78 @@ class CodexAppServerTaskProvisioningAdapter:
         })
 
 
+def receive_candidate_final_answer(request: dict[str, Any], turn_number: int, *,
+                                   thread_id: str, turn_id: str, raw: str) -> dict[str, Any]:
+    """Accept only the owning Hold's completed-turn text; business content is never identity."""
+    binding = request.get("input_binding") or {}
+    try:
+        if not final_answer_mode(binding) or "lane_item_count" not in binding:
+            raise ValueError("final answer intake requires an explicit finite single-item lane")
+        if not thread_id or not turn_id or not raw:
+            raise ValueError("exact completed turn and final answer are required")
+        candidate = lane_batch_ids(binding, turn_number)[0]
+        contract = binding["result_verification"]
+        boundary = Path(binding["output_boundary"]).resolve()
+        path = Path(contract["receipt_paths"][str(candidate)])
+        receipt_path = (path if path.is_absolute() else boundary / path).resolve()
+        if not receipt_path.is_relative_to(boundary):
+            raise ValueError("receipt path is outside the allowed boundary")
+        identity = {"candidate_id": candidate, "request_id": request["request_id"],
+                    "turn_number": turn_number, "thread_id": thread_id, "turn_id": turn_id}
+        raw_bytes = raw.encode("utf-8")
+        raw_hash = hashlib.sha256(raw_bytes).hexdigest()
+        # Content-addressed evidence survives replay/recovery and later runs using the receipt slot.
+        evidence_key = hashlib.sha256((json.dumps(identity, sort_keys=True) + raw_hash).encode()).hexdigest()
+        raw_path = receipt_path.with_name(f"{receipt_path.stem}.{evidence_key}.raw.txt")
+        payload_path = receipt_path.with_name(f"{receipt_path.stem}.{evidence_key}.payload.json")
+        for evidence_path in (raw_path, payload_path):
+            if not evidence_path.resolve().is_relative_to(boundary):
+                raise ValueError("evidence path is outside the allowed boundary")
+        def save_evidence(path: Path, content: bytes) -> None:
+            if path.exists():
+                if path.read_bytes() != content:
+                    raise ValueError("existing evidence differs")
+                return
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+            try:
+                temporary.write_bytes(content)
+                temporary.replace(path)
+            finally:
+                temporary.unlink(missing_ok=True)
+
+        save_evidence(raw_path, raw_bytes)
+        issues: list[str] = []
+        payload = None
+        parsed = False
+        try:
+            def reject_constant(value: str) -> None:
+                raise ValueError(f"non-JSON constant: {value}")
+            payload = json.loads(raw, parse_constant=reject_constant)
+            parsed = True
+        except (ValueError, RecursionError) as exc:
+            issues.append(f"JSON parse failed: {exc}")
+        if parsed and "output_schema" in contract:
+            try:
+                validate_saved_output(contract["output_schema"], payload)
+            except ValueError as exc:
+                issues.append(str(exc))
+        payload_bytes = json.dumps(payload, ensure_ascii=False, allow_nan=False).encode("utf-8")
+        save_evidence(payload_path, payload_bytes)
+        receipt = {"schema": "jarvis-final-answer-receipt/v1", **identity, "status": "received",
+                   "received": True, "raw_path": str(raw_path), "raw_sha256": raw_hash,
+                   "output_path": str(payload_path), "output_sha256": hashlib.sha256(payload_bytes).hexdigest(),
+                   "payload_parsed": parsed, "schema_issues": issues, "review_needed": True,
+                   "verification_status": "not_verified", "research_completion": "not_assessed"}
+        _write_json(receipt_path, receipt)
+        verified = verify_candidate_output(request, turn_number)
+        if verified.get("status") == "verified" and any(verified.get(key) != value for key, value in identity.items()):
+            raise ValueError("saved receipt does not match the owning native turn")
+        return verified
+    except (OSError, ValueError, KeyError, TypeError, IndexError) as exc:
+        return {"status": "blocked", "reason": f"final_answer_intake_failed: {exc}"}
+
+
 def verify_candidate_output(request: dict[str, Any], turn_number: int) -> dict[str, Any]:
     """Verify every real ID in this turn before declaring a batch complete."""
     binding = request.get("input_binding") or {}
@@ -508,7 +582,7 @@ def _verify_candidate_output_item(request: dict[str, Any], turn_number: int, can
     try:
         boundary = Path(binding["output_boundary"]).resolve(strict=True)
 
-        def read_output(value: str) -> tuple[Path, dict[str, Any]]:
+        def read_output(value: str, *, require_object: bool = True) -> tuple[Path, Any]:
             nonlocal safety_error
             path = Path(value)
             path = (path if path.is_absolute() else boundary / path).resolve()
@@ -518,15 +592,36 @@ def _verify_candidate_output_item(request: dict[str, Any], turn_number: int, can
             raw = path.read_text(encoding="utf-8-sig")
             evidence[str(path)] = raw
             data = json.loads(raw)
-            if not isinstance(data, dict):
+            if require_object and not isinstance(data, dict):
                 raise ValueError("saved output must be a JSON object")
-            if (type(data.get("candidate_id")) not in {int, str}
+            if require_object and (type(data.get("candidate_id")) not in {int, str}
                     or str(data["candidate_id"]) != str(candidate)):
                 safety_error = True
                 raise ValueError("saved candidate_id does not match current candidate")
             return path, data
 
         receipt_path, receipt = read_output(contract["receipt_paths"][str(candidate)])
+        if final_answer_mode(binding):
+            for key, value in expected.items():
+                if type(receipt.get(key)) is not type(value) or receipt.get(key) != value:
+                    raise ValueError(f"receipt {key} does not match current candidate/run/turn")
+            if (receipt.get("schema") != "jarvis-final-answer-receipt/v1" or receipt.get("status") != "received"
+                    or receipt.get("received") is not True
+                    or any(not isinstance(receipt.get(key), str) or not receipt[key] for key in ("thread_id", "turn_id"))
+                    or receipt.get("review_needed") is not True or receipt.get("verification_status") != "not_verified"
+                    or receipt.get("research_completion") != "not_assessed"):
+                raise ValueError("final answer receipt has no bound unverified intake identity")
+            output_path, _ = read_output(receipt["output_path"], require_object=False)
+            raw_path = Path(receipt["raw_path"]).resolve(strict=True)
+            if not raw_path.is_relative_to(boundary):
+                raise ValueError("raw path is outside the allowed boundary")
+            if (hashlib.sha256(output_path.read_bytes()).hexdigest() != receipt.get("output_sha256")
+                    or hashlib.sha256(raw_path.read_bytes()).hexdigest() != receipt.get("raw_sha256")):
+                raise ValueError("final answer evidence hash mismatch")
+            return {"status": "verified", **expected, "receipt_path": str(receipt_path),
+                    "output_path": str(output_path), "terminal_status": "received",
+                    "thread_id": receipt["thread_id"], "turn_id": receipt["turn_id"],
+                    "review_needed": True, "verification_status": "not_verified"}
         output_path, output = read_output(receipt["output_path"])
         allowed = contract["terminal_statuses"]
         if not isinstance(allowed, list) or not allowed or any(
@@ -552,8 +647,9 @@ def _verify_candidate_output_item(request: dict[str, Any], turn_number: int, can
         return {"status": "verified", **expected, "receipt_path": str(receipt_path),
                 "output_path": str(output_path), "terminal_status": receipt["status"]}
     except (OSError, ValueError, KeyError, TypeError, IndexError) as exc:
-        return {"status": "blocked" if safety_error else "review", **expected,
-                "scheduler_outcome": "blocked" if safety_error else "failed",
+        unsafe = safety_error or final_answer_mode(binding)
+        return {"status": "blocked" if unsafe else "review", **expected,
+                "scheduler_outcome": "blocked" if unsafe else "failed",
                 "reason": f"candidate_output_unverified: {exc}", "original_evidence": evidence}
 
 

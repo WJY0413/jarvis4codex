@@ -121,11 +121,12 @@ class JarvisMcpServer:
             controller_skill: Annotated[str | None, Field(description="Optional controller Skill to inject into the Worker prompt.")] = None,
             target_thread_count: int | None = None,
             threads: Annotated[list[dict[str, Any]] | None, Field(
-                description="Optional finite-item lanes; omit lanes for open-ended tasks without fixed batches. lane.batch_size is any positive integer (default 1). lane.result_verification.output_schema validates each saved item JSON using Draft 2020-12, document-local references only, no $id.",
+                description="Optional finite-item lanes; omit lanes for open-ended tasks. batch_size defaults to 1. result_verification.mode defaults to file_receipt; final_answer_json requires batch_size=1, separate receipt_paths and terminal_statuses=['received']; Holder saves the exact final answer and payload with review_needed=true, never business QA approval. output_schema uses Draft 2020-12 with document-local refs and no $id; in final_answer_json mode mismatches are recorded for review, not rejected.",
                 json_schema_extra={"anyOf": [{"type": "array", "items": {"type": "object", "properties": {
                     "lane": {"type": "object", "properties": {
                         "batch_size": {"type": "integer", "minimum": 1, "default": 1},
                         "result_verification": {"type": "object", "properties": {
+                            "mode": {"type": "string", "enum": ["file_receipt", "final_answer_json"], "default": "file_receipt"},
                             "output_schema": {"type": ["object", "boolean"]},
                         }},
                     }},

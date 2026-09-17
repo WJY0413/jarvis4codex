@@ -33,6 +33,21 @@ COOPER_ID = "ou_cooper"
 
 
 class CodexResolutionTests(unittest.TestCase):
+    def test_strict_final_answer_preserves_raw_text_and_never_falls_back_to_commentary(self):
+        raw = ' \r\n{"notes": "unchanged"}\n '
+        thread = {"turns": [
+            {"id": "old", "items": [{"type": "agentMessage", "phase": "final_answer", "text": "old"}]},
+            {"id": "current", "items": [{"type": "agentMessage", "phase": "commentary", "text": "working"}]},
+        ]}
+        self.assertEqual(AppServerClient.final_message_for_turn(thread, "current", require_final_answer=True), "")
+        self.assertEqual(AppServerClient.final_message_for_turn(thread, "current"), "working")
+        thread["turns"][1]["items"].extend([
+            {"type": "agentMessage", "phase": "final_answer", "text": raw},
+            {"type": "agentMessage", "phase": "commentary", "text": "later commentary"},
+        ])
+        self.assertEqual(AppServerClient.final_message_for_turn(thread, "current", require_final_answer=True), raw)
+        self.assertEqual(AppServerClient.final_message_for_turn(thread, "missing", require_final_answer=True), "")
+
     def test_explicit_pin_wins_and_is_version_checked(self):
         with patch("jarvis_native_task_launcher.shutil.which", return_value="pinned.exe") as which, patch(
             "jarvis_native_task_launcher.subprocess.run",
@@ -178,6 +193,30 @@ class RecoveryAppClient:
 
 
 class LauncherTests(unittest.TestCase):
+    def test_pocket_create_resume_and_continue_use_reduced_binding_without_legacy_contract(self):
+        from jarvis_native_task_launcher import append_lane_binding, LANE_BINDING_MARKER
+        binding = {"candidate_ids": [7], "lane_item_count": 2,
+                   "result_verification": {"mode": "final_answer_json", "output_schema": {"type": "object"}}}
+        client = AppServerClient.__new__(AppServerClient)
+        client.start = lambda: None
+        client.select_model = lambda _model: "gpt-test"
+        client.request = lambda method, _params: {"thread": {"id": "thread-1"}}
+        prompts = []
+        client._start_turn = lambda thread_id, prompt, **kwargs: prompts.append(prompt) or {"turn_id": "turn-1"}
+        client.create_task({"request_id": "r", "project_path": "unused", "title": "test", "prompt": "research",
+                            "input_binding": binding})
+        client.resume_turn_async("thread-1", "research", client_user_message_id="r2", input_binding=binding)
+        client.start_turn_async("thread-1", "继续", client_user_message_id="r3", input_binding=binding)
+        self.assertEqual(len(prompts), 3)
+        for prompt in prompts:
+            self.assertIn("不写文件", prompt)
+            self.assertIn('"candidate_ids":[7]', prompt)
+            self.assertNotIn("安全写回", prompt)
+            self.assertNotIn(RESULT_CONTRACT_MARKER, prompt)
+        rebound = append_lane_binding("research\n" + LANE_BINDING_MARKER + '\n{"candidate_ids":[999]}', binding)
+        self.assertNotIn("999", rebound)
+        self.assertEqual(rebound.count(LANE_BINDING_MARKER), 1)
+
     def make_queue(self, temp: str, *, live: bool = False):
         base = Path(temp)
         root = base / "dispatcher"

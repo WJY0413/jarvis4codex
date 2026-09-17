@@ -123,6 +123,17 @@ def append_result_contract(prompt: str) -> str:
 def append_lane_binding(prompt: str, input_binding: Mapping[str, Any] | None) -> str:
     """Attach one validated Loop lane to the Worker-visible turn input."""
     text = str(prompt or "").strip()
+    if input_binding and (input_binding.get("result_verification") or {}).get("mode") == "final_answer_json":
+        # Holder already validated the full lane; this is intentionally a reduced per-turn binding.
+        text = text.split(LANE_BINDING_MARKER, 1)[0].rstrip()
+        binding = json.dumps(dict(input_binding), ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+        return (f"{text}\n\n{LANE_BINDING_MARKER}\n"
+                "以下 JSON 是本回合唯一任务范围，只处理 candidate_ids 中的一个任务项。"
+                "最终回复只输出业务 JSON；不写文件、不运行收尾脚本、不填写 QA/回执或运行身份。"
+                "原文、payload、candidate_id/request_id/turn_number 和正式接收回执全部由 Holder 保存与绑定。"
+                "接收不代表业务核实通过；缺字段、缺来源和额外信息均可保留供复核。"
+                "此交付模式取代历史提示或技能中的写回与流程收尾要求；不要预取或处理其他项。\n"
+                f"{binding}")
     if not input_binding or LANE_BINDING_MARKER in text:
         return text
     binding = json.dumps(dict(input_binding), ensure_ascii=False, separators=(",", ":"), sort_keys=True)
@@ -1098,7 +1109,7 @@ class AppServerClient:
             "reasoning_effort": selected_effort,
         }
 
-    def wait_for_turn_readback(self, thread_id: str, turn_id: str) -> str:
+    def wait_for_turn_readback(self, thread_id: str, turn_id: str, *, require_final_answer: bool = False) -> str:
         """Wait until the exact completed turn is materialized in thread/read.
 
         App Server can deliver ``turn/completed`` before the corresponding
@@ -1115,6 +1126,7 @@ class AppServerClient:
             final_message = self.final_message_for_turn(
                 read_result.get("thread"),
                 turn_id,
+                require_final_answer=require_final_answer,
             )
             if final_message:
                 return final_message
@@ -1129,7 +1141,7 @@ class AppServerClient:
         return self.config.path.parent / "thread_turn_locks" / f"{digest}.lock"
 
     @staticmethod
-    def final_message_for_turn(thread: Any, turn_id: str) -> str:
+    def final_message_for_turn(thread: Any, turn_id: str, *, require_final_answer: bool = False) -> str:
         if not isinstance(thread, dict):
             return ""
         for turn in reversed(thread.get("turns") or []):
@@ -1143,8 +1155,9 @@ class AppServerClient:
             final_messages = [
                 item for item in messages if item.get("phase") == "final_answer"
             ]
-            selected = final_messages[-1] if final_messages else (messages[-1] if messages else None)
-            return str(selected.get("text") or "").strip() if selected else ""
+            selected = final_messages[-1] if final_messages else (messages[-1] if messages and not require_final_answer else None)
+            text = str(selected.get("text") or "") if selected else ""
+            return text if require_final_answer else text.strip()
         return ""
 
     def run_existing_task(

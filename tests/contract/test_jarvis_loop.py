@@ -104,6 +104,73 @@ class JarvisLoopContractTest(unittest.TestCase):
         result = LoopController(self.controller._store).tick(self.runtime, loop_id=started.loop_id)
         self.assertEqual(result.status, "completed")
         self.assertEqual(len(self.runtime.hold_calls), 1)
+    def test_final_answer_mode_is_persisted_and_reports_review_not_business_pass(self):
+        lane = {"candidate_ids": [7, 9], "database_path": "test.sqlite", "output_boundary": "out",
+                "result_verification": {"mode": "final_answer_json", "receipt_paths": {"7": "7.json", "9": "9.json"},
+                    "terminal_statuses": ["received"], "output_schema": {"type": "object"}}}
+        started = self.controller.start(self.runtime, request_id="pocket-loop", project="test", title="test", prompt="research",
+            max_rounds=2, target_thread_count=1, expires_at="2099-01-01T00:00:00+00:00", threads=[{"slot": "one", "lane": lane}])
+        self.assertEqual(started.status, "running")
+        call = self.runtime.hold_calls[0]
+        self.assertIn("不要写文件", call["prompt"])
+        self.assertNotIn("两者均须包含", call["prompt"])
+        self.assertEqual(call["input_binding"]["result_verification"], lane["result_verification"])
+        # Persist/reload the optional mode; legacy no-mode snapshots remain covered by existing tests.
+        self.assertEqual(self.controller._store.load(started.loop_id)["children"][0]["lane"], lane)
+        hold_id = started.data["children"][0]["hold_id"]
+        self.runtime.states[hold_id] = {"status": "turn_limit_reached", "total_turn_count": 2,
+            "output_verification": {"status": "verified", "candidate_id": 9, "terminal_status": "received",
+                                    "review_needed": True, "verification_status": "not_verified"}}
+        terminal = self.controller.tick(self.runtime, loop_id=started.loop_id)
+        self.assertEqual(terminal.status, "completed")
+        self.assertEqual(terminal.data["children"][0]["business_status"], "review_needed")
+        self.assertEqual(terminal.data["children"][0]["intake_status"], "received")
+
+    def test_final_answer_mode_survives_five_turn_rotation_and_reload(self):
+        # Release integration: the existing intake and rotation contracts must coexist.
+        ids = [1, 2, 3, 4, 5, 6]
+        lane = {"candidate_ids": ids, "database_path": "test.sqlite", "output_boundary": "out",
+                "result_verification": {"mode": "final_answer_json",
+                    "receipt_paths": {str(item): f"{item}.json" for item in ids},
+                    "terminal_statuses": ["received"]}}
+        started = self.controller.start(self.runtime, request_id="intake-rotation", project="test",
+            title="test", prompt="research", continue_prompt="continue research", turns_per_thread=5,
+            max_rounds=6, target_thread_count=1, expires_at="2099-01-01T00:00:00+00:00",
+            threads=[{"slot": "one", "lane": lane}])
+        for count, candidate in ((5, 5), (1, 6)):
+            state = self.controller._store.load(started.loop_id)
+            hold_id = state["children"][0]["hold_id"]
+            self.runtime.states[hold_id] = {"status": "turn_limit_reached", "session_turn_count": count,
+                "total_turn_count": count, "terminal_confirmed": True, "hold_released": True,
+                "output_verification": {"status": "verified", "candidate_id": candidate,
+                    "terminal_status": "received", "review_needed": True, "verification_status": "not_verified"}}
+            result = LoopController(self.controller._store).tick(self.runtime, loop_id=started.loop_id)
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(result.data["children"][0]["business_status"], "review_needed")
+        self.assertEqual([call["max_turns"] for call in self.runtime.hold_calls], [5, 1])
+        self.assertEqual([call["input_binding"]["candidate_ids"] for call in self.runtime.hold_calls], [ids, [6]])
+        for call in self.runtime.hold_calls:
+            self.assertIn("不要写文件", call["prompt"])
+            self.assertIn("不要写文件", call["continue_prompt"])
+            self.assertEqual(call["input_binding"]["result_verification"]["mode"], "final_answer_json")
+
+    def test_final_answer_mode_rejects_batch_unknown_mode_and_receipt_collision(self):
+        from copy import deepcopy
+        lane = {"candidate_ids": [7, 9], "database_path": "test.sqlite", "output_boundary": "out",
+                "result_verification": {"mode": "final_answer_json", "receipt_paths": {"7": "7.json", "9": "9.json"},
+                    "terminal_statuses": ["received"]}}
+        for change in ["batch", "mode", "status", "collision", "alias", "escape"]:
+            invalid = deepcopy(lane)
+            if change == "batch": invalid["batch_size"] = 2
+            if change == "mode": invalid["result_verification"]["mode"] = "typo"
+            if change == "status": invalid["result_verification"]["terminal_statuses"] = ["completed"]
+            if change == "collision": invalid["result_verification"]["receipt_paths"]["9"] = "7.json"
+            if change == "alias": invalid["result_verification"]["receipt_paths"]["9"] = "./7.json"
+            if change == "escape": invalid["result_verification"]["receipt_paths"]["9"] = "../9.json"
+            result = self.controller.start(self.runtime, request_id="bad-pocket-" + change, project="test", title="test", prompt="test",
+                max_rounds=2, target_thread_count=1, expires_at="2099-01-01T00:00:00+00:00", threads=[{"slot": "one", "lane": invalid}])
+            self.assertEqual(result.status, "invalid_request")
+        self.assertEqual(self.runtime.hold_calls, [])
 
     def test_open_ended_tasks_need_no_candidate_count_or_batch(self):
         started = self.controller.start(self.runtime, request_id="open-search", project="test", title="Explore",

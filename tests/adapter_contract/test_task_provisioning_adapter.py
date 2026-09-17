@@ -10,6 +10,8 @@ from unittest.mock import Mock, patch
 from adapters.codex_app_server.task_provisioning_adapter import (
     CodexAppServerTaskProvisioningAdapter,
     append_terminal_turn_history,
+    receive_candidate_final_answer,
+    verify_candidate_output,
 )
 from jarvis_control import TaskProvisionRequest
 from jarvis_control.provisioning import TaskMonitorResumeRequest, output_schema_validator, validate_saved_output
@@ -25,6 +27,58 @@ class FakeConfig:
 
 
 class TaskProvisioningAdapterContractTest(unittest.TestCase):
+    def test_final_answer_intake_preserves_partial_malformed_and_untrusted_identity(self):
+        cases = [({}, False), ({"extra": {"new": 1}}, False),
+                 ({"people": "wrong type", "candidate_id": 999, "request_id": "forged"}, True),
+                 ([], True), (None, True), ("BLOCKED: research unavailable", True)]
+        for payload, has_issues in cases:
+            with self.subTest(payload=payload), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                request = {"request_id": "bound-run", "input_binding": {"candidate_ids": [7],
+                    "lane_item_count": 1, "output_boundary": temp, "result_verification": {
+                        "mode": "final_answer_json", "receipt_paths": {"7": "7.receipt.json"},
+                        "terminal_statuses": ["received"], "output_schema": {"type": "object",
+                            "properties": {"people": {"type": "array"}}}}}}
+                raw = " \r\n" + (payload if isinstance(payload, str) else json.dumps(payload)) + "\n "
+                result = receive_candidate_final_answer(request, 1, thread_id="thread-bound", turn_id="turn-bound", raw=raw)
+                self.assertEqual(result["status"], "verified")
+                self.assertEqual(result["terminal_status"], "received")
+                receipt = json.loads((root / "7.receipt.json").read_text())
+                self.assertEqual(receipt["candidate_id"], 7)
+                self.assertEqual(receipt["request_id"], "bound-run")
+                self.assertEqual((receipt["thread_id"], receipt["turn_id"]), ("thread-bound", "turn-bound"))
+                self.assertEqual(Path(receipt["raw_path"]).read_bytes(), raw.encode())
+                self.assertEqual(json.loads(Path(receipt["output_path"]).read_text()), None if isinstance(payload, str) else payload)
+                self.assertEqual(bool(receipt["schema_issues"]), has_issues)
+                self.assertTrue(receipt["review_needed"])
+                self.assertEqual(receipt["verification_status"], "not_verified")
+                self.assertEqual(receipt["research_completion"], "not_assessed")
+                before = {p.name: p.read_bytes() for p in root.iterdir()}
+                self.assertEqual(receive_candidate_final_answer(request, 1, thread_id="thread-bound", turn_id="turn-bound", raw=raw), result)
+                self.assertEqual(before, {p.name: p.read_bytes() for p in root.iterdir()})
+                Path(receipt["raw_path"]).write_text("tampered")
+                self.assertEqual(verify_candidate_output(request, 1)["status"], "blocked")
+
+    def test_final_answer_intake_rejects_unbound_paths_and_write_failure(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            request = {"request_id": "run", "input_binding": {"candidate_ids": [1], "lane_item_count": 1,
+                "output_boundary": str(root / "out"), "result_verification": {"mode": "final_answer_json",
+                    "receipt_paths": {"1": "../escape.json"}, "terminal_statuses": ["received"]}}}
+            result = receive_candidate_final_answer(request, 1, thread_id="t", turn_id="u", raw="{}")
+            self.assertEqual(result["status"], "blocked")
+            self.assertEqual(list(root.iterdir()), [])
+            request["input_binding"]["result_verification"]["receipt_paths"] = {"1": "receipt.json"}
+            with patch("adapters.codex_app_server.task_provisioning_adapter._write_json", side_effect=OSError("disk full")):
+                self.assertEqual(receive_candidate_final_answer(request, 1, thread_id="t", turn_id="u", raw="{}")["status"], "blocked")
+            self.assertEqual(len(list(root.rglob("*.raw.txt"))), 1)
+            self.assertFalse((root / "out/receipt.json").exists())
+            self.assertEqual(receive_candidate_final_answer(request, 1, thread_id="t", turn_id="u", raw="{}")["status"], "verified")
+            receipt = json.loads((root / "out/receipt.json").read_text())
+            receipt["candidate_id"] = 99
+            (root / "out/receipt.json").write_text(json.dumps(receipt))
+            self.assertEqual(verify_candidate_output(request, 1)["status"], "blocked")
+
     def test_thread_execution_requires_exact_terminal_result_not_live_pid(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp) / "task-holds" / "hold-1"
@@ -158,12 +212,15 @@ class TaskProvisioningAdapterContractTest(unittest.TestCase):
                 self.assertEqual(row["candidate_ids"], row["output_verification"]["candidate_ids"])
 
     def test_optional_schema_survives_hold_persistence_without_migration(self):
-        for schema in (None, False, {"properties": {"score": {"type": "integer"}}}):
+        for schema, mode in ((None, None), (False, None), ({"properties": {"score": {"type": "integer"}}}, None),
+                             ({"type": "object"}, "final_answer_json")):
             with self.subTest(schema=schema), tempfile.TemporaryDirectory() as temp:
                 binding = {"candidate_ids": [1], "lane_item_count": 1, "output_boundary": "unused",
                            "result_verification": {"receipt_paths": {"1": "1.json"}, "terminal_statuses": ["completed"]}}
                 if schema is not None:
                     binding["result_verification"]["output_schema"] = schema
+                if mode:
+                    binding["result_verification"].update(mode=mode, terminal_statuses=["received"])
                 adapter = CodexAppServerTaskProvisioningAdapter("unused", state_dir=Path(temp), config_loader=lambda _: FakeConfig())
                 result = adapter.provision(TaskProvisionRequest(request_id="schema", project="test", title="test",
                     prompt="test", source_ref="test", input_binding=binding))
@@ -303,9 +360,9 @@ class TaskProvisioningAdapterContractTest(unittest.TestCase):
             def initialize_host(**kwargs):
                 self.assertEqual(kwargs["state_dir"], state_dir)
                 self.assertEqual(kwargs["launcher_config"], config_path)
-                self.assertEqual(kwargs["workers"], 10)
+                self.assertEqual(kwargs["workers"], 3)
                 (state_dir / "hold-host.json").write_text(json.dumps({
-                    "status": "ready", "pid": 1781, "worker_capacity": 10,
+                    "status": "ready", "pid": 1781, "worker_capacity": 3,
                     "observed_at": datetime.now(timezone.utc).isoformat(),
                     "host_started_at": datetime.now(timezone.utc).isoformat(),
                     "profile": config.profile, "codex_home": config.expected_codex_home,
@@ -321,7 +378,7 @@ class TaskProvisioningAdapterContractTest(unittest.TestCase):
             )
 
             health = adapter.ensure_hold_host_ready(required_workers=3)
-            reused = adapter.ensure_hold_host_ready(required_workers=7)
+            reused = adapter.ensure_hold_host_ready(required_workers=2)
             self.assertEqual(reused, {"status": "ready", "phase": "already_running"})
             self.assertFalse((state_dir / "task-holds").exists())
 
