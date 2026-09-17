@@ -24,3 +24,11 @@
 ## Deployment boundary
 
 This document records source verification only. It does not certify installation, a running service's source snapshot, current MCP connections, publication or actual release of any operational Hold. Those must be read back independently by the release controller. Healthy running work must not be restarted or replayed to activate this source.
+
+## Attempt 2: release identity correction
+
+- Independent review rejected attempt 1 for one P2: MCP initialization advertised 0.2.1 while package metadata declared 0.2.2. The separate independent related-core run passed 290 tests; it did not waive that release-identity defect.
+- Ran the existing version-targeted test first: one passed, confirming it still encoded the stale version rather than checking release metadata.
+- Changed the existing MCP version constant to 0.2.2. Updated the same canonical test to compare server identity with `pyproject.toml` and perform the actual SDK legacy initialization handshake, then read `client.session.server_info.version`.
+- Targeted MCP module verification: 21 tests passed. The wider 290-test run was not repeated because the correction is limited to release metadata and its MCP assertion.
+- Candidate remains pending independent acceptance (`self_accepted=false`). No installation, publication or operational runtime action was performed.

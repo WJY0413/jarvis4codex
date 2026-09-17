@@ -4,6 +4,7 @@ import asyncio
 import tempfile
 import threading
 import time
+import tomllib
 import unittest
 from pathlib import Path
 
@@ -90,7 +91,16 @@ class JarvisMcpContractTest(unittest.TestCase):
         return asyncio.run(run())
 
     def test_initialize_reports_the_current_mcp_version(self):
-        self.assertEqual(self.server.mcp.version, "0.2.1")
+        metadata = tomllib.loads((Path(__file__).resolve().parents[2] / "pyproject.toml").read_text(encoding="utf-8"))
+        expected_version = metadata["project"]["version"]
+        self.assertEqual(expected_version, "0.2.2")
+        self.assertEqual(self.server.mcp.version, expected_version)
+
+        async def initialize():
+            async with Client(self.server.mcp, mode="legacy") as client:
+                return client.session.server_info.version
+
+        self.assertEqual(asyncio.run(initialize()), expected_version)
 
     def test_loop_mcp_preserves_nested_output_schema(self):
         from unittest.mock import Mock
