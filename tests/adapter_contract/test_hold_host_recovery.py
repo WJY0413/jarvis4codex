@@ -5,6 +5,7 @@ import os
 import queue
 import threading
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -47,6 +48,68 @@ class RecoveryClient:
 
 
 class HoldHostRecoveryAdapterContractTest(unittest.TestCase):
+    def test_shared_scan_skips_history_preserves_twenty_workers_and_sees_requeue(self):
+        # Reproduced defect: every idle worker read all completed history each poll.
+        from adapters.codex_app_server import jarvis_hold_host_service as module
+        from adapters.codex_app_server.jarvis_task_hold_host import _write_json
+        with tempfile.TemporaryDirectory() as temp:
+            state = Path(temp)
+            history = []
+            for kind, count in (("task-holds", 590), ("task-monitors", 21)):
+                for index in range(count):
+                    root = state / kind / str(index)
+                    root.mkdir(parents=True)
+                    history.append(root)
+                    for name in ("request", "ack", "result"):
+                        _write_json(root / (name + ".json"), {"status": "completed"})
+            host = JarvisHoldHost(state_dir=state, launcher_config=state / "unused", workers=20)
+            stop, release, twenty, finished = (threading.Event() for _ in range(4))
+            started, errors, history_reads = [], [], []
+            guard = threading.Lock()
+            original_read = module._read_json
+            def read(path):
+                if path.name in {"request.json", "ack.json"} and (path.parent / "result.json").exists():
+                    history_reads.append(path)
+                return original_read(path)
+            def holder(_config, request, ack, result):
+                with guard:
+                    started.append(request.parent)
+                    if len(started) == 20:
+                        twenty.set()
+                if not release.wait(8):
+                    errors.append("holder release timeout")
+                _write_json(result, {"status": "completed"})
+                if len(started) == 21:
+                    finished.set()
+            def enqueue(root):
+                root.mkdir(parents=True, exist_ok=True)
+                _write_json(root / "request.json", {"request_id": root.name, "hold_id": root.name})
+                _write_json(root / "ack.json", {"request_id": root.name, "status": "accepted", "phase": "queued_for_user_host"})
+                (root / "result.json").unlink(missing_ok=True)
+            with patch.object(module, "_read_json", side_effect=read), patch.object(module, "hold_task", side_effect=holder):
+                runner = threading.Thread(target=host.run_forever, kwargs={"poll_seconds": .25, "stop_event": stop})
+                runner.start()
+                try:
+                    # Let at least one idle scan finish before adding live work.
+                    time.sleep(.35)
+                    self.assertEqual(history_reads, [])
+                    enqueue(history[-1])  # Same persisted directory explicitly requeued.
+                    for index in range(20):
+                        enqueue(state / "task-holds" / f"new-{index}")
+                    self.assertTrue(twenty.wait(5), "configured capacity was reduced")
+                    self.assertEqual(len(started), 20)
+                    release.set()
+                    self.assertTrue(finished.wait(5), "queued request was lost")
+                finally:
+                    release.set()
+                    stop.set()
+                    runner.join(8)
+            self.assertFalse(runner.is_alive())
+            self.assertEqual(errors, [])
+            self.assertEqual(len(started), len(set(started)))
+            self.assertIn(history[-1], started)
+            self.assertTrue(all((root / "result.json").exists() for root in history))
+
     def test_counter_cannot_override_binding_and_exact_completed_repeat_is_idempotent(self):
         from adapters.codex_app_server.jarvis_task_hold_host import _write_json
         for terminal in (False, True):

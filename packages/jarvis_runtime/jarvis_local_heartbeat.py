@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from contextlib import contextmanager
 import json
+import os
 from pathlib import Path
 import sqlite3
 import time
@@ -238,7 +239,18 @@ class HeartbeatService:
         return {"status": "failed", "error": "no JarvisControl function runner is configured"}
 
     def health(self) -> dict[str, Any]:
-        return {"status": "running", **computer_time(), **self.store.summary()}
+        # Reading configuration/SQLite is not evidence that a scheduler is alive.
+        # Even a fresh tick is labelled evidence, not a process-liveness claim.
+        try:
+            saved = json.loads(self.config.health_path.read_text(encoding="utf-8-sig"))
+            age = (_now() - _parse_time(saved.get("observed_at") or saved.get("utc_time"), "observed_at")).total_seconds()
+            recent = 0 <= age <= max(15.0, self.config.poll_seconds * 3)
+            verified_tick = saved.get("status") == "tick_completed" and isinstance(saved.get("pid"), int)
+            evidence = {"status": ("recent_tick" if verified_tick else "unverified") if recent else "stale", "last_tick": saved,
+                        "age_seconds": age}
+        except (OSError, ValueError, TypeError, AttributeError):
+            evidence = {"status": "unobserved", "last_tick": None}
+        return {**evidence, **computer_time(), **self.store.summary()}
 
     def run_once(self) -> dict[str, Any]:
         results = []
@@ -249,7 +261,8 @@ class HeartbeatService:
                 **computer_time(),
             })
             results.append(self.store.record(heartbeat, receipt))
-        health = self.health()
+        health = {"status": "tick_completed", "pid": os.getpid(), "observed_at": _now().isoformat(),
+                  **computer_time(), **self.store.summary()}
         self.config.health_path.parent.mkdir(parents=True, exist_ok=True)
         self.config.health_path.write_text(json.dumps(health, ensure_ascii=False, indent=2), encoding="utf-8")
         return {"results": results, "health": health}
@@ -271,7 +284,8 @@ class JarvisControlHeartbeat:
 
     def invoke_heartbeat(self, _request_id: str, capability: str, _source_ref: str, arguments: Mapping[str, Any]) -> dict[str, Any]:
         if capability == "heartbeat.health":
-            return {"status": "completed", **computer_time(), **self.store.summary()}
+            return {"status": "completed", **computer_time(), **self.store.summary(),
+                    "scheduler": HeartbeatService(self.store.config, store=self.store).health()}
         if capability == "heartbeat.create":
             created = self.store.create(arguments)
             return {"status": "active", "heartbeat_id": arguments["heartbeat_id"], **created}

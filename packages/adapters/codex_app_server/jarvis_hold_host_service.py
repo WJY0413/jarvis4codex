@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import queue
 import signal
 import subprocess
 import sys
@@ -288,15 +289,18 @@ class JarvisHoldHost:
         self._active_hold_ids: set[str] = set()
         self._health_lock = threading.Lock()
 
-    def run_once(self) -> bool:
+    def run_once(self, *, request_root: Path | None = None) -> bool:
         self._write_health("ready")
-        for requests_root in self.requests_roots:
+        for requests_root in self.requests_roots if request_root is None else (request_root.parent,):
             if not requests_root.is_dir():
                 continue
-            for root in sorted(path for path in requests_root.iterdir() if path.is_dir()):
+            roots = (request_root,) if request_root is not None else sorted(path for path in requests_root.iterdir() if path.is_dir())
+            for root in roots:
                 request_path = root / "request.json"
                 ack_path = root / "ack.json"
                 result_path = root / "result.json"
+                if result_path.exists():
+                    continue
                 request = _read_json(request_path)
                 ack = _read_json(ack_path)
                 if request is None or ack is None or result_path.exists():
@@ -650,28 +654,63 @@ class JarvisHoldHost:
 
     def run_forever(self, *, poll_seconds: float, stop_event: threading.Event | None = None) -> None:
         stop = stop_event or threading.Event()
+        pending: queue.Queue[Path] = queue.Queue(maxsize=self.workers)
+        scheduled: set[Path] = set()
+        scheduled_lock = threading.Lock()
         heartbeat = threading.Thread(target=self._run_health_heartbeat, args=(stop, poll_seconds), daemon=True)
-        threads = [threading.Thread(target=self._run_worker, args=(poll_seconds, stop), daemon=True) for _ in range(self.workers)]
+        threads = [threading.Thread(target=self._run_worker, args=(pending, scheduled, scheduled_lock, stop), daemon=True) for _ in range(self.workers)]
         heartbeat.start()
         for worker in threads:
             worker.start()
+        # One coordinator enumerates history; workers only consume bounded work.
+        # No terminal cache: an explicitly requeued request is visible next poll.
+        while not stop.is_set():
+            try:
+                for requests_root in self.requests_roots:
+                    if not requests_root.is_dir():
+                        continue
+                    for root in requests_root.iterdir():
+                        if stop.is_set():
+                            break
+                        if not root.is_dir() or (root / "result.json").exists():
+                            continue
+                        with scheduled_lock:
+                            if root in scheduled:
+                                continue
+                            scheduled.add(root)
+                        while not stop.is_set():
+                            try:
+                                pending.put(root, timeout=0.25)
+                                break
+                            except queue.Full:
+                                continue
+            except OSError:
+                pass  # Concurrently removed directories are retried next poll.
+            stop.wait(max(poll_seconds, 0.25))
         for worker in threads:
             worker.join()
+        heartbeat.join()
 
     def _run_health_heartbeat(self, stop_event: threading.Event, poll_seconds: float) -> None:
         while not stop_event.is_set():
             self._write_health("ready")
             stop_event.wait(min(max(poll_seconds, 0.25), 5.0))
 
-    def _run_worker(self, poll_seconds: float, stop_event: threading.Event) -> None:
+    def _run_worker(self, pending: queue.Queue[Path], scheduled: set[Path],
+                    scheduled_lock: threading.Lock, stop_event: threading.Event) -> None:
         while not stop_event.is_set():
             try:
-                handled = self.run_once()
+                root = pending.get(timeout=0.25)
+            except queue.Empty:
+                continue
+            try:
+                self.run_once(request_root=root)
             except Exception:
                 self._write_health("ready")
-                handled = False
-            if not handled:
-                stop_event.wait(max(poll_seconds, 0.25))
+            finally:
+                with scheduled_lock:
+                    scheduled.discard(root)
+                pending.task_done()
 
     def _mark_active(self, hold_id: str) -> None:
         with self._health_lock:

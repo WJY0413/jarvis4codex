@@ -2,14 +2,167 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 import json
+import os
 from pathlib import Path
 import tempfile
+import threading
+import time
 import unittest
+from unittest.mock import patch
 
 from jarvis_local_heartbeat import HeartbeatService, JarvisControlHeartbeat, LocalHeartbeatConfig, LocalHeartbeatStore
 
 
 class LocalHeartbeatTest(unittest.TestCase):
+    def test_health_reports_tick_evidence_not_configuration_as_running(self):
+        service = HeartbeatService(self.config, store=self.store)
+        self.assertEqual(service.health()["status"], "unobserved")
+        self.assertFalse(self.config.health_path.exists())
+        service.run_once()
+        self.assertEqual(service.health()["status"], "recent_tick")
+        self.assertEqual(service.health()["last_tick"]["pid"], os.getpid())
+        saved = json.loads(self.config.health_path.read_text(encoding="utf-8"))
+        saved["observed_at"] = "2000-01-01T00:00:00+00:00"
+        self.config.health_path.write_text(json.dumps(saved), encoding="utf-8")
+        before = self.config.health_path.read_bytes()
+        self.assertEqual(HeartbeatService(self.config).health()["status"], "stale")
+        control = JarvisControlHeartbeat(self.config_path)
+        receipt = control.invoke_heartbeat("health", "heartbeat.health", "test", {})
+        self.assertEqual(receipt["status"], "completed")
+        self.assertEqual(receipt["scheduler"]["status"], "stale")
+        self.assertEqual(before, self.config.health_path.read_bytes())
+        self.config.health_path.write_text(json.dumps({"status": "running", "utc_time": datetime.now(timezone.utc).isoformat()}))
+        self.assertEqual(service.health()["status"], "unverified")
+
+    def test_background_scheduler_rotates_after_writer_release_and_restarts_from_disk(self):
+        # User requirement: independently scheduled tick, not an external status
+        # query, must launch a new thread only after the previous writer exits.
+        from dataclasses import replace
+        from adapters.codex_app_server.jarvis_local_heartbeat_host import JarvisControlFunctionRunner
+        from adapters.codex_app_server.jarvis_hold_host_service import JarvisHoldHost
+        from adapters.codex_app_server.jarvis_task_hold_host import _write_json
+        from jarvis_control import LoopController, LoopStore
+        root = Path(self.temp.name)
+        config = replace(self.config, min_interval_seconds=1)
+        scheduler_store = LocalHeartbeatStore(config)
+        loop_store = LoopStore(root / "loops")
+        controller = LoopController(loop_store)
+        writer_release, result_ready = threading.Event(), threading.Event()
+        holder_stop, scheduler_stop = threading.Event(), threading.Event()
+        dispatches, errors = [], []
+
+        class Runtime:
+            def hold(_self, **kwargs):
+                for previous in dispatches:
+                    if (previous / ".user-host-claim").exists():
+                        errors.append("new dispatch before old writer release")
+                hold_root = root / "task-holds" / str(len(dispatches) + 1)
+                hold_root.mkdir(parents=True)
+                thread_id = f"fake-thread-{len(dispatches) + 1}"
+                dispatches.append(hold_root)
+                request = {"request_id": kwargs["request_id"], "hold_id": kwargs["hold_id"], "thread_id": thread_id}
+                _write_json(hold_root / "request.json", request)
+                _write_json(hold_root / "ack.json", {**request, "status": "accepted", "phase": "queued_for_user_host"})
+                return {"status": "holding", "target_thread_id": thread_id, "data": {"monitor_id": kwargs["hold_id"]}}
+
+            def monitor(_self, **kwargs):
+                for hold_root in dispatches:
+                    request = json.loads((hold_root / "request.json").read_text())
+                    if request["hold_id"] == kwargs["hold_id"]:
+                        result = hold_root / "result.json"
+                        receipt = json.loads(result.read_text()) if result.exists() else {"status": "holding"}
+                        return {"status": "completed", "data": {**request, **receipt,
+                            "hold_released": result.exists() and not (hold_root / ".user-host-claim").exists()}}
+                raise AssertionError("unexpected hold")
+
+            def heartbeat(_self, **kwargs):
+                if kwargs["action"] == "create":
+                    scheduler_store.create(kwargs["options"])
+                    return {"status": "active"}
+                scheduler_store.cancel(kwargs["heartbeat_id"])
+                return {"status": "cancelled"}
+
+            def stop_hold(_self, _hold_id):
+                return {"status": "stop_requested"}
+
+        runtime = Runtime()
+
+        class Control:
+            def loop(_self, *, action, loop_id):
+                if action != "tick":
+                    raise AssertionError("test cannot drive an external status call")
+                result = controller.tick(runtime, loop_id=loop_id)
+                return {"status": result.status, "data": result.data}
+
+        def holder(_config, request, ack, result):
+            payload = json.loads(request.read_text())
+            _write_json(result, {**payload, "status": "turn_limit_reached", "terminal_confirmed": True,
+                                 "session_turn_count": 1})
+            if request.parent == dispatches[0]:
+                result_ready.set()
+                if not writer_release.wait(10):
+                    errors.append("writer release timeout")
+
+        def schedule(service, stop):
+            try:
+                while not stop.is_set():
+                    service.run_once()
+                    stop.wait(.05)
+            except Exception as exc:
+                errors.append(repr(exc))
+
+        def await_condition(condition, timeout=6):
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                try:
+                    if condition():
+                        return True
+                except PermissionError:
+                    pass  # Windows readback can briefly race atomic replacement.
+                time.sleep(.02)
+            return False
+
+        started = controller.start(runtime, request_id="background-rotation", project="test", title="test",
+            prompt="isolated fake native holder", turns_per_thread=1, max_rounds=2, target_thread_count=1,
+            interval_seconds=1, expires_at="2099-01-01T00:00:00+00:00")
+        self.assertEqual(started.status, "running")
+        heartbeat_id = started.data["heartbeat_id"]
+        host = JarvisHoldHost(state_dir=root, launcher_config=root / "unused", workers=20)
+        service = HeartbeatService(config, function_runner=JarvisControlFunctionRunner(Control()))
+        host_thread = threading.Thread(target=host.run_forever, kwargs={"poll_seconds": .25, "stop_event": holder_stop})
+        scheduler_thread = threading.Thread(target=schedule, args=(service, scheduler_stop))
+        with patch("adapters.codex_app_server.jarvis_hold_host_service.hold_task", side_effect=holder):
+            host_thread.start()
+            scheduler_thread.start()
+            try:
+                self.assertTrue(result_ready.wait(3))
+                self.assertTrue(await_condition(lambda: scheduler_store.get(heartbeat_id)["run_count"] >= 2))
+                self.assertEqual(len(dispatches), 1, "terminal result alone cannot release a writer")
+                scheduler_stop.set()
+                scheduler_thread.join(3)
+                prior_count = scheduler_store.get(heartbeat_id)["run_count"]
+                controller = LoopController(LoopStore(root / "loops"))
+                service = HeartbeatService(config, function_runner=JarvisControlFunctionRunner(Control()))
+                scheduler_stop = threading.Event()
+                scheduler_thread = threading.Thread(target=schedule, args=(service, scheduler_stop))
+                writer_release.set()
+                scheduler_thread.start()
+                self.assertTrue(await_condition(lambda: loop_store.load(started.loop_id)["status"] == "completed"))
+                self.assertGreater(scheduler_store.get(heartbeat_id)["run_count"], prior_count)
+                self.assertEqual(len(dispatches), 2)
+                self.assertEqual(service.health()["status"], "recent_tick")
+                self.assertEqual([json.loads((path / "request.json").read_text())["thread_id"] for path in dispatches],
+                                 ["fake-thread-1", "fake-thread-2"])
+            finally:
+                writer_release.set()
+                scheduler_stop.set()
+                holder_stop.set()
+                scheduler_thread.join(5)
+                host_thread.join(5)
+        self.assertEqual(errors, [])
+        self.assertFalse(host_thread.is_alive())
+        self.assertFalse(scheduler_thread.is_alive())
+
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         root = Path(self.temp.name)
