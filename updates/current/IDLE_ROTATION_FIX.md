@@ -44,8 +44,12 @@ in-flight scans continue beyond the timer.
 
 The scheduler fixture runs real `HeartbeatService.run_once()` and historical
 `LoopStore.active_loop_ids()` each second, with no active business or notifier.
-Mixed-fixture process CPU fell about 93.4%; the completed-only comparison fell
-about 97.8%. These are implementation measurements, not independent QA or deployed
+Raw mixed-fixture process CPU seconds fell about 93.4%; the completed-only
+comparison fell about 97.8%. Because baseline shutdown was delayed, normalized
+CPU seconds per wall second is the appropriate rate comparison: all-terminal
+2.563 to 0.0914 (about 96.4% lower), mixed plus scheduler 2.530 to 0.3059 (about
+87.9% lower). These are process CPU rates, not whole-machine percentages.
+These are implementation measurements, not independent QA or deployed
 machine measurements. Historical Loop scanning remains unchanged: the measured
 combined cost does not justify an additional caching/state change in this fix.
 
