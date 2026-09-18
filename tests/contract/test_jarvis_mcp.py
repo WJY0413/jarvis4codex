@@ -93,7 +93,7 @@ class JarvisMcpContractTest(unittest.TestCase):
     def test_initialize_reports_the_current_mcp_version(self):
         metadata = tomllib.loads((Path(__file__).resolve().parents[2] / "pyproject.toml").read_text(encoding="utf-8"))
         expected_version = metadata["project"]["version"]
-        self.assertEqual(expected_version, "0.2.2")
+        self.assertEqual(expected_version, "0.2.3")
         self.assertEqual(self.server.mcp.version, expected_version)
 
         async def initialize():
