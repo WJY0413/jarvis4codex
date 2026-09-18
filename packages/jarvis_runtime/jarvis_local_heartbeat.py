@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 import sqlite3
 import time
+import uuid
 from typing import Any, Callable, Mapping
 
 
@@ -263,9 +264,30 @@ class HeartbeatService:
             results.append(self.store.record(heartbeat, receipt))
         health = {"status": "tick_completed", "pid": os.getpid(), "observed_at": _now().isoformat(),
                   **computer_time(), **self.store.summary()}
-        self.config.health_path.parent.mkdir(parents=True, exist_ok=True)
-        self.config.health_path.write_text(json.dumps(health, ensure_ascii=False, indent=2), encoding="utf-8")
+        self._publish_health(health)
         return {"results": results, "health": health}
+
+    def _publish_health(self, health: Mapping[str, Any]) -> None:
+        path = self.config.health_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            temporary.write_text(json.dumps(dict(health), ensure_ascii=False, indent=2), encoding="utf-8")
+            # Keep the previous complete tick visible while Windows readers hold
+            # the destination open; never truncate valid evidence on a failed write.
+            for attempt in range(20):
+                try:
+                    temporary.replace(path)
+                    break
+                except PermissionError:
+                    if attempt == 19:
+                        raise
+                    time.sleep(min(0.05 * (attempt + 1), 0.25))
+        finally:
+            try:
+                temporary.unlink(missing_ok=True)
+            except PermissionError:
+                pass  # Cleanup failure must not mask the publication result.
 
     def run_forever(self) -> int:
         try:

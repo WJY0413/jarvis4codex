@@ -14,6 +14,64 @@ from jarvis_local_heartbeat import HeartbeatService, JarvisControlHeartbeat, Loc
 
 
 class LocalHeartbeatTest(unittest.TestCase):
+    def test_health_remains_readable_while_next_tick_is_being_written(self):
+        # Independent QA reproduced an empty health file during a normal write.
+        service = HeartbeatService(self.config, store=self.store)
+        service.run_once()
+        old_tick = self.config.health_path.read_bytes()
+        entered, release = threading.Event(), threading.Event()
+        original = Path.write_text
+        errors = []
+        def paused_write(path, data, *args, **kwargs):
+            if path.parent == self.config.health_path.parent and path.name.endswith(".tmp"):
+                with path.open("w", encoding="utf-8") as stream:
+                    entered.set()
+                    if not release.wait(5):
+                        raise AssertionError("test publication release timeout")
+                    return stream.write(data)
+            return original(path, data, *args, **kwargs)
+        def write_tick():
+            try:
+                service.run_once()
+            except Exception as exc:
+                errors.append(exc)
+        with patch.object(Path, "write_text", paused_write):
+            writer = threading.Thread(target=write_tick)
+            writer.start()
+            try:
+                self.assertTrue(entered.wait(3))
+                self.assertEqual(self.config.health_path.read_bytes(), old_tick)
+                self.assertEqual(service.health()["status"], "recent_tick")
+            finally:
+                release.set()
+                writer.join(5)
+        self.assertFalse(writer.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(service.health()["status"], "recent_tick")
+        self.assertEqual(list(self.config.health_path.parent.glob("*.tmp")), [])
+
+    def test_health_atomic_replace_retries_and_preserves_previous_tick_on_failure(self):
+        service = HeartbeatService(self.config, store=self.store)
+        service.run_once()
+        replace = Path.replace
+        calls = []
+        def reader_lock_then_replace(source, target):
+            calls.append(target)
+            if len(calls) == 1:
+                raise PermissionError("Windows reader sharing violation")
+            return replace(source, target)
+        with patch.object(Path, "replace", reader_lock_then_replace), patch("jarvis_local_heartbeat.time.sleep"):
+            service.run_once()
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(service.health()["status"], "recent_tick")
+        previous = self.config.health_path.read_bytes()
+        with patch.object(Path, "replace", side_effect=PermissionError("persistently locked")) as attempts, patch("jarvis_local_heartbeat.time.sleep"):
+            with self.assertRaises(PermissionError):
+                service.run_once()
+        self.assertEqual(attempts.call_count, 20)
+        self.assertEqual(self.config.health_path.read_bytes(), previous)
+        self.assertEqual(list(self.config.health_path.parent.glob("*.tmp")), [])
+
     def test_health_reports_tick_evidence_not_configuration_as_running(self):
         service = HeartbeatService(self.config, store=self.store)
         self.assertEqual(service.health()["status"], "unobserved")

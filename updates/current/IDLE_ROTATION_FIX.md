@@ -101,3 +101,35 @@ must be reconciled under explicit user direction before activation.
 Independent QA must reproduce the benchmark and safety contracts on the frozen
 commit. An installation receipt must separately report actual process state,
 startup/recovery configuration, CPU sampling and any limits on live-business proof.
+
+## Attempt 2: independent QA health-publication correction
+
+The first independent review rejected candidate
+`ba7e63b1ee75e8683d1f1237679cf22a0bc0b57a`: its 82-test run had 81 passes
+and one timing-sensitive failure. A normal scheduler health-file truncate/write
+made the newly added reader return `unobserved` between otherwise valid recent
+ticks. A focused rerun passing did not erase that failure. The independent probe
+was rerun against the implementation worktree before this correction and again
+reported `before=recent_tick`, `during=unobserved`, `after=recent_tick`.
+
+Correction is confined to the existing heartbeat module: publish a complete JSON
+tick through a unique same-directory temporary file and atomic replacement.
+Replacement retries Windows `PermissionError` up to 20 attempts using the existing
+receipt-writer backoff pattern (50 ms increasing to 250 ms). If publication still
+fails, the prior complete health file survives and the failure is raised; temporary
+cleanup does not mask the publication outcome. No adapter import or new schema.
+
+Two focused cases in the existing heartbeat test module capture the reproduced
+failure window and Windows sharing behavior. One pauses the temporary write and
+requires the original `recent_tick` evidence to remain readable; the other verifies
+transient replacement retry plus bounded persistent failure preserving previous
+bytes and removing temporary files. The original background rotation assertion
+remains unchanged.
+
+Attempt-2 validation: `python -m unittest tests.jarvis_runtime.test_jarvis_local_heartbeat`
+passed all 13 tests, including autonomous rotation/reload and both new atomic-write
+checks. The full 82-test collection was not rerun. Previously independent Host
+capacity/exception-cleanup, recovery contracts and 90.81% normalized synthetic
+CPU-rate reduction remain separate prior evidence; the first QA failure remains
+recorded above. Await a new independent health/integration review; no deployment
+or self-acceptance is claimed.
