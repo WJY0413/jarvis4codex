@@ -93,7 +93,7 @@ class JarvisMcpContractTest(unittest.TestCase):
     def test_initialize_reports_the_current_mcp_version(self):
         metadata = tomllib.loads((Path(__file__).resolve().parents[2] / "pyproject.toml").read_text(encoding="utf-8"))
         expected_version = metadata["project"]["version"]
-        self.assertEqual(expected_version, "0.2.3")
+        self.assertEqual(expected_version, "0.2.4")
         self.assertEqual(self.server.mcp.version, expected_version)
 
         async def initialize():
@@ -125,7 +125,7 @@ class JarvisMcpContractTest(unittest.TestCase):
                 return await client.call_tool(name, arguments)
         return asyncio.run(run())
 
-    def test_lists_the_eight_public_jarvis_tools_with_sdk_generated_schema(self):
+    def test_lists_the_nine_public_jarvis_tools_with_sdk_generated_schema(self):
         result = self.list_tools()
         self.assertEqual(
             [tool.name for tool in result.tools],
@@ -137,6 +137,7 @@ class JarvisMcpContractTest(unittest.TestCase):
                 "jarvis_resume",
                 "jarvis_monitor",
                 "jarvis_heartbeat",
+                "jarvis_update",
                 "jarvis_notify",
             ],
         )

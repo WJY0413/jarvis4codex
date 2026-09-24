@@ -1,10 +1,10 @@
-# Jarvis Control Plane 0.2.2
+# Jarvis Control Plane 0.2.4
 
 Jarvis provides durable task holding, bounded loops, monitoring and local heartbeat scheduling through MCP. The Codex App Server adapter owns native turns; Monitor decides whether a completed turn may continue, and Hold executes only the command bound to that Hold and turn.
 
-The public MCP tools are `jarvis_create`, `jarvis_hold`, `jarvis_loop`, `jarvis_read`, `jarvis_resume`, `jarvis_monitor`, `jarvis_heartbeat` and `jarvis_notify`. Harness-specific operations remain in adapters behind the control-plane contracts.
+The public MCP tools are `jarvis_create`, `jarvis_hold`, `jarvis_loop`, `jarvis_read`, `jarvis_resume`, `jarvis_monitor`, `jarvis_heartbeat`, `jarvis_update` and `jarvis_notify`. Harness-specific operations remain in adapters behind the control-plane contracts.
 
-## Included in 0.2.2
+## Included in 0.2.4
 
 - Durable Hold ownership and exact host-aware recovery. Explicit `--workers` capacity is preserved (for example, 20); an active Host is not restarted to resize it.
 - Optional `turns_per_thread` bounds each thread within a Loop. Set it to 5 for five-turn rotation; continuation preserves logical task identity and remaining lane work.
@@ -12,6 +12,7 @@ The public MCP tools are `jarvis_create`, `jarvis_hold`, `jarvis_loop`, `jarvis_
 - Finite lanes with arbitrary positive batch sizes, exact candidate binding, last-batch handling, per-item saved output/receipt verification and optional Draft 2020-12 output schemas. Open-ended work can omit lanes.
 - Native observer reads distinguish raw observer status from execution evidence: `read_source`, `execution_source` and `execution_status`. An interrupted observer is not proof that the owning Hold stopped; missing authoritative evidence remains unknown.
 - Local heartbeat scheduling, terminal reconciliation and optional outbox notifications. Delivery is successful only with its delivery receipt; enqueueing is not delivery.
+- Programmatic `jarvis_update` checks or activates automatic selection of the newest validated local Codex Desktop runtime without polling, downloading, or restarting Codex Desktop.
 
 Result verification supports saved JSON files and receipts, plus the explicitly selected `final_answer_json` intake mode. Runtime completion and technical output verification do not imply business-quality acceptance.
 

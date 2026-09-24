@@ -108,6 +108,62 @@ class CodexAppServerTaskProvisioningAdapter:
         config = self._config_loader(self._config_path)
         return sorted(config.allowed_projects)
 
+    def update_runtime(self, *, action: str, request_id: str) -> dict[str, Any]:
+        """Check or activate automatic Codex Desktop selection for new Jarvis turns."""
+        if action not in {"check", "apply"}:
+            raise ValueError("action must be check or apply")
+        raw = _read_json_file(self._config_path)
+        if raw is None:
+            raise RuntimeError("launcher config is unreadable")
+        resolver = _runtime_symbols()["resolve_codex_runtime"]
+        selected = dict(resolver("desktop_auto"))
+        configured = str(raw.get("codex_cli") or "auto")
+        health = _read_json_file(self._state_dir / "hold-host.json") or {}
+        active_count = int(health.get("active_count") or 0)
+        active_hold_ids = [str(value) for value in health.get("active_hold_ids") or []]
+        data: dict[str, Any] = {
+            "action": action,
+            "configured": configured,
+            "selected": selected,
+            "update_required": configured != "desktop_auto",
+            "changed": False,
+            "hold_host": {
+                "status": health.get("status"),
+                "pid": health.get("pid"),
+                "active_count": active_count,
+                "active_hold_ids": active_hold_ids,
+            },
+        }
+        if action == "check" or configured == "desktop_auto":
+            return {"status": "completed", "data": data}
+        if active_count or active_hold_ids:
+            return {
+                "status": "blocked",
+                "reason": "active Jarvis holds prevent a launcher policy update",
+                "data": data,
+            }
+        stamp = observed_now().strftime("%Y%m%d-%H%M%S-%f")
+        backup_dir = self._state_dir / "runtime-update-backups" / stamp
+        backup_dir.mkdir(parents=True, exist_ok=False)
+        backup_path = backup_dir / self._config_path.name
+        backup_path.write_bytes(self._config_path.read_bytes())
+        updated = dict(raw)
+        updated["codex_cli"] = "desktop_auto"
+        _write_json(self._config_path, updated)
+        readback = _read_json_file(self._config_path)
+        if readback is None or readback.get("codex_cli") != "desktop_auto":
+            self._config_path.write_bytes(backup_path.read_bytes())
+            raise RuntimeError("launcher config update failed readback and was rolled back")
+        verified = dict(resolver(str(readback["codex_cli"])))
+        data.update({
+            "configured": "desktop_auto",
+            "selected": verified,
+            "update_required": False,
+            "changed": True,
+            "backup_path": str(backup_path),
+        })
+        return {"status": "completed", "data": data}
+
     def hold_host_health(self, *, required_workers: int = 1) -> dict[str, str]:
         """Check whether the fixed HoldHost can accept a Loop before it is created."""
         try:
@@ -872,6 +928,9 @@ def _runtime_symbols() -> dict[str, Any]:
     runtime_dir = Path(__file__).resolve().parents[2] / "jarvis_runtime"
     if str(runtime_dir) not in sys.path:
         sys.path.insert(0, str(runtime_dir))
-    from jarvis_native_task_launcher import NativeTaskLauncherConfig
+    from jarvis_native_task_launcher import NativeTaskLauncherConfig, resolve_codex_runtime
 
-    return {"NativeTaskLauncherConfig": NativeTaskLauncherConfig}
+    return {
+        "NativeTaskLauncherConfig": NativeTaskLauncherConfig,
+        "resolve_codex_runtime": resolve_codex_runtime,
+    }

@@ -20,7 +20,7 @@ class JarvisMcpServer:
         self.mcp = MCPServer(
             "jarvis-control",
             title="Jarvis Control Plane",
-            version="0.2.3",
+            version="0.2.4",
             instructions=(
                 "Use jarvis_read before a state-changing call when you need capability or thread context. "
                 "Use jarvis_hold for a managed lifecycle: Hold executes turns and Monitor issues a verified "
@@ -238,6 +238,19 @@ class JarvisMcpServer:
             return _tool_result(self.control.heartbeat(
                 action=action, request_id=request_id, source_ref=source_ref,
                 heartbeat_id=heartbeat_id, options=options,
+            ))
+
+        @self.mcp.tool(
+            name="jarvis_update",
+            description="Check or activate Jarvis automatic Codex Desktop runtime selection. check is read-only; apply changes only the launcher policy when no Hold is active.",
+            annotations=ToolAnnotations(idempotentHint=True, openWorldHint=False),
+        )
+        def jarvis_update(
+            action: Literal["check", "apply"] = "check",
+            request_id: str = "mcp:jarvis_update",
+        ) -> CallToolResult:
+            return _tool_result(self.control.update(
+                action=action, request_id=request_id,
             ))
 
         @self.mcp.tool(

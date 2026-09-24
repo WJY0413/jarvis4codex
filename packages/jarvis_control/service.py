@@ -287,6 +287,10 @@ class JarvisControl:
                         "available": self._capabilities.heartbeat_available,
                         "requires_scheduler": True,
                     },
+                    "jarvis_update": {
+                        "available": callable(getattr(self._provisioner, "update_runtime", None)),
+                        "scope": "codex_runtime",
+                    },
                     "jarvis_notify": {
                         "available": self._notifier is not None,
                         "reason": None if self._notifier is not None else "no notification adapter is configured",
@@ -341,6 +345,29 @@ class JarvisControl:
                 return self._receipt("jarvis_read", "invalid_request", reason=str(exc))
             return self._receipt("jarvis_read", "completed", data={"turns": turns})
         return self._receipt("jarvis_read", "invalid_request", reason="subject must be capabilities, thread, hold, or history")
+
+    def update(self, *, action: str, request_id: str) -> dict[str, Any]:
+        updater = getattr(self._provisioner, "update_runtime", None)
+        if not callable(updater):
+            return self.unsupported(
+                tool="jarvis_update", reason="no Codex runtime update adapter is configured"
+            )
+        try:
+            result = dict(updater(action=action, request_id=request_id))
+        except ValueError as exc:
+            return self._receipt(
+                "jarvis_update", "invalid_request", request_id=request_id, reason=str(exc)
+            )
+        except Exception as exc:
+            return self._receipt(
+                "jarvis_update", "failed", request_id=request_id, reason=str(exc)
+            )
+        status = str(result.get("status") or "failed")
+        return self._receipt(
+            "jarvis_update", status, request_id=request_id,
+            reason=result.get("reason"), data=result.get("data"),
+            readback={"verified": status == "completed", "terminal": True},
+        )
 
     def monitor(
         self,

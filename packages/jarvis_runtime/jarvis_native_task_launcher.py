@@ -700,7 +700,79 @@ def _npm_codex_command(prefix: Path) -> list[str] | None:
     return None
 
 
+_CODEX_VERSION_RESPONSE = re.compile(
+    r"codex-cli\s+(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)"
+)
+
+
+def _codex_version(output: str, executable: str) -> str:
+    match = _CODEX_VERSION_RESPONSE.fullmatch(output)
+    if not match:
+        raise NativeTaskError(
+            f"unrecognized Codex version response from {executable!r}"
+        )
+    return match.group(1)
+
+
+def _codex_version_key(version: str) -> tuple[Any, ...]:
+    """Return a deterministic SemVer-style key for selecting a Desktop build."""
+    public = version.split("+", 1)[0]
+    core, separator, prerelease = public.partition("-")
+    major, minor, patch = (int(value) for value in core.split("."))
+    if not separator:
+        return major, minor, patch, 1, ()
+    identifiers = tuple(
+        (0, int(value)) if value.isdigit() else (1, value.casefold())
+        for value in prerelease.split(".")
+    )
+    return major, minor, patch, 0, identifiers
+
+
+def _desktop_codex_command() -> tuple[list[str], str] | None:
+    """Find and validate the newest installed Codex Desktop CLI on Windows."""
+    if os.name != "nt":
+        return None
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    if not local_app_data:
+        return None
+    root = Path(local_app_data) / "OpenAI" / "Codex" / "bin"
+    if not root.is_dir():
+        return None
+    candidates: list[tuple[tuple[Any, ...], int, str, str]] = []
+    for executable in root.glob("*/codex.exe"):
+        if not executable.is_file():
+            continue
+        resolved = str(executable.resolve())
+        try:
+            output = _cli_probe([resolved, "--version"], "Codex Desktop version probe")
+            version = _codex_version(output, resolved)
+            modified_ns = executable.stat().st_mtime_ns
+        except (NativeTaskError, OSError) as exc:
+            logging.getLogger(__name__).warning(
+                "Ignoring unusable Codex Desktop candidate %r: %s", resolved, exc
+            )
+            continue
+        candidates.append((_codex_version_key(version), modified_ns, resolved, version))
+    if not candidates:
+        return None
+    _, _, executable, version = max(candidates)
+    logging.getLogger(__name__).info(
+        "Codex CLI resolved via Codex Desktop discovery: %r (version %s)",
+        executable,
+        version,
+    )
+    return [executable], version
+
+
 def _resolve_codex_command(configured: str) -> tuple[list[str], str]:
+    if configured == "desktop_auto":
+        desktop = _desktop_codex_command()
+        if desktop is not None:
+            return desktop
+        logging.getLogger(__name__).warning(
+            "No usable Codex Desktop CLI found; falling back to normal auto discovery"
+        )
+        configured = "auto"
     if configured != "auto":
         executable = shutil.which(configured)
         if not executable:
@@ -727,12 +799,20 @@ def _resolve_codex_command(configured: str) -> tuple[list[str], str]:
                     raise NativeTaskError("Codex executable not found on PATH or in npm global installation")
                 command, source = [executable], "PATH executable"
     output = _cli_probe(command + ["--version"], "Codex version probe")
-    match = re.fullmatch(r"codex-cli\s+(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)", output)
-    if not match:
-        raise NativeTaskError(f"unrecognized Codex version response from {command[0]!r}")
-    version = match.group(1)
+    version = _codex_version(output, command[0])
     logging.getLogger(__name__).info("Codex CLI resolved via %s: %r (version %s)", source, command, version)
     return command, version
+
+
+def resolve_codex_runtime(configured: str) -> dict[str, Any]:
+    """Return the validated command Jarvis would use for a new App Server."""
+    command, version = _resolve_codex_command(configured)
+    return {
+        "configured": configured,
+        "command": command,
+        "executable": command[0],
+        "version": version,
+    }
 
 
 class AppServerClient:
