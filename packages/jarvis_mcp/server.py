@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+import threading
 from typing import Annotated, Any, Literal
 
 from mcp.server import MCPServer
+from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import CallToolResult, TextContent, ToolAnnotations
 from pydantic import Field
 
@@ -17,15 +19,18 @@ class JarvisMcpServer:
 
     def __init__(self, control: JarvisControl) -> None:
         self.control = control
+        # Wired App Server adapters and receipt stores are shared, not per-client.
+        self._control_lock = threading.RLock()
         self.mcp = MCPServer(
             "jarvis-control",
             title="Jarvis Control Plane",
-            version="0.2.4",
+            version="0.2.5",
             instructions=(
                 "Use jarvis_read before a state-changing call when you need capability or thread context. "
                 "Use jarvis_hold for a managed lifecycle: Hold executes turns and Monitor issues a verified "
                 "CONTINUE or STOP command only after exact terminal and content readback. "
                 "Use jarvis_read subject=hold for lifecycle state and jarvis_monitor only for status or notification delivery."
+                " Use jarvis_close to gracefully stop an exact Loop or standalone Hold; closing is not confirmed closure."
             ),
         )
         self._register_tools()
@@ -33,6 +38,26 @@ class JarvisMcpServer:
     def run_stdio(self) -> None:
         """Run the already-wired server on local standard input/output."""
         self.mcp.run("stdio")
+
+    def run_http(self, *, port: int) -> None:
+        """Explicit single-process, loopback-only service; no per-client sessions."""
+        if not 1 <= port <= 65535:
+            raise ValueError("HTTP port must be between 1 and 65535")
+        self.mcp.run(
+            "streamable-http", host="127.0.0.1", port=port,
+            stateless_http=True, json_response=True,
+            transport_security=TransportSecuritySettings(
+                enable_dns_rebinding_protection=True,
+                allowed_hosts=[f"127.0.0.1:{port}"],
+                allowed_origins=[f"http://127.0.0.1:{port}"],
+            ),
+        )
+
+    def _invoke(self, method: str, **kwargs: Any) -> dict[str, Any]:
+        # One adapter call at a time protects shared request/response queues and
+        # read-modify-write state. A failed call releases the lock as well.
+        with self._control_lock:
+            return getattr(self.control, method)(**kwargs)
 
     def _register_tools(self) -> None:
         @self.mcp.tool(
@@ -54,7 +79,7 @@ class JarvisMcpServer:
             hold_id: str | None = None,
             notifications: dict[str, Any] | None = None,
         ) -> CallToolResult:
-            return _tool_result(self.control.create(
+            return _tool_result(self._invoke("create",
                 request_id=request_id,
                 project=project,
                 title=title,
@@ -89,7 +114,7 @@ class JarvisMcpServer:
             continue_prompt: str = "继续",
             notifications: dict[str, Any] | None = None,
         ) -> CallToolResult:
-            return _tool_result(self.control.hold(
+            return _tool_result(self._invoke("hold",
                 request_id=request_id,
                 prompt=prompt,
                 source_ref=source_ref,
@@ -143,7 +168,7 @@ class JarvisMcpServer:
             reasoning_effort: str | None = None,
             notifications: dict[str, Any] | bool | None = None,
         ) -> CallToolResult:
-            return _tool_result(self.control.loop(
+            return _tool_result(self._invoke("loop",
                 action=action, loop_id=loop_id, request_id=request_id, project=project,
                 title=title, prompt=prompt, business_skill=business_skill, controller_skill=controller_skill, target_thread_count=target_thread_count,
                 threads=threads, max_rounds=max_rounds, max_turns=max_turns,
@@ -151,6 +176,20 @@ class JarvisMcpServer:
                 auto_continue=auto_continue, interval_seconds=interval_seconds,
                 expires_at=expires_at, model=model, reasoning_effort=reasoning_effort,
                 notifications=notifications,
+            ))
+
+        @self.mcp.tool(
+            name="jarvis_close",
+            description="Durably close exactly one loop_id or standalone hold_id. Stop future work and request supported interruption only for a proven exact current owner. No turn_id required. closed requires terminal/release evidence; closed_unconfirmed means local management stopped but external execution is unknown, never released or replaced automatically. Records a closure report; no shared Host kill, history deletion or chat archival. Prefer loop_id for Loop-managed work.",
+            annotations=ToolAnnotations(destructiveHint=True, idempotentHint=True, openWorldHint=False),
+        )
+        def jarvis_close(
+            hold_id: str | None = None,
+            loop_id: str | None = None,
+            request_id: str | None = None,
+        ) -> CallToolResult:
+            return _tool_result(self._invoke("jarvis_close",
+                hold_id=hold_id, loop_id=loop_id, request_id=request_id,
             ))
 
         @self.mcp.tool(
@@ -165,7 +204,7 @@ class JarvisMcpServer:
             thread_id: str | None = None,
             turn_id: str | None = None,
         ) -> CallToolResult:
-            return _tool_result(self.control.read(
+            return _tool_result(self._invoke("read",
                 subject=subject, task_id=task_id, hold_id=hold_id,
                 thread_id=thread_id, turn_id=turn_id,
             ))
@@ -190,7 +229,7 @@ class JarvisMcpServer:
             continue_prompt: str = "继续",
             notifications: dict[str, Any] | None = None,
         ) -> CallToolResult:
-            return _tool_result(self.control.resume(
+            return _tool_result(self._invoke("resume",
                 request_id=request_id, task_id=task_id, prompt=prompt, source_ref=source_ref,
                 model=model, reasoning_effort=reasoning_effort,
                 hold_with_monitor=hold_with_monitor, monitor_id=monitor_id, hold_id=hold_id,
@@ -216,7 +255,7 @@ class JarvisMcpServer:
             reasoning_effort: str | None = None,
             hold_id: str | None = None,
         ) -> CallToolResult:
-            return _tool_result(self.control.monitor(
+            return _tool_result(self._invoke("monitor",
                 action=action, request_id=request_id, monitor_id=monitor_id,
                 source_ref=source_ref, observed_task_id=observed_task_id,
                 receipt_task_id=receipt_task_id, resume_task_id=resume_task_id, prompt=prompt,
@@ -235,7 +274,7 @@ class JarvisMcpServer:
             heartbeat_id: str | None = None,
             options: dict[str, Any] | None = None,
         ) -> CallToolResult:
-            return _tool_result(self.control.heartbeat(
+            return _tool_result(self._invoke("heartbeat",
                 action=action, request_id=request_id, source_ref=source_ref,
                 heartbeat_id=heartbeat_id, options=options,
             ))
@@ -249,7 +288,7 @@ class JarvisMcpServer:
             action: Literal["check", "apply"] = "check",
             request_id: str = "mcp:jarvis_update",
         ) -> CallToolResult:
-            return _tool_result(self.control.update(
+            return _tool_result(self._invoke("update",
                 action=action, request_id=request_id,
             ))
 
@@ -263,7 +302,7 @@ class JarvisMcpServer:
             request_id: str = "mcp:jarvis_notify",
             source_ref: str = "mcp:jarvis_notify",
         ) -> CallToolResult:
-            return _tool_result(self.control.notify(
+            return _tool_result(self._invoke("notify",
                 request_id=request_id, source_ref=source_ref, message=message,
             ))
 

@@ -33,6 +33,82 @@ COOPER_ID = "ou_cooper"
 
 
 class CodexResolutionTests(unittest.TestCase):
+    def test_explicit_model_survives_catalogue_and_preserves_upstream_result(self):
+        # Real local JSON-RPC subprocess; no real Codex/provider or runtime state.
+        script = '''
+import json, sys
+mode = sys.argv[1]
+calls = []
+for line in sys.stdin:
+    req = json.loads(line)
+    if "id" not in req:
+        continue
+    method, params = req["method"], req.get("params", {})
+    calls.append({"method": method, "params": params})
+    result, error = {}, None
+    if method == "model/list":
+        if mode == "catalogue_error":
+            error = {"code": -32601, "message": "catalogue unavailable"}
+        else:
+            result = {"data": [] if mode == "empty" else [{"id": "default-model", "isDefault": True}]}
+    elif method == "thread/start":
+        result = {"thread": {"id": "offline-thread"}}
+    elif method == "turn/start":
+        if mode == "upstream_reject":
+            error = {"code": 429, "message": "upstream exact rejection", "data": {"model": params["model"]}}
+        else:
+            result = {"turn": {"id": "offline-turn", "status": "completed"}}
+    elif method == "thread/read":
+        result = {"thread": {"turns": [{"id": "offline-turn", "items": [
+            {"type": "agentMessage", "phase": "final_answer", "text": "offline success"}]}]}}
+    elif method == "test/trace":
+        result = {"calls": calls}
+    print(json.dumps({"id": req["id"], **({"error": error} if error else {"result": result})}), flush=True)
+    if method == "turn/start" and not error:
+        print(json.dumps({"method": "turn/completed", "params": {"threadId": "offline-thread",
+            "turn": {"id": "offline-turn", "status": "completed"}}}), flush=True)
+'''
+        receipts = []
+        for mode in ("unlisted", "empty", "catalogue_error", "upstream_reject"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temp:
+                config = SimpleNamespace(codex_cli="offline", expected_codex_home="",
+                    request_timeout_seconds=3, poll_seconds=0.01, turn_completion_timeout_seconds=3,
+                    turn_readback_timeout_seconds=3)
+                with patch("jarvis_native_task_launcher._resolve_codex_command",
+                        return_value=([sys.executable, "-u", "-c", script, mode], "offline")):
+                    client = AppServerClient(config)
+                try:
+                    if mode == "upstream_reject":
+                        with self.assertRaisesRegex(NativeTaskError, "upstream exact rejection") as caught:
+                            client.start_turn("offline-thread", "hello", client_user_message_id="offline",
+                                              model="custom/vendor-v1")
+                        self.assertIn('"code": 429', str(caught.exception))
+                        self.assertIn('"model": "custom/vendor-v1"', str(caught.exception))
+                    else:
+                        # start_turn historically initializes via select_model; preserve it.
+                        result = client.start_turn("offline-thread", "hello", client_user_message_id="offline",
+                                                   model="custom/vendor-v1")
+                        self.assertEqual(result["model"], "custom/vendor-v1")
+                        self.assertEqual(result["final_message"], "offline success")
+                    trace = client.request("test/trace", {})["calls"]
+                    turns = [call["params"] for call in trace if call["method"] == "turn/start"]
+                    self.assertEqual([turn["model"] for turn in turns], ["custom/vendor-v1"])
+                    self.assertFalse(any(call["method"] == "model/list" for call in trace))
+                    if mode == "unlisted":
+                        self.assertEqual(client.select_model(), "default-model")
+                    receipts.append({"case": mode, "model": turns[0]["model"], "turn_requests": 1,
+                                     "fallback": False, "upstream_error_preserved": mode == "upstream_reject"})
+                finally:
+                    process = client.process
+                    client.close()
+                    self.assertTrue(process is None or process.poll() is not None)
+                    if process is not None:
+                        for stream in (process.stdin, process.stdout, process.stderr):
+                            if stream is not None:
+                                stream.close()
+        self.assertEqual(len(receipts), 4)
+        print("ANY_MODEL_OFFLINE_RECEIPT " + json.dumps(receipts))
+
     def test_strict_final_answer_preserves_raw_text_and_never_falls_back_to_commentary(self):
         raw = ' \r\n{"notes": "unchanged"}\n '
         thread = {"turns": [
@@ -119,6 +195,20 @@ class CodexResolutionTests(unittest.TestCase):
         self.assertEqual(popen.call_args.args[0], command + ["app-server", "--stdio"])
         self.assertFalse(popen.call_args.kwargs["shell"])
         close.assert_called_once()
+
+    def test_connection_base_url_is_scoped_to_child_app_server(self):
+        config = SimpleNamespace(codex_cli="auto", expected_codex_home="",
+                                 connection_base_url_override="http://127.0.0.1:4003/v1")
+        with patch("jarvis_native_task_launcher._resolve_codex_command", return_value=(["codex.exe"], "0.153.4")):
+            client = AppServerClient(config)
+        with patch("jarvis_native_task_launcher.subprocess.Popen") as popen, patch(
+            "jarvis_native_task_launcher.threading.Thread",
+        ), patch.object(client, "request", side_effect=NativeTaskError("stop")):
+            with self.assertRaises(NativeTaskError):
+                client.start()
+        self.assertEqual(popen.call_args.args[0], [
+            "codex.exe", "-c", "openai_base_url=http://127.0.0.1:4003/v1", "app-server", "--stdio",
+        ])
 
     def test_auto_finds_npm_package_without_codex_on_path(self):
         with tempfile.TemporaryDirectory(prefix="npm prefix ") as root:

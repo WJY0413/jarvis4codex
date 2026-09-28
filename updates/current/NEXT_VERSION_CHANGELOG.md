@@ -1,3 +1,10 @@
+# Jarvis 0.2.5
+
+- Added opt-in loopback Streamable HTTP for multiple clients to reuse one explicitly started MCP server. Default stdio compatibility is retained; registrations and running instances are not changed automatically.
+- Added `jarvis_close` with durable per-target request/result reports, exact-owner interruption, automatic Loop child-report aggregation and stale-close/rotation protection. Unknown external execution remains explicitly unconfirmed and unreleased; failures and identity conflicts are not reported as success. History is retained and shared processes are not terminated.
+- Explicit non-empty model IDs are no longer rejected by CLI or gateway model catalogs. Explicit named connection mappings accept custom IDs while retaining loopback and credential-reference safety. Actual upstream rejection remains an error; no arbitrary model capability or web-search support is promised. Recovery does not start an unavailable gateway.
+- Public package and MCP metadata are versioned 0.2.5. Installation, service activation, MCP client refresh and publication remain separate operations. Existing work must be safely drained before replacing loaded code.
+
 # Jarvis 0.2.2
 
 ## Integrated official capability snapshot

@@ -18,6 +18,7 @@ from typing import Any
 
 from jarvis_monitor import HoldTurnMonitor, HoldTurnRequest, NotificationPolicy
 from jarvis_runtime.jarvis_native_task_launcher import AppServerClient, NativeTaskLauncherConfig
+from adapters.codex_app_server.jarvis_connection import route_for_model
 from adapters.codex_app_server.task_provisioning_adapter import append_terminal_turn_history, read_turn_history, verify_candidate_output, receive_candidate_final_answer, _pid_is_alive
 from jarvis_runtime.coo_dispatcher_store import ProcessLock
 from jarvis_control.provisioning import lane_batch_ids, lane_batch_size, final_answer_mode
@@ -179,6 +180,7 @@ def hold_task(
     scheduler_failed_items = 0
     interrupt_at: float | None = None
     host_stop_selected = False
+    dispatch_evidence = "unknown" if request.get("mode") == "recover" else "not_sent"
 
     def control_poll() -> None:
         nonlocal interrupt_at, host_stop_selected
@@ -218,7 +220,9 @@ def hold_task(
         current = _read_json(request_path)
         if current.get("request_id") != request.get("request_id"):
             raise RuntimeError("Hold request changed while a turn was owned")
-        return current.get("stop_requested") is True
+        close_path = request_path.with_name("close.json")
+        close = _read_json(close_path) if close_path.exists() else {}
+        return current.get("stop_requested") is True or close.get("request_id") == request_id
 
     def verify_output() -> dict[str, Any]:
         nonlocal verification
@@ -232,8 +236,12 @@ def hold_task(
         return verification
 
     def report(next_phase: str, details: dict[str, Any] | None = None) -> None:
-        nonlocal phase, thread_id, turn_id
+        nonlocal phase, thread_id, turn_id, dispatch_evidence
         phase = next_phase
+        if phase == "turn_starting":
+            dispatch_evidence = "possibly_sent"
+        elif phase == "turn_started":
+            dispatch_evidence = "sent"
         # Capture dispatch identity before ack replacement can fail. Do not recover
         # a turn by guessing the latest turn on a reused thread.
         if details and details.get("thread_id"):
@@ -244,6 +252,7 @@ def hold_task(
             "request_id": request_id,
             "status": "accepted",
             "phase": phase,
+            "dispatch_evidence": dispatch_evidence,
             "pid": os.getpid(),
             "hold_id": hold_id,
             "thread_id": thread_id,
@@ -269,7 +278,13 @@ def hold_task(
                 _write_json(result_path, cancelled)
                 _write_json(ack_path, cancelled)
                 return 0
-            client = AppServerClient(NativeTaskLauncherConfig(launcher_config_path))
+            launcher_config = NativeTaskLauncherConfig(launcher_config_path)
+            launcher_config.connection_base_url_override = route_for_model(
+                getattr(launcher_config, "jarvis_connection", None),
+                request.get("model"),
+                allow_start=str(request.get("mode") or "create") != "recover",
+            )
+            client = AppServerClient(launcher_config)
             report("launcher_config_loaded")
             input_binding = _turn_input_binding(request, initial_total_turn_count)
             mode = str(request.get("mode") or "create")
@@ -389,12 +404,15 @@ def hold_task(
                         "expected_turn_id": decision.expected_turn_id,
                         "reason": decision.reason,
                     },
+                    "reason": decision.reason,
+                    "error": decision.error,
                     "observed_at": _now(),
                 })
                 if decision.action != "CONTINUE":
                     break
                 terminal_confirmed = False
                 turn_id = ""  # A failed next dispatch must not reuse the previous terminal turn.
+                dispatch_evidence = "not_sent"
                 started = client.start_turn_async(
                     thread_id,
                     str(decision.continue_prompt or continue_prompt),
@@ -444,6 +462,8 @@ def hold_task(
             "total_turn_count": total_turn_count,
             "max_turns": max_turns,
             "final_message": final_message,
+            "reason": decision.reason,
+            "error": decision.error,
             "output_verification": verification,
             "scheduler_failed_items": scheduler_failed_items,
             "terminal_confirmed": terminal_confirmed,
@@ -460,6 +480,7 @@ def hold_task(
             "turn_count": turn_count, "total_turn_count": total_turn_count,
             "max_turns": max_turns,
             "terminal_confirmed": terminal_confirmed, "reason": str(exc), "observed_at": _now(),
+            "dispatch_evidence": dispatch_evidence,
         }
         if host_stop_selected or interrupt_at is not None:
             failure.update(host_stop=True, execution_evidence="requires_owner_terminal")
@@ -476,14 +497,25 @@ def hold_task(
         _write_json(ack_path, failure)
         return 1
     finally:
+        observer_stopped = client is None
         if client is not None:
             owned_process = getattr(client, "process", None)
             client.close()
+            observer_stopped = owned_process is None or owned_process.poll() is not None
             if result_path.is_file():
                 saved = _read_json(result_path)
                 if saved.get("host_stop"):
                     _write_json(result_path, {**saved, "holder_client_exit_confirmed": (
                         owned_process is not None and owned_process.poll() is not None)})
+        if observer_stopped and result_path.is_file():
+            saved = _read_json(result_path)
+            current = _read_json(request_path)
+            if saved.get("request_id") == current.get("request_id") == request_id:
+                _write_json(result_path, {**saved, "local_observer_stopped": True})
+                from adapters.codex_app_server.task_provisioning_adapter import refresh_close_report
+                refresh_close_report(result_path.parent, {**saved, "local_observer_stopped": True,
+                    "hold_released": saved.get("terminal_confirmed") is True
+                        and not (result_path.parent / ".user-host-claim").exists()})
 
 
 def main() -> int:

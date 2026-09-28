@@ -203,6 +203,14 @@ class NativeTaskLauncherConfig:
         )
         self.codex_cli = str(raw.get("codex_cli") or "auto")
         self.profile = str(raw.get("profile") or "").strip()
+        connection = raw.get("jarvis_connection") or {}
+        if not isinstance(connection, dict):
+            raise NativeTaskError("jarvis_connection must be an object")
+        self.jarvis_connection = connection
+        self.connection_base_url_override = (
+            "https://chatgpt.com/backend-api/codex"
+            if connection.get("enabled") is True else None
+        )
         self.expected_codex_home = str(raw.get("expected_codex_home") or "").strip()
         self.live_creation_enabled = bool(raw.get("live_creation_enabled", False))
         self.poll_seconds = max(float(raw.get("poll_seconds", 2)), 0.25)
@@ -822,7 +830,7 @@ class AppServerClient:
         self.executable = self.cli_command[0]
         self.process: subprocess.Popen[str] | None = None
         self.response_queue: queue.Queue[dict[str, Any]] = queue.Queue()
-        self.notifications: queue.Queue[dict[str, Any]] = queue.Queue()
+        self.notifications: queue.Queue[dict[str, Any] | None] = queue.Queue()
         self.stderr_lines: list[str] = []
         self._request_id = 0
         self._write_lock = threading.Lock()
@@ -838,8 +846,13 @@ class AppServerClient:
         # native tasks are created in the intended visible task space.
         if self.config.expected_codex_home:
             env["CODEX_HOME"] = str(self.config.expected_codex_home)
+        command = [*self.cli_command]
+        base_url = getattr(self.config, "connection_base_url_override", None)
+        if base_url:
+            command.extend(["-c", f"openai_base_url={base_url}"])
+        command.extend(["app-server", "--stdio"])
         self.process = subprocess.Popen(
-            [*self.cli_command, "app-server", "--stdio"],
+            command,
             cwd=str(WORKSPACE_ROOT),
             env=env,
             stdin=subprocess.PIPE,
@@ -894,17 +907,22 @@ class AppServerClient:
 
     def _read_stdout(self) -> None:
         assert self.process is not None and self.process.stdout is not None
-        for raw in self.process.stdout:
-            try:
-                item = json.loads(raw)
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(item, dict):
-                continue
-            if "id" in item:
-                self.response_queue.put(item)
-            else:
-                self.notifications.put(item)
+        try:
+            for raw in self.process.stdout:
+                try:
+                    item = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(item, dict):
+                    continue
+                if "id" in item:
+                    self.response_queue.put(item)
+                else:
+                    self.notifications.put(item)
+        finally:
+            # FIFO preserves terminal evidence already read before EOF. A closed
+            # transport is not evidence that the remote execution is terminal.
+            self.notifications.put(None)
 
     def _read_stderr(self) -> None:
         assert self.process is not None and self.process.stderr is not None
@@ -982,6 +1000,11 @@ class AppServerClient:
         return [item for item in models if isinstance(item, dict)]
 
     def select_model(self, requested: str | None = None) -> str:
+        if requested:
+            # Explicit IDs belong to the selected upstream; CLI discovery can
+            # be stale or unavailable. Retain initialization, never substitute.
+            self.start()
+            return requested
         models = self.available_models()
         supported: dict[str, dict[str, Any]] = {}
         for item in models:
@@ -990,13 +1013,6 @@ class AppServerClient:
                 supported[model_id] = item
         if not supported:
             raise NativeTaskError("app-server model/list returned no supported models")
-        if requested:
-            if requested not in supported:
-                raise NativeTaskError(
-                    f"requested model is not supported by this CLI: {requested}; "
-                    f"available={sorted(supported)}"
-                )
-            return requested
         default = next(
             (
                 model_id
@@ -1303,6 +1319,11 @@ class AppServerClient:
                 item = self.notifications.get(timeout=remaining)
             except queue.Empty:
                 continue
+            if item is None:
+                raise NativeTaskCreationError(
+                    "App Server disconnected before exact turn/completed; execution terminal is unknown",
+                    thread_id=thread_id,
+                )
             if item.get("method") != "turn/completed":
                 continue
             params = item.get("params")

@@ -63,6 +63,7 @@ class HoldTurnDecision:
     reason: str
     continue_prompt: str | None
     notification_events: tuple[NotificationEvent, ...]
+    error: Any = None
 
 
 class HoldTurnMonitor:
@@ -82,7 +83,10 @@ class HoldTurnMonitor:
             )
         command_id = f"monitor:{request.hold_id}:{request.turn_id}:{request.turn_count}"
         if terminal_status != "completed":
-            return self._stop(request, command_id, terminal_status, final_message, "non_completed_terminal")
+            error = terminal.get("error")
+            detail = error.get("message") if isinstance(error, dict) else error if isinstance(error, str) else None
+            return self._stop(request, command_id, terminal_status, final_message,
+                              str(detail or "non_completed_terminal"), error=error)
         verification = {}
         if request.receive_final_answer is not None and not final_message:
             return self._stop(request, command_id, "blocked", final_message, "final_answer_unavailable")
@@ -119,6 +123,7 @@ class HoldTurnMonitor:
         result_status: str,
         final_message: str,
         reason: str,
+        error: Any = None,
     ) -> HoldTurnDecision:
         events = list(self._milestone_events(request, result_status))
         if request.notification_policy.terminal:
@@ -142,6 +147,7 @@ class HoldTurnMonitor:
             reason=reason,
             continue_prompt=None,
             notification_events=tuple(events),
+            error=error,
         )
 
     @staticmethod

@@ -18,11 +18,52 @@ ACTIVE = {"accepted", "holding", "running"}
 TERMINAL = {"completed", "failed", "interrupted", "cancelled", "canceled", "turn_limit_reached", "blocked"}
 
 
+def _cleanup_evidence_confirmed(state: Mapping[str, Any]) -> bool:
+    """Do not trust legacy cleanup labels without owned-Hold release evidence."""
+    for child in state.get("children", []):
+        receipt = child.get("last_receipt") or {}
+        if not child.get("hold_id"):
+            if receipt.get("status") in ACTIVE:
+                return False
+            continue
+        data = receipt.get("data") or {}
+        if (receipt.get("status") != "completed"
+                or (data.get("lifecycle_status") or data.get("status")) not in TERMINAL
+                or data.get("hold_released") is not True
+                or data.get("terminal_confirmed") is not True):
+            return False
+    return True
+
+
 class LoopRuntime(Protocol):
     def hold(self, **kwargs: Any) -> dict[str, Any]: ...
     def monitor(self, **kwargs: Any) -> dict[str, Any]: ...
     def heartbeat(self, **kwargs: Any) -> dict[str, Any]: ...
     def stop_hold(self, hold_id: str) -> dict[str, Any]: ...
+    def close_hold(self, hold_id: str, **kwargs: Any) -> dict[str, Any]: ...
+
+
+def _aggregate_close_reports(state: dict[str, Any]) -> None:
+    close = state.get("close") or {}
+    reports = close.get("child_reports") or {}
+    children = [child for child in state.get("children", []) if child.get("hold_id")]
+    if not children or not all(child["hold_id"] in reports for child in children):
+        return
+    complete = all(reports[child["hold_id"]].get("report_status") == "completed" for child in children)
+    stopped = all(reports[child["hold_id"]].get("management_closed") is True for child in children)
+    if not (state.get("cleanup") or {}).get("heartbeat_cancelled"):
+        return
+    failures = [f"{child['hold_id']}: {reports[child['hold_id']].get('reason') or 'close failed'}"
+        for child in children if reports[child["hold_id"]].get("report_status") == "failed"]
+    close.update(report_status="failed" if failures else "completed" if complete else "unresolved" if stopped else "pending",
+        reason="; ".join(failures) or None,
+        scheduling_closed=True, execution_state="terminal" if complete else "unknown",
+        terminal_confirmed=complete, management_closed=stopped, external_execution_unresolved=stopped and not complete)
+    if complete:
+        state["cleanup"]["status"] = "completed"
+        state["status"] = state["cleanup"]["target"]
+    elif stopped:
+        state["status"] = "closed_unconfirmed"
 
 
 @dataclass(frozen=True)
@@ -68,7 +109,7 @@ class LoopStore:
                 continue
             if not isinstance(state, Mapping) or state.get("schema") != "jarvis-loop-state/v1":
                 continue
-            if state.get("status") in {"blocked", "completed", "stopped", "expired"}:
+            if state.get("status") in {"blocked", "completed", "stopped", "expired", "closed_unconfirmed"}:
                 continue
             loop_id = str(state.get("loop_id") or "").strip()
             if loop_id:
@@ -86,18 +127,67 @@ class LoopStore:
                 incoming_cleanup = state.get("cleanup") or {}
                 if prior_cleanup and (
                     not incoming_cleanup or prior_cleanup["target"] != incoming_cleanup.get("target")
-                    or (prior_cleanup.get("status") == "completed" and incoming_cleanup.get("status") != "completed")
+                    or (prior_cleanup.get("status") == "completed" and incoming_cleanup.get("status") != "completed"
+                        and _cleanup_evidence_confirmed(latest))
                 ):
                     state.clear()
                     state.update(latest)
                     return
+                prior_close = latest.get("close") or {}
+                if prior_close and prior_close.get("close_request_id") != (state.get("close") or {}).get("close_request_id"):
+                    state.clear()
+                    state.update(latest)
+                    return
+                if prior_close.get("close_request_id") == (state.get("close") or {}).get("close_request_id") and prior_close.get("child_reports"):
+                    state["close"]["child_reports"] = prior_close["child_reports"]
+                    for child in state.get("children", []):
+                        report = prior_close["child_reports"].get(child.get("hold_id"))
+                        if report:
+                            child["hold_released"] = report.get("hold_released") is True
+                            child["last_receipt"] = {"status": "completed", "data": {
+                                **report, "status": report.get("lifecycle_status") or ("cancelled" if report.get("terminal_confirmed") else "unknown")}}
+                    _aggregate_close_reports(state)
+            self._write_locked(path, state)
+
+    @staticmethod
+    def _write_locked(path: Path, state: Mapping[str, Any]) -> None:
+        """Caller holds this state's existing lock (including dispatch commit)."""
+        temporary = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        try:
+            temporary.write_text(json.dumps(dict(state), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            os.replace(temporary, path)
+        finally:
+            if temporary.exists():
+                temporary.unlink()
+
+    def record_child_close(self, report: Mapping[str, Any]) -> None:
+        """Merge one bound owner report atomically; never dispatch or scan history."""
+        parent = report.get("parent_close") or {}
+        loop_id = str(parent.get("loop_id") or "")
+        path = self._path(loop_id)
+        with ProcessLock(path.with_suffix(".lock")):
+            state = self.load(loop_id)
+            close = state.get("close") or {}
+            if not close or close.get("close_request_id") != parent.get("close_request_id"):
+                return
+            child = next((item for item in state.get("children", []) if item.get("hold_id") == report.get("hold_id")), None)
+            if child is None:
+                return
+            reports = close.setdefault("child_reports", {})
+            prior = reports.get(report["hold_id"]) or {}
+            if prior and (prior.get("request_id") != report.get("request_id") or prior.get("report_status") == "completed"):
+                return
+            data = (child.get("last_receipt") or {}).get("data") or {}
+            if data.get("request_id") and data["request_id"] != report.get("request_id"):
+                return
+            reports[report["hold_id"]] = dict(report)
+            child["hold_released"] = report.get("hold_released") is True
+            child["last_receipt"] = {"status": "completed", "data": {
+                **report, "status": report.get("lifecycle_status") or ("cancelled" if report.get("terminal_confirmed") else "unknown")}}
+            _aggregate_close_reports(state)
             temporary = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-            try:
-                temporary.write_text(json.dumps(dict(state), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-                os.replace(temporary, path)
-            finally:
-                if temporary.exists():
-                    temporary.unlink()
+            temporary.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            os.replace(temporary, path)
 
     def _path(self, loop_id: str) -> Path:
         safe = "".join(char if char.isalnum() or char in "._-" else "_" for char in loop_id).strip("._")
@@ -210,7 +300,14 @@ class LoopController:
             state = self._store.load(loop_id)
         except ValueError as exc:
             return LoopResult("invalid_request", loop_id, {}, str(exc))
-        if state.get("cleanup", {}).get("status") == "pending":
+        if state.get("status") == "closed_unconfirmed":
+            return self._result(state)
+        if state.get("close") and not state.get("cleanup"):
+            self._finish(runtime, state, "stopped")
+            self._store.save(loop_id, state)
+            return self._result(state)
+        if (state.get("cleanup", {}).get("status") == "pending"
+                or (state.get("cleanup", {}).get("status") == "completed" and not _cleanup_evidence_confirmed(state))):
             self._finish(runtime, state, state["cleanup"]["target"])
             self._store.save(loop_id, state)
         elif state["status"] not in {"blocked", "completed", "stopped", "expired"}:
@@ -276,12 +373,32 @@ class LoopController:
             },
         }
 
+    def close(self, runtime: LoopRuntime, *, loop_id: str, request_id: str | None = None) -> LoopResult:
+        try:
+            state = self._store.load(loop_id)
+            if state.get("close", {}).get("report_status") not in {"completed", "unresolved"}:
+                state.setdefault("close", {"schema": "jarvis-close-report/v1", "loop_id": loop_id,
+                    "close_request_id": request_id or f"close:{loop_id}", "requested_at": datetime.now(timezone.utc).isoformat(),
+                    "report_status": "pending", "scheduling_closed": False, "terminal_confirmed": False})
+                self._store.save(loop_id, state)  # Durable intent before cancel/child effects.
+            if state.get("status") == "closed_unconfirmed":
+                return self._result(state)
+            if state.get("cleanup", {}).get("status") == "completed" and _cleanup_evidence_confirmed(state):
+                state["close"].update(report_status="completed", scheduling_closed=True,
+                    execution_state="terminal", terminal_confirmed=True, management_closed=True,
+                    external_execution_unresolved=False)
+                self._store.save(loop_id, state)
+                return self._result(state)
+            return self.stop(runtime, loop_id=loop_id)
+        except (OSError, ValueError, RuntimeError) as exc:
+            return LoopResult("failed", loop_id, {}, str(exc))
+
     def stop(self, runtime: LoopRuntime, *, loop_id: str) -> LoopResult:
         try:
             state = self._store.load(loop_id)
         except ValueError as exc:
             return LoopResult("invalid_request", loop_id, {}, str(exc))
-        if state.get("cleanup", {}).get("status") == "completed":
+        if state.get("cleanup", {}).get("status") == "completed" and _cleanup_evidence_confirmed(state):
             return self._result(state)
         self._finish(runtime, state, state.get("cleanup", {}).get("target", "stopped"))
         self._store.save(loop_id, state)
@@ -293,6 +410,8 @@ class LoopController:
             "target": target, "status": "pending",
             "host": "retained", "host_reason": "shared_or_unproven_exclusive_ownership",
         })
+        if cleanup.get("status") == "completed" and not _cleanup_evidence_confirmed(state):
+            cleanup["status"] = "pending"
         state["status"] = "stopping" if target == "stopped" else "finalizing"
         self._store.save(state["loop_id"], state)
         cleanup = state["cleanup"]
@@ -304,13 +423,30 @@ class LoopController:
                 "completed", "cancelled", "canceled", "not_required",
             }
         released = True
+        management_closed = True
         for child in state["children"]:
             hold_id = child.get("hold_id")
             if not hold_id:
                 # Failed acquisition can still have left a persistent queued request.
                 released = released and child.get("last_receipt", {}).get("status") not in ACTIVE
+                management_closed = management_closed and child.get("last_receipt", {}).get("status") not in ACTIVE
                 continue
-            if child.get("stop_receipt", {}).get("status") != "stop_requested":
+            if state.get("close"):
+                closer = getattr(runtime, "close_hold", None)
+                try:
+                    child["close_receipt"] = closer(hold_id,
+                        request_id=f"{state['loop_id']}:{child['slot']}:close",
+                        parent_close={"loop_id": state["loop_id"], "close_request_id": state["close"]["close_request_id"]}
+                    ) if callable(closer) else {"status": "unsupported"}
+                except Exception as exc:
+                    child["close_receipt"] = {"status": "failed", "reason": str(exc)}
+                management_closed = management_closed and child["close_receipt"].get("status") in {"closed", "closed_unconfirmed"}
+                if child["close_receipt"].get("status") in {"failed", "unsupported"}:
+                    # No fallback stop after the child's durable write failed.
+                    released = False
+                    child["hold_released"] = False
+                    continue
+            elif child.get("stop_receipt", {}).get("status") != "stop_requested":
                 stopper = getattr(runtime, "stop_hold", None)
                 child["stop_receipt"] = stopper(hold_id) if callable(stopper) else {"status": "unsupported"}
             receipt = runtime.monitor(action="status", request_id=f"{state['loop_id']}:{child['slot']}:cleanup",
@@ -319,12 +455,25 @@ class LoopController:
             data = receipt.get("data") or {}
             lifecycle = data.get("lifecycle_status") or data.get("status")
             child["hold_released"] = (receipt.get("status") == "completed" and lifecycle in TERMINAL
-                                      and data.get("hold_released", True) is True
-                                      and data.get("terminal_confirmed", True) is True)
+                                      and data.get("hold_released") is True
+                                      and data.get("terminal_confirmed") is True)
             released = released and child["hold_released"]
         if released and cleanup.get("heartbeat_cancelled"):
             cleanup["status"] = "completed"
             state["status"] = cleanup["target"]
+        if state.get("close"):
+            complete = released and cleanup.get("heartbeat_cancelled") is True
+            local_closed = management_closed and cleanup.get("heartbeat_cancelled") is True
+            failures = [f"{item.get('hold_id')}: {item['close_receipt'].get('reason') or item['close_receipt']['status']}"
+                for item in state["children"] if (item.get("close_receipt") or {}).get("status") in {"failed", "unsupported", "invalid_request"}]
+            state["close"].update(report_status="failed" if failures else "completed" if complete else "unresolved" if local_closed else "pending",
+                reason="; ".join(failures) or None,
+                scheduling_closed=True, execution_state="terminal" if complete else "unknown",
+                terminal_confirmed=complete, management_closed=local_closed,
+                external_execution_unresolved=local_closed and not complete,
+                children=[{"hold_id": item.get("hold_id"), "receipt": item.get("close_receipt")} for item in state["children"]])
+            if local_closed and not complete:
+                state["status"] = "closed_unconfirmed"
 
     def _observe(self, runtime: LoopRuntime, state: dict[str, Any]) -> None:
         for child in state["children"]:
@@ -391,8 +540,17 @@ class LoopController:
                 elif child.get("lane"):
                     self._check_bound_terminal(child, {**data, "total_turn_count": child["round"]}, rounds=child["round"])
                 if child["phase"] == "completed" and child["round"] < _round_limit(child, state["max_rounds"]):
-                    child["completed_rounds"] = child["round"]
-                    self._acquire(runtime, state, child)
+                    # Serialize the final close check, dispatch and child binding with close intent.
+                    path = self._store._path(state["loop_id"])
+                    with ProcessLock(path.with_suffix(".lock")):
+                        latest = self._store.load(state["loop_id"])
+                        if latest.get("close") or latest.get("cleanup"):
+                            state.clear()
+                            state.update(latest)
+                            return False
+                        child["completed_rounds"] = child["round"]
+                        self._acquire(runtime, state, child)
+                        self._store._write_locked(path, state)
                 changed = True
                 continue
             if child.get("lane"):
@@ -467,7 +625,7 @@ class LoopController:
 
     @staticmethod
     def _result(state: Mapping[str, Any]) -> LoopResult:
-        data = {key: state.get(key) for key in ("loop_id", "project", "status", "target_thread_count", "heartbeat_id", "heartbeat", "max_rounds", "max_turns", "turns_per_thread", "auto_continue", "continue_prompt", "controller_skill", "business_skill", "model", "reasoning_effort", "notifications", "interval_seconds", "expires_at", "children", "cleanup")}
+        data = {key: state.get(key) for key in ("loop_id", "project", "status", "target_thread_count", "heartbeat_id", "heartbeat", "max_rounds", "max_turns", "turns_per_thread", "auto_continue", "continue_prompt", "controller_skill", "business_skill", "model", "reasoning_effort", "notifications", "interval_seconds", "expires_at", "children", "cleanup", "close")}
         data["business_status"] = ("review" if any(child.get("business_status") in {"review", "unverified"}
             or child.get("phase") == "blocked" for child in state["children"]) else "not_evaluated")
         return LoopResult(str(state["status"]), str(state["loop_id"]), data)

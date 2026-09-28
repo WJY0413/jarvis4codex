@@ -25,7 +25,13 @@ class FakeRuntime:
         return {"status": "holding", "target_thread_id": self.states[hold_id]["thread_id"], "data": {"monitor_id": hold_id}}
 
     def monitor(self, **kwargs):
-        return {"status": "completed", "data": dict(self.states[kwargs["hold_id"]])}
+        data = dict(self.states[kwargs["hold_id"]])
+        # These synthetic terminal scenarios model confirmed, released owners.
+        # Missing real evidence is exercised with the real adapter in MCP E2E.
+        terminal = data.get("status") in {"completed", "failed", "blocked", "cancelled", "turn_limit_reached"}
+        data.setdefault("terminal_confirmed", terminal)
+        data.setdefault("hold_released", terminal)
+        return {"status": "completed", "data": data}
 
     def heartbeat(self, **kwargs):
         self.heartbeat_calls.append(kwargs)
@@ -63,7 +69,7 @@ class JarvisLoopContractTest(unittest.TestCase):
                 self.assertEqual(len(runtime.hold_calls), before)
 
     def test_rotation_requires_released_success_and_respects_manual_stop_and_expiry(self):
-        cases = ["failed", "cancelled", "unknown", "unreleased", "unconfirmed", "short", "manual", "stop", "expiry"]
+        cases = ["failed", "cancelled", "unknown", "unreleased", "unconfirmed", "short", "manual", "stop", "expiry", "close_during_monitor"]
         for case in cases:
             with self.subTest(case=case):
                 runtime = FakeRuntime()
@@ -80,6 +86,14 @@ class JarvisLoopContractTest(unittest.TestCase):
                     state = self.controller._store.load(started.loop_id)
                     state["expires_at"] = "2000-01-01T00:00:00+00:00"
                     self.controller._store.save(started.loop_id, state)
+                if case == "close_during_monitor":
+                    original_monitor = runtime.monitor
+                    def monitor_and_close(**kwargs):
+                        state = self.controller._store.load(started.loop_id)
+                        state["close"] = {"close_request_id": "close:during-monitor", "report_status": "pending"}
+                        self.controller._store.save(started.loop_id, state)
+                        return original_monitor(**kwargs)
+                    runtime.monitor = monitor_and_close
                 self.controller.tick(runtime, loop_id=started.loop_id)
                 self.assertEqual(len(runtime.hold_calls), 1)
                 if case == "unreleased":
@@ -242,6 +256,17 @@ class JarvisLoopContractTest(unittest.TestCase):
                     self.assertEqual(saved["children"][0]["lane"]["result_verification"]["output_schema"], schema)
 
     def test_stale_tick_cannot_overwrite_a_persisted_stop(self):
+        # QA P1: first durable close exists before cleanup and must already win.
+        self.controller._store.create("close-race", {"schema": "jarvis-loop-state/v1", "loop_id": "close-race", "status": "running", "children": []})
+        stale = self.controller._store.load("close-race")
+        closing = self.controller._store.load("close-race")
+        closing["close"] = {"close_request_id": "close:race", "report_status": "pending", "scheduling_closed": False}
+        self.controller._store.save("close-race", closing)
+        self.controller._store.save("close-race", stale)
+        self.assertEqual(self.controller._store.load("close-race")["close"], closing["close"])
+        self.assertEqual(stale["close"], closing["close"])
+        self.controller.tick(self.runtime, loop_id="close-race")
+        self.assertEqual(self.runtime.hold_calls, [])
         started = self.controller.start(self.runtime, request_id="stop-race", project="test", title="test", prompt="test",
                                         target_thread_count=1, max_rounds=2, expires_at="2099-01-01T00:00:00+00:00")
         stale_tick = self.controller._store.load(started.loop_id)
@@ -931,7 +956,9 @@ class JarvisLoopContractTest(unittest.TestCase):
         self.assertIn("prompt", arguments)
         self.assertTrue({"continue_prompt", "turns_per_thread"}.issubset(arguments))
         loop_calls = [node for node in ast.walk(functions[0]) if isinstance(node, ast.Call)
-                      and isinstance(node.func, ast.Attribute) and node.func.attr == "loop"]
+                      and isinstance(node.func, ast.Attribute) and node.func.attr == "_invoke"
+                      and isinstance(node.func.value, ast.Name) and node.func.value.id == "self"
+                      and node.args and isinstance(node.args[0], ast.Constant) and node.args[0].value == "loop"]
         self.assertEqual(len(loop_calls), 1)
         forwarded = {keyword.arg for keyword in loop_calls[0].keywords}
         self.assertTrue({"continue_prompt", "turns_per_thread"}.issubset(forwarded))

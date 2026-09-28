@@ -17,6 +17,42 @@ from adapters.codex_app_server.jarvis_hold_host_service import JarvisHoldHost, _
 from adapters.codex_app_server.task_provisioning_adapter import read_turn_history
 from jarvis_native_task_launcher import HostContextRequiredError
 from adapters.codex_app_server.jarvis_task_hold_host import hold_task
+from adapters.codex_app_server.jarvis_connection import (
+    GATEWAY_BASE_URL, OFFICIAL_BASE_URL, JarvisConnectionError, route_for_model,
+)
+
+
+class JarvisConnectionTests(unittest.TestCase):
+    def test_native_task_never_starts_optional_gateway(self):
+        probe = Mock(side_effect=AssertionError("native route must not probe 4003"))
+        self.assertEqual(route_for_model({"enabled": True}, "gpt-6-luna", probe=probe), OFFICIAL_BASE_URL)
+        self.assertIsNone(route_for_model(None, "fjd-gpt-luna", probe=probe))
+
+    def test_private_task_adopts_or_starts_gateway(self):
+        healthy = {"service": "private-additive-router", "models": ["fjd-gpt-luna"]}
+        settings = {"enabled": True, "start_command": ["bun.exe", "gateway.mjs"],
+                    "log_path": "C:/logs/jarvis-connection.log", "startup_timeout_seconds": 1}
+        start = Mock()
+        self.assertEqual(route_for_model(settings, "fjd-gpt-luna", probe=lambda: healthy, start=start), GATEWAY_BASE_URL)
+        start.assert_not_called()
+        probes = iter([None, healthy])
+        self.assertEqual(route_for_model(settings, "fjd-gpt-luna", probe=lambda: next(probes),
+                                         start=start, sleep=lambda _: None), GATEWAY_BASE_URL)
+        start.assert_called_once_with(settings["start_command"], settings["log_path"])
+
+    def test_model_catalogue_does_not_gate_explicit_routes(self):
+        settings = {"enabled": True, "model_connections": {"custom/vendor-v1": "custom"},
+            "connections": {"custom": {"base_url": "http://127.0.0.1:4005/v1",
+                "health_url": "http://127.0.0.1:4005/healthz", "credential_ref": "env:OFFLINE_TEST_KEY"}}}
+        for catalog in ({}, {"models": []}, {"models": ["unrelated-model"]}):
+            with self.subTest(catalog=catalog):
+                health = {"service": "private-additive-router", **catalog}
+                self.assertEqual(route_for_model(settings, "custom/vendor-v1", probe_url=lambda _: health),
+                                 "http://127.0.0.1:4005/v1")
+                self.assertEqual(route_for_model({"enabled": True}, "fjd-gpt-terra", probe=lambda: health),
+                                 GATEWAY_BASE_URL)
+        self.assertEqual(route_for_model(settings, "unmapped/unknown", probe_url=Mock(side_effect=AssertionError)),
+                         OFFICIAL_BASE_URL)
 
 
 class FakeConfig:
@@ -444,6 +480,174 @@ class HostContextFailureClient(FakeClient):
 
 
 class TaskMonitorHostTest(unittest.TestCase):
+    def test_resume_failure_records_dispatch_boundary_for_safe_close(self):
+        for sent in (False, True):
+            with self.subTest(sent=sent), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                target = root / "task-holds" / "prestart"
+                target.mkdir(parents=True)
+                request, ack, result = (target / name for name in ("request.json", "ack.json", "result.json"))
+                request.write_text(json.dumps({"hold_id": "prestart", "request_id": "prestart-v1",
+                    "mode": "resume", "thread_id": "shared-thread", "prompt": "hello"}))
+                class FailedResume(FakeClient):
+                    def resume_turn_async(self, thread_id, prompt, **kwargs):
+                        report = kwargs["on_phase"]
+                        report("thread_resuming", {"thread_id": thread_id})
+                        if sent:
+                            report("turn_starting", {"thread_id": thread_id})
+                        raise RuntimeError("transport disconnected" if sent else "already has an active writer")
+                with patch("adapters.codex_app_server.jarvis_task_hold_host.NativeTaskLauncherConfig", return_value=FakeConfig()), patch(
+                        "adapters.codex_app_server.jarvis_task_hold_host.AppServerClient", FailedResume):
+                    self.assertEqual(hold_task(root / "unused", request, ack, result), 1)
+                saved = json.loads(result.read_text())
+                self.assertEqual(saved["dispatch_evidence"], "possibly_sent" if sent else "not_sent")
+                self.assertFalse(saved["terminal_confirmed"])
+                self.assertEqual(saved["turn_id"], "")
+                from adapters.codex_app_server.task_provisioning_adapter import CodexAppServerTaskProvisioningAdapter
+                adapter = CodexAppServerTaskProvisioningAdapter(root / "unused", state_dir=root)
+                receipt = adapter.close_hold("prestart")
+                self.assertEqual(receipt["status"], "closed_unconfirmed" if sent else "closed")
+                self.assertEqual(receipt["hold_released"], not sent)
+                if sent:
+                    self.assertFalse(receipt["terminal_confirmed"])
+                    self.assertTrue(receipt["close_report"]["external_execution_unresolved"])
+                    from jarvis_control import LoopStore, LoopController, JarvisControl
+                    store = LoopStore(root / "loops")
+                    store.create("unknown-loop", {"schema": "jarvis-loop-state/v1", "loop_id": "unknown-loop",
+                        "status": "running", "heartbeat_id": None, "children": [{"slot": "one", "hold_id": "prestart"}]})
+                    controller = LoopController(store)
+                    control = JarvisControl(Mock(), Mock(), adapter, loop_controller=controller)
+                    closed = control.jarvis_close(loop_id="unknown-loop")
+                    self.assertEqual(closed["status"], "closed_unconfirmed")
+                    self.assertFalse(closed["readback"]["terminal"])
+                    self.assertNotIn("unknown-loop", store.active_loop_ids())
+                    with patch.object(control, "monitor", side_effect=AssertionError("closed observer must not poll")):
+                        self.assertEqual(controller.status(control, loop_id="unknown-loop").status, "closed_unconfirmed")
+                    from adapters.codex_app_server.jarvis_hold_host_service import JarvisHoldHost
+                    with patch("adapters.codex_app_server.jarvis_hold_host_service.hold_task", side_effect=AssertionError("must not rerun")):
+                        self.assertFalse(JarvisHoldHost(state_dir=root, launcher_config=root / "unused").run_once())
+                self.assertEqual(json.loads(result.read_text()), saved)
+                print("JARVIS_CLOSE_PREDISPATCH_RECEIPT " + json.dumps({"dispatch_evidence": saved["dispatch_evidence"],
+                    "close_status": receipt["status"], "original_result_preserved": True}))
+
+    def test_exited_app_server_observation_preserves_terminal_evidence_and_error(self):
+        # Reproduced defects: EOF hangs forever, and terminal errors disappear in result.json.
+        import queue
+        from types import SimpleNamespace
+        from jarvis_runtime.jarvis_native_task_launcher import AppServerClient
+        error = {"message": "provider rejected request", "code": "prompt_blocked",
+                 "codexErrorInfo": {"httpConnectionFailed": {"httpStatusCode": 400}}}
+        for event_kind in ("absent", "unrelated", "failed", "legacy_failed"):
+            with self.subTest(event_kind=event_kind), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                request, ack, result = (root / name for name in ("request.json", "ack.json", "result.json"))
+                request.write_text(json.dumps({"request_id": "offline-lifecycle", "hold_id": "offline-hold",
+                    "max_turns": 1}), encoding="utf-8")
+                terminal = {"id": "turn-1", "status": "failed"}
+                if event_kind != "legacy_failed":
+                    terminal["error"] = error
+                wire = "" if event_kind == "absent" else json.dumps({"method": "turn/completed",
+                    "params": {"threadId": "other-thread" if event_kind == "unrelated" else "thread-1",
+                               "turn": terminal}}) + "\n"
+                observer = AppServerClient.__new__(AppServerClient)
+                observer.config = SimpleNamespace(poll_seconds=0.01, turn_completion_timeout_seconds=1)
+                observer.notifications = queue.Queue()
+                observer.response_queue = queue.Queue()
+                with subprocess.Popen([sys.executable, "-c", "import sys; sys.stdout.write(sys.argv[1])", wire],
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8") as process:
+                    observer.process = process
+                    process.wait(timeout=5)
+                    observer._read_stdout()
+                    client = FakeClient(None)
+                    def wait(thread_id, turn_id, **kwargs):
+                        deadline = time.monotonic() + 0.5
+                        poll = kwargs.pop("control_poll")
+                        def bounded_poll():
+                            if time.monotonic() >= deadline:
+                                raise RuntimeError("probe deadline exceeded: terminal wait hung")
+                            poll()
+                        return observer.wait_for_turn_terminal(thread_id, turn_id,
+                            control_poll=bounded_poll, **kwargs)
+                    client.wait_for_turn_terminal = wait
+                    with patch("adapters.codex_app_server.jarvis_task_hold_host.NativeTaskLauncherConfig", return_value=FakeConfig()), patch(
+                            "adapters.codex_app_server.jarvis_task_hold_host.AppServerClient", return_value=client):
+                        exit_code = hold_task(root / "unused", request, ack, result)
+                saved = json.loads(result.read_text(encoding="utf-8"))
+                saved_ack = json.loads(ack.read_text(encoding="utf-8"))
+                exact_terminal = event_kind in {"failed", "legacy_failed"}
+                self.assertEqual(exit_code, 0 if exact_terminal else 1)
+                self.assertEqual(saved["terminal_confirmed"], exact_terminal)
+                self.assertEqual((saved["thread_id"], saved["turn_id"]), ("thread-1", "turn-1"))
+                self.assertEqual(client.started_turns, [])
+                self.assertTrue(client.closed)
+                if not exact_terminal:
+                    self.assertIn("App Server disconnected", saved["reason"])
+                    self.assertFalse((root / "turn-history.sqlite").exists())
+                else:
+                    self.assertEqual(saved["status"], "failed")
+                    if event_kind == "failed":
+                        self.assertEqual(saved["error"], error)
+                        self.assertEqual(saved_ack["error"], error)
+                        self.assertEqual(saved["reason"], error["message"])
+                    else:
+                        self.assertIsNone(saved.get("error"))
+                        self.assertEqual(saved["reason"], "non_completed_terminal")
+                print("LIFECYCLE_OFFLINE_RECEIPT " + json.dumps({"case": event_kind,
+                    "terminal_confirmed": saved["terminal_confirmed"], "reason": saved["reason"],
+                    "error": saved.get("error"), "production_state_used": False}))
+
+    def test_recovery_preserves_model_bound_route_without_dispatch(self):
+        # Reproduced recovery route selection bug; only gateway I/O is replaced.
+        from functools import partial
+        settings = {"enabled": True, "model_connections": {"jean-gpt-6-luna": "jean"},
+            "connections": {"jean": {"base_url": "http://127.0.0.1:4005/v1",
+                "health_url": "http://127.0.0.1:4005/healthz", "credential_ref": "env:OFFLINE_TEST_KEY"}}}
+        for model, expected in (("jean-gpt-6-luna", "http://127.0.0.1:4005/v1"),
+                ("fjd-gpt-6-sol", GATEWAY_BASE_URL), ("gpt-6-luna", OFFICIAL_BASE_URL), (None, OFFICIAL_BASE_URL)):
+            with self.subTest(model=model), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                request, ack, result = (root / name for name in ("request.json", "ack.json", "result.json"))
+                request.write_text(json.dumps({"mode": "recover", "request_id": "route-recovery",
+                    "thread_id": "thread-1", "turn_id": "turn-1", "model": model, "max_turns": 1}), encoding="utf-8")
+                config = FakeConfig()
+                config.jarvis_connection = settings
+                client = FakeClient(None)
+                routed = partial(route_for_model, probe=lambda *args: {
+                    "service": "private-additive-router", "models": [model]}, probe_url=lambda *args: {
+                    "service": "private-additive-router", "models": [model]})
+                with patch("adapters.codex_app_server.jarvis_task_hold_host.NativeTaskLauncherConfig", return_value=config), patch(
+                        "adapters.codex_app_server.jarvis_task_hold_host.route_for_model", side_effect=routed), patch(
+                        "adapters.codex_app_server.jarvis_task_hold_host.AppServerClient", return_value=client):
+                    self.assertEqual(hold_task(root / "unused", request, ack, result), 0)
+                self.assertEqual(config.connection_base_url_override, expected)
+                self.assertEqual(client.created_requests, [])
+                self.assertEqual(client.started_turns, [])
+                self.assertFalse(hasattr(client, "resumed"))
+                print("RECOVERY_ROUTE_RECEIPT " + json.dumps({"model": model,
+                    "base_url": config.connection_base_url_override, "new_dispatches": 0}))
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            request, ack, result = (root / name for name in ("request.json", "ack.json", "result.json"))
+            request.write_text(json.dumps({"mode": "recover", "request_id": "route-down",
+                "thread_id": "thread-1", "turn_id": "turn-1", "model": "fjd-gpt-6-sol"}), encoding="utf-8")
+            config = FakeConfig()
+            config.jarvis_connection = {"enabled": True, "start_command": ["never.exe", "never.py"],
+                                       "log_path": str(root / "gateway.log")}
+            start = Mock(side_effect=RuntimeError("forbidden recovery gateway startup"))
+            routed = partial(route_for_model, probe=lambda: None, probe_url=lambda url: None, start=start)
+            with patch("adapters.codex_app_server.jarvis_task_hold_host.NativeTaskLauncherConfig", return_value=config), patch(
+                    "adapters.codex_app_server.jarvis_task_hold_host.route_for_model", side_effect=routed), patch(
+                    "adapters.codex_app_server.jarvis_task_hold_host.AppServerClient") as factory:
+                self.assertEqual(hold_task(root / "unused", request, ack, result), 1)
+            start.assert_not_called()
+            factory.assert_not_called()
+            saved = json.loads(result.read_text(encoding="utf-8"))
+            self.assertFalse(saved["terminal_confirmed"])
+            self.assertIn("recovery cannot start", saved["reason"])
+            print("RECOVERY_ROUTE_RECEIPT " + json.dumps({"case": "gateway_unavailable",
+                "gateway_starts": 0, "new_dispatches": 0, "terminal_confirmed": False}))
+
     def test_final_answer_lane_receives_each_turn_without_worker_file_writes(self):
         class PocketClient(FakeClient):
             def wait_for_turn_readback(self, thread_id, turn_id, **kwargs):

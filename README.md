@@ -1,10 +1,17 @@
-# Jarvis Control Plane 0.2.4
+# Jarvis Control Plane 0.2.5
 
 Jarvis provides durable task holding, bounded loops, monitoring and local heartbeat scheduling through MCP. The Codex App Server adapter owns native turns; Monitor decides whether a completed turn may continue, and Hold executes only the command bound to that Hold and turn.
 
-The public MCP tools are `jarvis_create`, `jarvis_hold`, `jarvis_loop`, `jarvis_read`, `jarvis_resume`, `jarvis_monitor`, `jarvis_heartbeat`, `jarvis_update` and `jarvis_notify`. Harness-specific operations remain in adapters behind the control-plane contracts.
+The public MCP tools are `jarvis_create`, `jarvis_hold`, `jarvis_close`, `jarvis_loop`, `jarvis_read`, `jarvis_resume`, `jarvis_monitor`, `jarvis_heartbeat`, `jarvis_update` and `jarvis_notify`. Harness-specific operations remain in adapters behind the control-plane contracts.
 
-## Included in 0.2.4
+## New in 0.2.5
+
+- Opt-in loopback Streamable HTTP lets multiple MCP clients share one explicitly started server process. The default remains stdio; installation does not switch registrations or start a second instance.
+- Explicit model IDs pass through to the upstream task request without a model-list allowlist. An explicit `jarvis_connection.model_connections` mapping can route any non-empty ID to its named local connection. Gateway health catalogs do not certify or restrict model availability; real upstream errors remain authoritative. Unmapped models retain existing native/default routing, not an arbitrary private endpoint.
+- `jarvis_close` durably records closure requests and outcomes for one Hold or Loop. It stops further scheduling and can interrupt the precisely owned current turn. `closed` requires terminal and release evidence; `closed_unconfirmed` means local management stopped but external execution is still unknown and capacity is not claimed as released. Live local owners remain `closing`. Identity conflicts and failed durable writes return errors, never synthetic success.
+- Loop closure survives stale state saves and reports child closure automatically. Recovery never starts an unavailable gateway; no shared Host or unrelated writer is killed to force closure.
+
+## Existing capabilities
 
 - Durable Hold ownership and exact host-aware recovery. Explicit `--workers` capacity is preserved (for example, 20); an active Host is not restarted to resize it.
 - Optional `turns_per_thread` bounds each thread within a Loop. Set it to 5 for five-turn rotation; continuation preserves logical task identity and remaining lane work.
@@ -69,6 +76,8 @@ Register this command and arguments with your MCP client, using absolute paths f
 <venv-python> -m jarvis_mcp.entrypoint --config <config-dir>/transport.json --launcher-config <config-dir>/launcher.json --state-dir <state-dir> --local-heartbeat-config <config-dir>/local-heartbeat.json
 ```
 
+This starts the default stdio transport for that client. To explicitly share one server, run that same command once with `--transport streamable-http --port <chosen-port>` and register `http://127.0.0.1:<chosen-port>/mcp` in each intended MCP client instead of per-client commands. The HTTP listener is loopback-only; all ten tools use the same serialization lock. It is not a remote authenticated service. Use different ports, configurations and state directories for independent instances. Starting or upgrading one instance does not automatically start or upgrade another.
+
 For long-running local scheduling, the existing host module uses the same configuration:
 
 ```text
@@ -100,6 +109,6 @@ $env:PYTHONPATH = 'packages;packages/jarvis_runtime'
 
 ## Release provenance
 
-This release integrates accepted rotation, scheduler-result and host-aware recovery work with the production notification, adoption and explicit-capacity fixes. Private local development ancestry, installation receipts and business-task records are not imported.
+This release integrates the accepted shared MCP transport, explicit-model routing and durable closure changes on the previous public release. Private local development ancestry, installation receipts and business-task records are not imported.
 
 The new release content and assets are sanitized. Existing public repository history is retained; this release does not rewrite or purge that history. See `updates/current/NEXT_VERSION_CHANGELOG.md` for release notes.

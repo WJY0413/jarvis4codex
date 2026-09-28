@@ -1,4 +1,4 @@
-"""Stdio process entry point for a locally registered Jarvis MCP server."""
+"""Local Jarvis MCP entry point: stdio or explicit shared loopback HTTP."""
 
 from __future__ import annotations
 
@@ -22,11 +22,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--state-dir", type=Path, required=True, help="isolated MCP receipt and monitor state directory")
     parser.add_argument("--local-heartbeat-config", type=Path, help="local scheduler config, kept separate from App Server transport")
     parser.add_argument("--notification-config", type=Path, help="verified Jarvis notification adapter config")
+    parser.add_argument("--transport", choices=("stdio", "streamable-http"), default="stdio")
+    parser.add_argument("--port", type=int, help="required loopback port for streamable-http")
     return parser
 
 
 def main() -> int:
-    args = build_parser().parse_args()
+    parser = build_parser()
+    args = parser.parse_args()
+    if args.transport == "streamable-http" and (args.port is None or not 1 <= args.port <= 65535):
+        parser.error("streamable-http requires --port between 1 and 65535")
+    if args.transport == "stdio" and args.port is not None:
+        parser.error("--port requires --transport streamable-http")
     control = build_jarvis_control(
         args.config,
         args.state_dir,
@@ -36,7 +43,10 @@ def main() -> int:
     )
     server = JarvisMcpServer(control)
     try:
-        server.run_stdio()
+        if args.transport == "streamable-http":
+            server.run_http(port=args.port)
+        else:
+            server.run_stdio()
     finally:
         control.close()
     return 0

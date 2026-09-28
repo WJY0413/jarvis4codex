@@ -1,6 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import os
+import socket
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -21,6 +26,105 @@ from jarvis_codex_bridge import (
 )
 from jarvis_control import JarvisControl
 from jarvis_mcp import JarvisMcpServer
+
+
+class SharedHttpMcpContractTest(unittest.TestCase):
+    """Real HTTP acceptance; synthetic control never accesses runtime state."""
+
+    def test_shared_process_clients_security_and_cleanup(self):
+        import http.client
+
+        with socket.socket() as reserve:
+            reserve.bind(("127.0.0.1", 0))
+            port = reserve.getsockname()[1]
+        script = '''
+import os, sys, time
+from jarvis_mcp import JarvisMcpServer
+class Control:
+    def __init__(self):
+        self.active = 0
+        self.maximum = 0
+    def read(self, **kwargs):
+        self.active += 1
+        self.maximum = max(self.maximum, self.active)
+        time.sleep(0.03)
+        self.active -= 1
+        return {"status": "ok", "pid": os.getpid(), "maximum": self.maximum}
+    jarvis_close = read
+JarvisMcpServer(Control()).run_http(port=int(sys.argv[1]))
+'''
+        # Windows venv python is a launcher; use its base interpreter with the
+        # venv packages so the owned PID is the actual HTTP service PID.
+        bootstrap = f"import site; site.addsitedir({str(Path(sys.prefix) / 'Lib' / 'site-packages')!r});\n"
+        executable = getattr(sys, "_base_executable", sys.executable) if os.name == "nt" else sys.executable
+        command = [executable, "-c", bootstrap + script, str(port)]
+        url = f"http://127.0.0.1:{port}/mcp"
+        def request(method="GET", headers=None):
+            connection = http.client.HTTPConnection("127.0.0.1", port, timeout=1)
+            try:
+                connection.request(method, "/mcp", body="{}" if method == "POST" else None,
+                                   headers=headers or {})
+                response = connection.getresponse()
+                response.read()
+                return response.status
+            finally:
+                connection.close()
+        receipt = {"transport": "streamable-http", "client_count": 3}
+        with tempfile.TemporaryFile(mode="w+") as log:
+            process = subprocess.Popen(command, stdout=log, stderr=log)
+            try:
+                deadline = time.monotonic() + 15
+                while True:
+                    if process.poll() is not None:
+                        log.seek(0)
+                        self.fail(log.read())
+                    try:
+                        request()
+                        break
+                    except OSError:
+                        if time.monotonic() > deadline:
+                            self.fail("HTTP startup timeout")
+                        time.sleep(0.1)
+
+                async def exercise():
+                    async with Client(url) as first, Client(url) as second:
+                        names = [tool.name for tool in (await first.list_tools()).tools]
+                        self.assertIn("jarvis_read", names)
+                        self.assertEqual(len(names), 10)
+                        self.assertIn("jarvis_close", names)
+                        results = await asyncio.gather(*[
+                            client.call_tool(tool, arguments)
+                            for client, tool, arguments in (
+                                (first, "jarvis_read", {"subject": "capabilities"}),
+                                (second, "jarvis_close", {"hold_id": "synthetic-hold"}),
+                            )
+                        ])
+                        async with Client(url) as third:
+                            results.append(await third.call_tool("jarvis_read", {"subject": "capabilities"}))
+                        results.append(await second.call_tool("jarvis_read", {"subject": "capabilities"}))
+                        return [result.structured_content for result in results]
+
+                results = asyncio.run(exercise())
+                self.assertEqual({result["pid"] for result in results}, {process.pid})
+                self.assertEqual({result["maximum"] for result in results}, {1})
+                self.assertIsNone(process.poll())
+                bad_host = request("POST", {"host": "evil.example"})
+                bad_origin = request("POST", {"origin": "https://evil.example"})
+                self.assertIn(bad_host, (400, 403, 421))
+                self.assertIn(bad_origin, (400, 403, 421))
+                duplicate = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=15)
+                self.assertNotEqual(duplicate.returncode, 0)
+                self.assertIsNone(process.poll())
+                receipt.update(pid=process.pid, readbacks=results, disconnect_survived=True,
+                               unsafe_host=bad_host, unsafe_origin=bad_origin,
+                               duplicate_listener_exit=duplicate.returncode)
+            finally:
+                process.terminate()
+                process.wait(timeout=10)
+                receipt["process_cleaned_up"] = process.poll() is not None
+        target = os.environ.get("JARVIS_HTTP_E2E_RECEIPT")
+        if target:
+            Path(target).write_text(json.dumps(receipt, indent=2) + "\n", encoding="utf-8")
 
 
 class FakeTransport:
@@ -93,7 +197,7 @@ class JarvisMcpContractTest(unittest.TestCase):
     def test_initialize_reports_the_current_mcp_version(self):
         metadata = tomllib.loads((Path(__file__).resolve().parents[2] / "pyproject.toml").read_text(encoding="utf-8"))
         expected_version = metadata["project"]["version"]
-        self.assertEqual(expected_version, "0.2.4")
+        self.assertEqual(expected_version, "0.2.5")
         self.assertEqual(self.server.mcp.version, expected_version)
 
         async def initialize():
@@ -125,7 +229,7 @@ class JarvisMcpContractTest(unittest.TestCase):
                 return await client.call_tool(name, arguments)
         return asyncio.run(run())
 
-    def test_lists_the_nine_public_jarvis_tools_with_sdk_generated_schema(self):
+    def test_lists_the_public_jarvis_tools_with_sdk_generated_schema(self):
         result = self.list_tools()
         self.assertEqual(
             [tool.name for tool in result.tools],
@@ -133,6 +237,7 @@ class JarvisMcpContractTest(unittest.TestCase):
                 "jarvis_create",
                 "jarvis_hold",
                 "jarvis_loop",
+                "jarvis_close",
                 "jarvis_read",
                 "jarvis_resume",
                 "jarvis_monitor",
@@ -151,6 +256,227 @@ class JarvisMcpContractTest(unittest.TestCase):
         self.assertTrue({"continue_prompt", "turns_per_thread"}.issubset(loop_tool.input_schema["properties"]))
         self.assertIn("Optional business Skill", loop_tool.input_schema["properties"]["business_skill"]["description"])
         self.assertIn("action=start requires a prompt", loop_tool.description)
+
+    def test_close_mcp_drains_queued_hold_or_loop_without_turn_id(self):
+        from jarvis_control import LoopController, LoopStore
+        from adapters.codex_app_server.task_provisioning_adapter import CodexAppServerTaskProvisioningAdapter
+        from adapters.codex_app_server.jarvis_task_hold_host import hold_task
+        for target in ("hold", "loop"):
+            with self.subTest(target=target):
+                root = Path(self.temp.name) / target
+                hold_root = root / "task-holds" / "close-test"
+                hold_root.mkdir(parents=True)
+                request, ack, result = (hold_root / name for name in ("request.json", "ack.json", "result.json"))
+                request.write_text(json.dumps({"request_id": "close-test", "hold_id": "close-test"}), encoding="utf-8")
+                ack.write_text(json.dumps({"status": "accepted", "hold_id": "close-test"}), encoding="utf-8")
+                store = LoopStore(root / "loops")
+                store.create("close-loop", {"schema": "jarvis-loop-state/v1", "loop_id": "close-loop",
+                    "status": "running", "heartbeat_id": None,
+                    "children": [{"slot": "one", "hold_id": "close-test"}]})
+                adapter = CodexAppServerTaskProvisioningAdapter(root / "unused", state_dir=root)
+                self.server = JarvisMcpServer(JarvisControl(self.capability_port, self.bridge,
+                    provisioner=adapter, loop_controller=LoopController(store)))
+                args = {"hold_id": "close-test"} if target == "hold" else {"loop_id": "close-loop"}
+                pending = self.call("jarvis_close", args).structured_content
+                self.assertEqual(pending["status"], "closing")
+                close_path = hold_root / "close.json"
+                self.assertEqual(json.loads(close_path.read_text())["report_status"], "pending")
+                if target == "loop":
+                    self.assertEqual(store.load("close-loop")["close"]["report_status"], "pending")
+                self.assertFalse(pending["readback"]["terminal"])
+                self.assertTrue(json.loads(request.read_text())["stop_requested"])
+                self.assertFalse(result.exists())
+                self.assertEqual(hold_task(root / "unused", request, ack, result), 0)
+                self.assertEqual(json.loads(close_path.read_text())["report_status"], "completed")
+                if target == "loop":
+                    self.assertEqual(store.load("close-loop")["close"]["report_status"], "completed")
+                finished = self.call("jarvis_close", args).structured_content
+                self.assertEqual(finished["status"], "closed")
+                close_report = json.loads(close_path.read_text())
+                self.assertEqual(close_report["report_status"], "completed")
+                self.assertEqual(close_report["execution_state"], "terminal")
+                self.assertTrue(close_report["scheduling_closed"])
+                if target == "loop":
+                    self.assertEqual(store.load("close-loop")["close"]["report_status"], "completed")
+                self.assertTrue(finished["readback"]["terminal"])
+                self.assertEqual(finished["tool"], "jarvis_close")
+                snapshots = [path.read_bytes() for path in (request, ack, result)]
+                self.assertEqual(self.call("jarvis_close", args).structured_content["status"], "closed")
+                self.assertEqual(snapshots, [path.read_bytes() for path in (request, ack, result)])
+                self.assertEqual(close_report, json.loads(close_path.read_text()))
+                self.assertEqual(json.loads(result.read_text())["phase"], "stopped_before_dispatch")
+                self.assertEqual(self.transport.prompts, [])
+                print("JARVIS_CLOSE_E2E_RECEIPT " + json.dumps({"target": target,
+                    "initial": pending["status"], "final": finished["status"], "turns_started": 0,
+                    "repeat_idempotent": True, "production_state_used": False}))
+
+    def test_close_reports_persistence_failure_and_cancels_unclaimed_queue_without_host(self):
+        from unittest.mock import patch
+        from adapters.codex_app_server.task_provisioning_adapter import CodexAppServerTaskProvisioningAdapter
+        root = Path(self.temp.name)
+        target = root / "task-holds" / "offline-queued"
+        target.mkdir(parents=True)
+        request = target / "request.json"
+        request.write_text(json.dumps({"hold_id": "offline-queued", "request_id": "queued-v1"}))
+        (target / "ack.json").write_text(json.dumps({"hold_id": "offline-queued", "request_id": "queued-v1",
+            "status": "accepted", "phase": "queued_for_user_host"}))
+        adapter = CodexAppServerTaskProvisioningAdapter(root / "unused", state_dir=root)
+        self.server = JarvisMcpServer(JarvisControl(self.capability_port, self.bridge, provisioner=adapter))
+        before = request.read_bytes()
+        with patch("adapters.codex_app_server.task_provisioning_adapter._write_json", side_effect=PermissionError("disk denied")):
+            failed = self.call("jarvis_close", {"hold_id": "offline-queued"}).structured_content
+        self.assertEqual(failed["status"], "failed")
+        self.assertIn("disk denied", failed["reason"])
+        self.assertEqual(request.read_bytes(), before)
+        self.assertFalse((target / "result.json").exists())
+        # Crash window: intent persisted but request stop was not written.
+        from adapters.codex_app_server.task_provisioning_adapter import _write_json
+        def fail_latch(path, value):
+            if path == request:
+                raise PermissionError("stop latch denied")
+            _write_json(path, value)
+        with patch("adapters.codex_app_server.task_provisioning_adapter._write_json", side_effect=fail_latch):
+            failed = self.call("jarvis_close", {"hold_id": "offline-queued"}).structured_content
+        self.assertEqual(failed["status"], "failed")
+        self.assertTrue((target / "close.json").exists())
+        self.assertEqual(request.read_bytes(), before)
+        from adapters.codex_app_server.jarvis_task_hold_host import hold_task
+        self.assertEqual(hold_task(root / "unused", request, target / "ack.json", target / "result.json"), 0)
+        receipt = self.call("jarvis_close", {"hold_id": "offline-queued"}).structured_content
+        self.assertEqual(receipt["status"], "closed")
+        report = json.loads((target / "close.json").read_text())
+        self.assertEqual(report["request_id"], "queued-v1")
+        self.assertEqual(report["report_status"], "completed")
+        self.assertEqual(json.loads((target / "result.json").read_text())["phase"], "stopped_before_dispatch")
+        # A reused Hold directory must not inherit the prior attempt's closure.
+        request.write_text(json.dumps({"hold_id": "offline-queued", "request_id": "queued-v2"}))
+        from adapters.codex_app_server.task_provisioning_adapter import refresh_close_report
+        refresh_close_report(target, {"request_id": "queued-v1", "terminal_confirmed": True, "hold_released": True})
+        self.assertEqual(report, json.loads((target / "close.json").read_text()))
+        print("JARVIS_CLOSE_DURABLE_RECEIPT " + json.dumps({"queued_without_host": "closed",
+            "failed_write_no_effects": True, "stale_owner_report_ignored": True}))
+
+    def test_close_qa_binding_recovery_and_failure_receipts(self):
+        from types import SimpleNamespace
+        from jarvis_control import LoopController, LoopStore
+        from adapters.codex_app_server.task_provisioning_adapter import CodexAppServerTaskProvisioningAdapter
+        root = Path(self.temp.name)
+        adapter = CodexAppServerTaskProvisioningAdapter(root / "unused", state_dir=root)
+        for case in ("recover", "stale"):
+            with self.subTest(case=case):
+                target = root / "task-holds" / case
+                target.mkdir(parents=True)
+                request = {"hold_id": case, "request_id": "new"}
+                if case == "recover":
+                    request.update(mode="recover", thread_id="existing-thread", turn_id="existing-active-turn")
+                (target / "request.json").write_text(json.dumps(request))
+                (target / "ack.json").write_text(json.dumps({"hold_id": case, "request_id": "new",
+                    "status": "accepted", "phase": "queued_for_user_host"}))
+                if case == "stale":
+                    (target / "result.json").write_text(json.dumps({"hold_id": case, "request_id": "old",
+                        "status": "completed", "terminal_confirmed": True}))
+                before = {p.name: p.read_bytes() for p in target.glob("*.json")}
+                self.server = JarvisMcpServer(JarvisControl(self.capability_port, self.bridge, provisioner=adapter))
+                receipt = self.call("jarvis_close", {"hold_id": case}).structured_content
+                report = json.loads((target / "close.json").read_text())
+                self.assertFalse(report["terminal_confirmed"])
+                self.assertFalse(report["hold_released"])
+                if case == "recover":
+                    self.assertEqual(receipt["status"], "closed_unconfirmed")
+                    self.assertEqual(report["turn_id"], "existing-active-turn")
+                    self.assertTrue(report["external_execution_unresolved"])
+                else:
+                    self.assertEqual(receipt["status"], "failed")
+                    self.assertFalse(receipt["readback"]["verified"])
+                    self.assertFalse(adapter.hold_status(case)["hold_released"])
+                    for name, content in before.items():
+                        self.assertEqual((target / name).read_bytes(), content)
+                    store = LoopStore(root / "loops")
+                    store.create("stale-loop", {"schema": "jarvis-loop-state/v1", "loop_id": "stale-loop",
+                        "status": "running", "heartbeat_id": None, "children": [{"slot": "one", "hold_id": case}]})
+                    self.server = JarvisMcpServer(JarvisControl(self.capability_port, self.bridge,
+                        provisioner=adapter, loop_controller=LoopController(store)))
+                    loop_receipt = self.call("jarvis_close", {"loop_id": "stale-loop"}).structured_content
+                    self.assertEqual(loop_receipt["status"], "failed")
+                    self.assertEqual(store.load("stale-loop")["close"]["report_status"], "failed")
+        for failure in ("failed", "unsupported"):
+            for loop in (False, True):
+                with self.subTest(failure=failure, loop=loop):
+                    store = LoopStore(root / f"loops-{failure}")
+                    if loop:
+                        store.create("l", {"schema": "jarvis-loop-state/v1", "loop_id": "l", "status": "running",
+                            "heartbeat_id": None, "children": [{"slot": "one", "hold_id": "h"}]})
+                    provisioner = SimpleNamespace(close_hold=lambda *a, **k: {"status": failure, "reason": "durable intent unavailable"})
+                    self.server = JarvisMcpServer(JarvisControl(self.capability_port, self.bridge,
+                        provisioner=provisioner, loop_controller=LoopController(store)))
+                    receipt = self.call("jarvis_close", {"loop_id": "l"} if loop else {"hold_id": "h"}).structured_content
+                    self.assertEqual(receipt["status"], "failed" if loop else failure)
+                    self.assertFalse(receipt["readback"]["verified"])
+                    self.assertFalse(receipt["readback"].get("terminal", False))
+                    self.assertIn("durable intent unavailable", receipt["reason"])
+                    if loop:
+                        state = store.load("l")
+                        self.assertEqual(state["cleanup"]["status"], "pending")
+                        self.assertEqual(state["close"]["report_status"], "failed")
+        print("JARVIS_CLOSE_QA_ATTEMPT2 " + json.dumps({"recover": "closed_unconfirmed",
+            "stale_result": "failed_preserved", "child_failures": "explicit"}))
+
+    def test_close_rejects_ambiguous_targets_and_never_confirms_unknown_execution(self):
+        from jarvis_control import LoopController, LoopStore
+        from adapters.codex_app_server.task_provisioning_adapter import CodexAppServerTaskProvisioningAdapter
+        root = Path(self.temp.name)
+        hold_root = root / "task-holds" / "unknown-test"
+        hold_root.mkdir(parents=True)
+        request, result = (hold_root / name for name in ("request.json", "result.json"))
+        request.write_text(json.dumps({"request_id": "unknown", "hold_id": "unknown-test"}), encoding="utf-8")
+        result.write_text(json.dumps({"status": "failed", "terminal_confirmed": False, "turn_id": ""}), encoding="utf-8")
+        adapter = CodexAppServerTaskProvisioningAdapter(root / "unused", state_dir=root)
+        self.server = JarvisMcpServer(JarvisControl(self.capability_port, self.bridge, provisioner=adapter))
+        before = request.read_bytes()
+        for args in ({}, {"hold_id": "unknown-test", "loop_id": "other"}):
+            self.assertEqual(self.call("jarvis_close", args).structured_content["status"], "invalid_request")
+            self.assertEqual(request.read_bytes(), before)
+        self.assertEqual(self.call("jarvis_close", {"hold_id": "missing"}).structured_content["status"], "failed")
+        pending = self.call("jarvis_close", {"hold_id": "unknown-test"}).structured_content
+        self.assertEqual(pending["status"], "closing")
+        self.assertFalse(pending["readback"]["terminal"])
+        self.assertFalse(pending["data"]["hold_released"])
+        self.assertFalse(json.loads(result.read_text())["terminal_confirmed"])
+
+        # QA P1: a legacy startup failure lacks terminal_confirmed entirely.
+        legacy = {"status": "failed", "turn_id": "", "reason": "thread/resume already has an active writer"}
+        result.write_text(json.dumps(legacy), encoding="utf-8")
+        original = result.read_bytes()
+        store = LoopStore(root / "loops")
+        store.create("unknown-loop", {"schema": "jarvis-loop-state/v1", "loop_id": "unknown-loop",
+            "status": "running", "heartbeat_id": None, "children": [{"slot": "one", "hold_id": "unknown-test"}]})
+        self.server = JarvisMcpServer(JarvisControl(self.capability_port, self.bridge,
+            provisioner=adapter, loop_controller=LoopController(store)))
+        for args in ({"hold_id": "unknown-test"}, {"loop_id": "unknown-loop"}):
+            pending = self.call("jarvis_close", args).structured_content
+            self.assertEqual(pending["status"], "closing")
+            self.assertFalse(pending["readback"]["terminal"])
+            self.assertEqual(result.read_bytes(), original)
+        state = store.load("unknown-loop")
+        self.assertEqual(state["cleanup"]["status"], "pending")
+        self.assertFalse(state["children"][0]["hold_released"])
+        self.assertFalse(adapter.hold_status("unknown-test")["hold_released"])
+        # Persisted output of the rejected version must not remain falsely closed.
+        legacy_state = store.load("unknown-loop")
+        legacy_state["status"] = "stopped"
+        legacy_state["cleanup"]["status"] = "completed"
+        legacy_state["children"][0]["hold_released"] = True
+        store.save("unknown-loop", legacy_state)
+        self.assertNotIn("unknown-loop", store.active_loop_ids())
+        pending = self.call("jarvis_close", {"loop_id": "unknown-loop"}).structured_content
+        self.assertEqual(pending["status"], "closing")
+        self.assertFalse(pending["readback"]["terminal"])
+        self.assertEqual(store.load("unknown-loop")["cleanup"]["status"], "pending")
+        self.assertFalse(store.load("unknown-loop")["children"][0]["hold_released"])
+        self.assertEqual(result.read_bytes(), original)
+        print("JARVIS_CLOSE_E2E_RECEIPT " + json.dumps({"case": "legacy_no_turn_unknown",
+            "hold_close": "closing", "loop_close": "closing", "cleanup": "pending",
+            "hold_released": False, "history_bytes_preserved": True}))
 
     def test_resume_without_a_monitor_owned_adapter_reports_unsupported(self):
         result = self.call(

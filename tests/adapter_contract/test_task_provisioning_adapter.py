@@ -302,6 +302,10 @@ class TaskProvisioningAdapterContractTest(unittest.TestCase):
             self.assertTrue(adapter.hold_status("hold-test")["hold_released"])
             (root / "result.json").write_text(json.dumps({"status": "failed", "terminal_confirmed": False}), encoding="utf-8")
             self.assertFalse(adapter.hold_status("hold-test")["hold_released"])
+            (root / "result.json").write_text(json.dumps({"status": "failed", "turn_id": ""}), encoding="utf-8")
+            before = (root / "result.json").read_bytes()
+            self.assertFalse(adapter.hold_status("hold-test")["hold_released"])
+            self.assertEqual((root / "result.json").read_bytes(), before)
 
     def test_explicit_missing_or_mismatched_existing_hold_stays_fail_closed(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -555,6 +559,7 @@ class TaskProvisioningAdapterContractTest(unittest.TestCase):
             root.mkdir(parents=True)
             (root / "result.json").write_text(json.dumps({
                 "request_id": "create-1", "status": "turn_limit_reached",
+                "terminal_confirmed": True,
                 "thread_id": "thread-created-1",
                 "turn_count": 2, "total_turn_count": 2, "max_turns": 2,
             }), encoding="utf-8")

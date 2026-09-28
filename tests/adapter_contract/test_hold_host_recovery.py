@@ -275,7 +275,7 @@ class HoldHostRecoveryAdapterContractTest(unittest.TestCase):
                         "mode": mode if root == target else "recover", "thread_id": thread_id, "turn_id": turn_id})
                     _write_json(root / "ack.json", {"hold_id": root.name, "request_id": root.name,
                         "status": "accepted", "phase": "queued_for_user_host"})
-                adapter = CodexAppServerTaskProvisioningAdapter("unused", state_dir=state, config_loader=lambda _: FakeConfig())
+                adapter = CodexAppServerTaskProvisioningAdapter(config_path, state_dir=state, config_loader=lambda _: FakeConfig())
                 release = host._release_claim
                 def cleanup(root):
                     if root == target and cleanup_failure is True:
@@ -313,9 +313,9 @@ class HoldHostRecoveryAdapterContractTest(unittest.TestCase):
                         if cleanup_failure == "legacy":
                             adapter.request_hold_stop("a-target")  # Legacy optional-field request.
                         else:
-                            accepted = host.request_host_stop("a-target", "target-thread", "target-turn")
-                            self.assertEqual(accepted["status"], "stop_requested")
-                            self.assertFalse(accepted["hold_released"])
+                            accepted = adapter.close_hold("a-target", request_id="exact-close")
+                            self.assertIn(accepted["status"], {"closing", "closed", "closed_unconfirmed"})
+                            self.assertTrue((target / "close.json").exists())
                             host.request_host_stop("a-target", "target-thread", "target-turn")
                         workers[0].join(3)
                         self.assertFalse(workers[0].is_alive())
@@ -326,6 +326,10 @@ class HoldHostRecoveryAdapterContractTest(unittest.TestCase):
                         confirmed = terminal and cleanup_failure != "client"
                         self.assertEqual(receipt["hold_released"], confirmed and cleanup_failure is not True)
                         self.assertEqual(receipt["terminal_confirmed"], confirmed)
+                        if cleanup_failure != "legacy":
+                            report = json.loads((target / "close.json").read_text())
+                            self.assertEqual(report["report_status"], "completed" if confirmed and cleanup_failure is not True else "unresolved")
+                            self.assertEqual(report["hold_released"], receipt["hold_released"])
                         self.assertEqual(json.loads((target / "ack.json").read_text()), json.loads((target / "result.json").read_text()))
                         self.assertEqual(len(clients[0].calls), 1)
                         self.assertTrue(workers[1].is_alive())
@@ -403,6 +407,64 @@ class HoldHostRecoveryAdapterContractTest(unittest.TestCase):
             client.resume_turn_async.assert_not_called()
             self.assertEqual(before, [(path.name, path.read_bytes()) for path in other.iterdir()])
             self.assertTrue(adapter.hold_status("hold-error")["hold_released"])
+
+        # A close with no turn may inspect the thread, never claim its sole writer.
+        with tempfile.TemporaryDirectory() as temp:
+            host, root, client = self._exception_result(temp)
+            host._release_claim(root)
+            saved = json.loads((root / "result.json").read_text())
+            saved["turn_id"] = ""
+            for name in ("result.json", "ack.json"):
+                (root / name).write_text(json.dumps(saved))
+            original = (root / "result.json").read_bytes()
+            client.request.return_value = {"thread": {"id": "thread-exact", "turns": [{"id": "other-writer", "status": "inProgress"}]}}
+            adapter = CodexAppServerTaskProvisioningAdapter(host.launcher_config, state_dir=Path(temp))
+            with patch("adapters.codex_app_server.jarvis_hold_host_service.NativeTaskLauncherConfig", return_value=FakeConfig()), patch(
+                    "adapters.codex_app_server.jarvis_hold_host_service.AppServerClient", return_value=client):
+                receipt = adapter.close_hold("hold-error")
+            self.assertEqual(receipt["status"], "closing")
+            self.assertFalse(receipt["terminal_confirmed"])
+            self.assertFalse(receipt["hold_released"])
+            client.request.assert_called_once_with("thread/read", {"threadId": "thread-exact", "includeTurns": True})
+            self.assertEqual(receipt["close_report"]["last_action"]["active_turn_ids"], ["other-writer"])
+            self.assertEqual(original, (root / "result.json").read_bytes())
+
+    def test_model_validation_rejection_reclaims_only_proven_first_create_without_claim(self):
+        # Sept 27: create rejected its model before turn/start, leaving no turn id.
+        from adapters.codex_app_server import jarvis_hold_host_service as module
+        from adapters.codex_app_server.jarvis_task_hold_host import _write_json
+        for case in ("valid", "transport", "active", "claim", "resume", "stale", "ack_conflict", "prior_turn"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temp:
+                host, root, client = self._exception_result(temp)
+                host._release_claim(root)
+                request = {"hold_id": "hold-error", "request_id": "req", "mode": "create", "model": "fjd-gpt-6-sol"}
+                result = {"request_id": "req", "hold_id": "hold-error", "status": "failed",
+                          "phase": "model_selecting", "thread_id": "new-thread", "turn_id": "",
+                          "total_turn_count": 1, "pid": 123, "terminal_confirmed": False,
+                          "reason": "requested model is not supported by this CLI: fjd-gpt-6-sol; available=[]",
+                          "observed_at": "2026-09-27T15:00:00+00:00"}
+                health = {"pid": 123, "active_hold_ids": [], "observed_at": "2026-09-27T15:01:00+00:00"}
+                if case == "transport": result["reason"] = "model/list timeout"
+                if case == "active": health["active_hold_ids"] = ["hold-error"]
+                if case == "claim": _write_json(root / ".user-host-claim" / "owner.json", {"pid": 123})
+                if case == "resume": request["mode"] = "resume"
+                if case == "stale": health["observed_at"] = result["observed_at"]
+                if case == "prior_turn": request["initial_total_turn_count"] = 2
+                ack = dict(result)
+                if case == "ack_conflict": ack["thread_id"] = "other"
+                for name, value in (("request.json", request), ("ack.json", ack), ("result.json", result)):
+                    _write_json(root / name, value)
+                _write_json(host.health_path, health)
+                with patch.object(module, "_matching_health", return_value=True), patch.object(module, "AppServerClient", return_value=client):
+                    receipt = host.reconcile_hold("hold-error")
+                    self.assertEqual(receipt["terminal_confirmed"], case == "valid")
+                    self.assertEqual(receipt["hold_released"], case == "valid")
+                    if case == "valid":
+                        self.assertEqual(receipt["status"], "failed")
+                        self.assertEqual(receipt["reason"], result["reason"])
+                        self.assertEqual(receipt["turn_id"], "")
+                        self.assertTrue(host.reconcile_hold("hold-error")["hold_released"])
+                client.request.assert_not_called()
 
     def test_host_preserves_terminal_result_and_cleanup_failure_does_not_stop_other_seat(self):
         from adapters.codex_app_server.jarvis_task_hold_host import _write_json

@@ -382,6 +382,11 @@ class JarvisHoldHost:
                                 _write_json(ack_path, failed_cleanup)
                     finally:
                         self._write_health("ready")
+                        from adapters.codex_app_server.task_provisioning_adapter import refresh_close_report
+                        evidence = _read_json(result_path) or {}
+                        refresh_close_report(root, {**evidence, "holder_exit_confirmed": holder_returned,
+                            "hold_released": evidence.get("terminal_confirmed") is True
+                                and not (root / ".user-host-claim").exists()})
                 return True
         return False
 
@@ -595,11 +600,64 @@ class JarvisHoldHost:
                 claim = root / ".user-host-claim"
                 if result.get("terminal_confirmed") is True and result.get("status") in terminal_statuses and not claim.exists():
                     return {**result, "hold_released": True}
+                # create_task reports model_selecting before calling turn/start.
+                # This exact local validation error proves non-dispatch; an empty
+                # turn alone (or a transport error) never proves termination.
+                model = request.get("model")
+                if (request.get("mode") == "create" and model
+                        and not request.get("thread_id") and not request.get("turn_id")
+                        and request.get("initial_turn_count", 1) == 1
+                        and request.get("initial_total_turn_count", 1) == 1
+                        and result.get("status") == "failed"
+                        and result.get("phase") == "model_selecting"
+                        and str(result.get("reason", "")).startswith(
+                            f"requested model is not supported by this CLI: {model}; available=")
+                        and result.get("thread_id") and not result.get("turn_id")
+                        and result.get("total_turn_count") == 1
+                        and all(ack.get(key) == result.get(key) for key in (
+                            "status", "phase", "reason", "thread_id", "turn_id", "pid"))
+                        and not claim.exists()):
+                    health = _read_json(self.health_path) or {}
+                    if (health.get("pid") != result.get("pid")
+                            or not _matching_health(self.state_dir, self.profile, self.codex_home,
+                                now=_now, pid_alive=_pid_is_alive, pid_started_at=_pid_started_at)
+                            or not isinstance(health.get("active_hold_ids"), list)
+                            or hold_id in health["active_hold_ids"]
+                            or _parse_time(health.get("observed_at")) is None
+                            or _parse_time(result.get("observed_at")) is None
+                            or _parse_time(health["observed_at"]) <= _parse_time(result["observed_at"])):
+                        return {**unknown, "reason": "Pre-dispatch failure owner inactivity is unproven"}
+                    reconciled = {**result, "terminal_confirmed": True,
+                                  "execution_evidence": "model_validation_rejected_before_turn_start",
+                                  "recovery": {"source": "pre_dispatch_model_validation",
+                                               "observed_at": _now(), "turn_started": False}}
+                    _write_json(result_path, reconciled)
+                    _write_json(ack_path, {**ack, **reconciled})
+                    return {**reconciled, "hold_released": True}
                 identities = {}
                 for key in ("thread_id", "turn_id"):
                     # request/ack may name the previous terminal turn when a
                     # continuation failed before its new identity was returned.
                     if not result.get(key):
+                        close = _read_json(root / "close.json") or {}
+                        if key == "turn_id" and close and close.get("request_id") == request.get("request_id") and identities.get("thread_id"):
+                            # Read-only diagnosis cannot assign an unrelated active writer.
+                            from adapters.codex_app_server.jarvis_connection import route_for_model
+                            config = NativeTaskLauncherConfig(self.launcher_config)
+                            config.connection_base_url_override = route_for_model(
+                                getattr(config, "jarvis_connection", None), request.get("model"), allow_start=False)
+                            client = AppServerClient(config)
+                            try:
+                                client.start()
+                                readback = client.request("thread/read", {"threadId": identities["thread_id"], "includeTurns": True})
+                            finally:
+                                client.close()
+                            observed = readback.get("thread") or {}
+                            matched = observed.get("id") == identities["thread_id"]
+                            return {**unknown, **identities, "thread_readback_matched": matched,
+                                "active_turn_ids": [turn.get("id") for turn in observed.get("turns", [])
+                                    if matched and isinstance(turn, dict) and turn.get("status") == "inProgress"],
+                                "reason": "Thread inspected; no durable turn ownership binding, no interrupt or release"}
                         return {**unknown, "reason": f"Exact result {key} missing; never reuse a prior turn"}
                     values = {str(value[key]) for value in (request, ack, result) if value.get(key)}
                     if len(values) != 1:

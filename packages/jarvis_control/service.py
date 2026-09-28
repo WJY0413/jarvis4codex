@@ -99,6 +99,49 @@ class JarvisControl:
         except Exception as exc:
             return {"status": "failed", "reason": str(exc)}
 
+    def jarvis_close(
+        self, *, hold_id: str | None = None, loop_id: str | None = None,
+        request_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Persist closure and stop exact owned work; unknown execution stays explicit."""
+        if bool(hold_id) == bool(loop_id):
+            return self._receipt("jarvis_close", "invalid_request", request_id=request_id,
+                                 reason="provide exactly one of hold_id or loop_id")
+        try:
+            if loop_id:
+                if self._loop_controller is None:
+                    return self.unsupported(tool="jarvis_close", reason="no loop controller is configured")
+                result = self._loop_controller.close(self, loop_id=loop_id, request_id=request_id)
+                data = result.data
+                if result.status in {"invalid_request", "failed"}:
+                    return self._receipt("jarvis_close", result.status, request_id=request_id, reason=result.reason, data=data)
+                if (data.get("close") or {}).get("report_status") == "failed":
+                    return self._receipt("jarvis_close", "failed", request_id=request_id,
+                        reason=data["close"].get("reason"), data=data, readback={"verified": False, "terminal": False})
+                closed = (data.get("cleanup") or {}).get("status") == "completed"
+                unconfirmed = result.status == "closed_unconfirmed"
+            else:
+                data = self.close_hold(hold_id, request_id=request_id)
+                if data.get("status") in {"failed", "unsupported", "invalid_request"}:
+                    return self._receipt("jarvis_close", data["status"], request_id=request_id,
+                        reason=data.get("reason"), data=data, readback={"verified": False, "terminal": False})
+                closed = data.get("status") == "closed"
+                unconfirmed = data.get("status") == "closed_unconfirmed"
+            return self._receipt("jarvis_close", "closed" if closed else "closed_unconfirmed" if unconfirmed else "closing",
+                request_id=request_id, data={**data, "close_target": {
+                    "loop_id": loop_id} if loop_id else {"hold_id": hold_id}},
+                reason=None if closed else "local management closed; external execution remains unconfirmed" if unconfirmed else "stop requested; awaiting terminal evidence and resource release",
+                readback={"verified": True, "terminal": closed})
+        except Exception as exc:
+            return self._receipt("jarvis_close", "failed", request_id=request_id, reason=str(exc))
+
+    def close_hold(self, hold_id: str, *, request_id: str | None = None, parent_close: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        """Internal generic lifecycle port; MCP exposes only jarvis_close."""
+        closer = getattr(self._provisioner, "close_hold", None)
+        if not callable(closer):
+            raise RuntimeError("durable Hold closure is unavailable")
+        return closer(hold_id, request_id=request_id, parent_close=parent_close)
+
     def create(
         self,
         *,
