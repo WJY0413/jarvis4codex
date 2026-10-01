@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "dispatcher_thread_id": "jarvis-dot-example",
+  "linux_cloud": true,
+  "codex_cli": "codex",
+  "profile": "Jarvis dot (label only)",
+  "expected_codex_home": "../codex-home",
+  "runtime_environments": [],
+  "runtime_constraints": {
+    "model_provider": "openai",
+    "sandbox": "read-only",
+    "approval_policy": "never"
+  },
+  "allowed_projects": {
+    "Example": "workspace"
+  },
+  "request_timeout_seconds": 30,
+  "turn_completion_timeout_seconds": 180,
+  "turn_readback_timeout_seconds": 20,
+  "max_attempts": 1,
+  "live_creation_enabled": false
+}

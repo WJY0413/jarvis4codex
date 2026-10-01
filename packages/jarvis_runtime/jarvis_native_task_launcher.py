@@ -17,6 +17,11 @@ import threading
 import time
 from typing import Any, Callable, Mapping
 
+try:
+    from .linux_cloud import child_environment, config_path, acquire_instance_lock, release_instance_lock
+except ImportError:  # direct runtime-script execution
+    from linux_cloud import child_environment, config_path, acquire_instance_lock, release_instance_lock
+
 try:  # Supports installed package imports and direct runtime-script execution.
     from .coo_dispatcher_store import (
         DEFAULT_ROOT,
@@ -74,9 +79,12 @@ class NativeTaskError(RuntimeError):
 
 
 class NativeTaskCreationError(NativeTaskError):
-    def __init__(self, message: str, *, thread_id: str | None = None):
+    def __init__(self, message: str, *, thread_id: str | None = None, turn_id: str | None = None,
+                 terminal_status: str | None = None):
         super().__init__(message)
         self.thread_id = thread_id
+        self.turn_id = turn_id
+        self.terminal_status = terminal_status
 
 
 class HostContextRequiredError(NativeTaskError):
@@ -122,6 +130,8 @@ def append_result_contract(prompt: str) -> str:
 
 def append_lane_binding(prompt: str, input_binding: Mapping[str, Any] | None) -> str:
     """Attach one validated Loop lane to the Worker-visible turn input."""
+    if not input_binding:
+        return str(prompt or "")
     text = str(prompt or "").strip()
     if input_binding and (input_binding.get("result_verification") or {}).get("mode") == "final_answer_json":
         # Holder already validated the full lane; this is intentionally a reduced per-turn binding.
@@ -201,8 +211,37 @@ class NativeTaskLauncherConfig:
         self.dispatcher_thread_id = _as_nonempty_string(
             raw.get("dispatcher_thread_id"), "dispatcher_thread_id"
         )
-        self.codex_cli = str(raw.get("codex_cli") or "auto")
+        try:
+            self.codex_cli = config_path(str(raw.get("codex_cli") or "auto"), self.path.parent, command=True)
+        except ValueError as exc:
+            raise NativeTaskError(str(exc)) from exc
+        self.linux_cloud = raw.get("linux_cloud", False)
+        if not isinstance(self.linux_cloud, bool):
+            raise NativeTaskError("linux_cloud must be boolean")
         self.profile = str(raw.get("profile") or "").strip()
+        self.profile_is_label_only = True  # Not passed to Codex; runtime readback is authoritative.
+        # Opt-in instance contract. Never infer it from a profile name or
+        # change the default launcher policy when the field is absent.
+        self.runtime_constraints = None
+        if "runtime_constraints" in raw:
+            constraints = raw["runtime_constraints"]
+            supported = {
+                "model_provider": "openai",
+                "sandbox": "read-only",
+                "approval_policy": "never",
+            }
+            if not isinstance(constraints, dict) or constraints != supported:
+                raise NativeTaskError(
+                    "runtime_constraints requires exactly model_provider=openai, "
+                    "sandbox=read-only, approval_policy=never"
+                )
+            self.runtime_constraints = dict(constraints)
+        self.runtime_environments = None
+        if "runtime_environments" in raw:
+            environments = raw["runtime_environments"]
+            if not isinstance(environments, list) or environments:
+                raise NativeTaskError("runtime_environments supports only an explicit empty list")
+            self.runtime_environments = []
         connection = raw.get("jarvis_connection") or {}
         if not isinstance(connection, dict):
             raise NativeTaskError("jarvis_connection must be an object")
@@ -211,8 +250,26 @@ class NativeTaskLauncherConfig:
             "https://chatgpt.com/backend-api/codex"
             if connection.get("enabled") is True else None
         )
-        self.expected_codex_home = str(raw.get("expected_codex_home") or "").strip()
-        self.live_creation_enabled = bool(raw.get("live_creation_enabled", False))
+        home = str(raw.get("expected_codex_home") or "").strip()
+        self.expected_codex_home_input = home
+        self.expected_codex_home_base_dir = str(self.path.parent)
+        try:
+            self.expected_codex_home = config_path(home, self.path.parent) if home else ""
+        except ValueError as exc:
+            raise NativeTaskError(str(exc)) from exc
+        if self.linux_cloud:
+            if self.runtime_environments != [] or self.runtime_constraints is None or not self.expected_codex_home:
+                raise NativeTaskError("linux_cloud requires runtime_environments=[], explicit home and runtime_constraints")
+            if self.jarvis_connection:
+                raise NativeTaskError("linux_cloud does not support gateway connection overrides")
+        self.live_creation_enabled = raw.get("live_creation_enabled", False) is True
+        self.default_model = str(raw.get("default_model") or "").strip() or None
+        self.default_reasoning_effort = str(raw.get("default_reasoning_effort") or "").strip() or None
+        if self.default_reasoning_effort is not None and self.default_reasoning_effort not in REASONING_EFFORTS:
+            raise NativeTaskError("unsupported default_reasoning_effort")
+        self.worker_capacity = raw.get("worker_capacity", 1)
+        if type(self.worker_capacity) is not int or not 1 <= self.worker_capacity <= 64:
+            raise NativeTaskError("worker_capacity must be an integer from 1 to 64")
         self.poll_seconds = max(float(raw.get("poll_seconds", 2)), 0.25)
         self.request_timeout_seconds = max(
             int(raw.get("request_timeout_seconds", 60)), 10
@@ -235,11 +292,14 @@ class NativeTaskLauncherConfig:
         projects = raw.get("allowed_projects")
         if not isinstance(projects, dict) or not projects:
             raise NativeTaskError("allowed_projects must be a non-empty JSON object")
-        self.allowed_projects = {
-            str(name).strip(): str(path_value).strip()
-            for name, path_value in projects.items()
-            if str(name).strip() and str(path_value).strip()
-        }
+        try:
+            self.allowed_projects = {
+                str(name).strip(): config_path(str(path_value), self.path.parent)
+                for name, path_value in projects.items()
+                if str(name).strip() and str(path_value).strip()
+            }
+        except ValueError as exc:
+            raise NativeTaskError(str(exc)) from exc
 
     def resolve_project(self, value: str) -> tuple[str, Path]:
         requested = _as_nonempty_string(value, "project")
@@ -247,7 +307,10 @@ class NativeTaskLauncherConfig:
             name = requested
             path = Path(self.allowed_projects[requested]).resolve()
         else:
-            requested_path = Path(requested).resolve()
+            try:
+                requested_path = Path(config_path(requested, self.path.parent))
+            except ValueError as exc:
+                raise NativeTaskError(str(exc)) from exc
             match = next(
                 (
                     (name, Path(path_value).resolve())
@@ -835,36 +898,134 @@ class AppServerClient:
         self._request_id = 0
         self._write_lock = threading.Lock()
         self.initialize_result: dict[str, Any] | None = None
+        self.runtime_context: dict[str, Any] = {}
+        self._instance_lock_fd = None
+        self.before_turn_dispatch = None  # Optional owner-installed cancellation/commit gate.
+
+    def _runtime_thread_params(self, model: str | None) -> dict[str, Any]:
+        model = model or getattr(self.config, "default_model", None)
+        constraints = getattr(getattr(self, "config", None), "runtime_constraints", None)
+        if constraints is None:
+            return {}
+        params: dict[str, Any] = {
+            "modelProvider": constraints["model_provider"],
+            "sandbox": constraints["sandbox"],
+            "approvalPolicy": constraints["approval_policy"],
+        }
+        effort = getattr(self.config, "default_reasoning_effort", None)
+        if effort is not None:
+            params["config"] = {"model_reasoning_effort": effort}
+        if model is not None:
+            if not isinstance(model, str) or not model.strip():
+                raise NativeTaskError("constrained runtime model must be a non-empty string")
+            params["model"] = model
+        return params
+
+    def _verify_runtime_context(
+        self, response: Mapping[str, Any], *, operation: str,
+        thread_id: str, model: str | None,
+    ) -> None:
+        config = getattr(self, "config", None)
+        model = model or getattr(config, "default_model", None)
+        constrained = getattr(config, "runtime_constraints", None) is not None
+        no_environments = getattr(config, "runtime_environments", None) is not None
+        if not constrained and not no_environments:
+            return
+        # Only non-secret execution-policy fields from the actual response are
+        # retained. Do not copy the thread, config, account or authentication.
+        self.runtime_context = {
+            key: response[key]
+            for key in ("model", "modelProvider", "sandbox", "approvalPolicy", "reasoningEffort")
+            if key in response
+        }
+        self.runtime_context.update(operation=operation, thread_id=thread_id)
+        initialized = getattr(self, "initialize_result", None) or {}
+        if initialized.get("codexHome"):
+            observed_home = str(initialized["codexHome"])
+            self.runtime_context["codex_home"] = observed_home
+            self.runtime_context["codex_home_verified"] = bool(getattr(config, "expected_codex_home", "")) and Path(observed_home).resolve() == Path(config.expected_codex_home).resolve()
+        if constrained:
+            self.runtime_context["constraints_verified"] = False
+        observed_thread = response.get("thread")
+        if no_environments:
+            self.runtime_context["environments_verified"] = False
+            if isinstance(observed_thread, dict) and "environments" in observed_thread:
+                self.runtime_context["environments"] = observed_thread["environments"]
+        sandbox = response.get("sandbox")
+        failures = []
+        if not thread_id or not isinstance(observed_thread, dict) or observed_thread.get("id") != thread_id:
+            failures.append("thread identity")
+        if not isinstance(response.get("model"), str) or not response["model"].strip():
+            failures.append("model missing")
+        elif model is not None and response["model"] != model:
+            failures.append("model mismatch")
+        if constrained:
+            if response.get("modelProvider") != "openai":
+                failures.append("modelProvider")
+            if (not isinstance(sandbox, dict) or sandbox.get("type") != "readOnly"
+                    or sandbox.get("networkAccess", False) is not False):
+                failures.append("sandbox")
+            if response.get("approvalPolicy") != "never":
+                failures.append("approvalPolicy")
+        expected_effort = getattr(config, "default_reasoning_effort", None)
+        if expected_effort is not None and response.get("reasoningEffort") != expected_effort:
+            failures.append("reasoningEffort")
+        if no_environments:
+            environments = self.runtime_context.get("environments")
+            if not isinstance(environments, list) or environments:
+                failures.append("thread.environments")
+        if failures:
+            raise NativeTaskCreationError(
+                "runtime constraint readback failed: " + ", ".join(failures),
+                thread_id=thread_id or None,
+            )
+        if constrained:
+            self.runtime_context["constraints_verified"] = True
+        if no_environments:
+            self.runtime_context["environments_verified"] = True
 
     def start(self) -> dict[str, Any]:
+        try:
+            return self._start_impl()
+        except BaseException:
+            self.close()
+            raise
+
+    def _start_impl(self) -> dict[str, Any]:
         if self.process and self.process.poll() is None:
             return self.initialize_result or {}
-        env = os.environ.copy()
-        env["PYTHONUTF8"] = "1"
-        # The launcher may itself run under a sandboxed controller process.
-        # Pin the child App Server to the configured real Codex profile so
-        # native tasks are created in the intended visible task space.
-        if self.config.expected_codex_home:
-            env["CODEX_HOME"] = str(self.config.expected_codex_home)
+        try:
+            env = child_environment(self.config)
+        except ValueError as exc:
+            raise NativeTaskError(str(exc)) from exc
         command = [*self.cli_command]
         base_url = getattr(self.config, "connection_base_url_override", None)
         if base_url:
             command.extend(["-c", f"openai_base_url={base_url}"])
         command.extend(["app-server", "--stdio"])
-        self.process = subprocess.Popen(
-            command,
-            cwd=str(WORKSPACE_ROOT),
-            env=env,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            bufsize=1,
-            shell=False,
-            **_background_subprocess_kwargs(),
-        )
+        try:
+            self._instance_lock_fd = acquire_instance_lock(self.config)
+        except (ValueError, OSError) as exc:
+            raise NativeTaskError(str(exc)) from exc
+        try:
+            self.process = subprocess.Popen(
+                command,
+                cwd=str(WORKSPACE_ROOT),
+                env=env,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+                shell=False,
+                **_background_subprocess_kwargs(),
+            )
+        except BaseException:
+            release_instance_lock(self._instance_lock_fd)
+            self._instance_lock_fd = None
+            raise
         threading.Thread(target=self._read_stdout, daemon=True).start()
         threading.Thread(target=self._read_stderr, daemon=True).start()
         try:
@@ -888,8 +1049,8 @@ class AppServerClient:
             ):
                 raise HostContextRequiredError(
                     "JARVIS_HOST_CONTEXT_REQUIRED: App Server cannot initialize the configured "
-                    f"CODEX_HOME {self.config.expected_codex_home!r}; run hold from the normal "
-                    "Windows user host, not the MCP sandbox."
+                    f"CODEX_HOME {self.config.expected_codex_home!r}; use a supported executor "
+                    "with permission to initialize this independent home."
                 ) from exc
             raise NativeTaskError(
                 f"Codex {self.cli_version} at {self.cli_command!r} failed App Server initialization: {detail}"
@@ -936,6 +1097,9 @@ class AppServerClient:
             raise NativeTaskError("Codex app-server is not running")
         encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
         with self._write_lock:
+            dispatch_gate = getattr(self, "before_turn_dispatch", None)
+            if value.get("method") == "turn/start" and callable(dispatch_gate):
+                dispatch_gate(value.get("params") or {})
             self.process.stdin.write(encoded + "\n")
             self.process.stdin.flush()
 
@@ -1000,6 +1164,7 @@ class AppServerClient:
         return [item for item in models if isinstance(item, dict)]
 
     def select_model(self, requested: str | None = None) -> str:
+        requested = requested or getattr(self.config, "default_model", None)
         if requested:
             # Explicit IDs belong to the selected upstream; CLI discovery can
             # be stale or unavailable. Retain initialization, never substitute.
@@ -1084,7 +1249,12 @@ class AppServerClient:
         """Reattach one durable thread in this App Server before starting its turn."""
         self.start()
         _report_phase(on_phase, "thread_resuming", thread_id=thread_id)
-        self.request("thread/resume", {"threadId": thread_id})
+        params = {"threadId": thread_id, **self._runtime_thread_params(model)}
+        self.runtime_context = {}
+        resumed = self.request("thread/resume", params)
+        self._verify_runtime_context(
+            resumed, operation="thread/resume", thread_id=thread_id, model=model,
+        )
         _report_phase(on_phase, "thread_resumed", thread_id=thread_id)
         return self.start_turn_async(
             thread_id,
@@ -1112,12 +1282,21 @@ class AppServerClient:
         _report_phase(on_phase, "app_server_initialized")
         try:
             _report_phase(on_phase, "thread_starting")
-            started = self.request("thread/start", {"cwd": project_path, "ephemeral": False})
+            params = {"cwd": project_path, "ephemeral": False,
+                      **self._runtime_thread_params(request.get("model"))}
+            if getattr(getattr(self, "config", None), "runtime_environments", None) is not None:
+                params["environments"] = []
+            self.runtime_context = {}
+            started = self.request("thread/start", params)
             thread = started.get("thread")
             thread_id = str(thread.get("id") or "") if isinstance(thread, dict) else ""
             if not thread_id:
                 raise NativeTaskCreationError("thread/start response is missing thread.id")
             _report_phase(on_phase, "thread_started", thread_id=thread_id)
+            self._verify_runtime_context(
+                started, operation="thread/start", thread_id=thread_id,
+                model=request.get("model"),
+            )
             _report_phase(on_phase, "model_selecting", thread_id=thread_id)
             selected_model = self.select_model(request.get("model"))
             _report_phase(on_phase, "model_selected", thread_id=thread_id, model=selected_model)
@@ -1164,7 +1343,7 @@ class AppServerClient:
             )
             raise NativeTaskCreationError(
                 f"native task turn ended with status {turn_status!r}: {detail}",
-                thread_id=thread_id,
+                thread_id=thread_id, turn_id=turn_id, terminal_status=turn_status,
             )
         final_message = self.wait_for_turn_readback(thread_id, turn_id)
         return {**started, "turn_status": turn_status, "final_message": final_message}
@@ -1177,7 +1356,23 @@ class AppServerClient:
         client_user_message_id: str,
         selected_model: str,
         selected_effort: str | None = None,
+        output_schema: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
+        config = getattr(self, "config", None)
+        selected_effort = selected_effort or getattr(config, "default_reasoning_effort", None)
+        constrained = getattr(config, "runtime_constraints", None) is not None
+        no_environments = getattr(config, "runtime_environments", None) is not None
+        if constrained or no_environments:
+            context = getattr(self, "runtime_context", {})
+            if ((constrained and context.get("constraints_verified") is not True)
+                    or (no_environments and (context.get("environments_verified") is not True
+                        or context.get("environments") != []))
+                    or context.get("thread_id") != thread_id
+                    or context.get("model") != selected_model):
+                raise NativeTaskCreationError(
+                    "turn/start requires matching verified runtime context",
+                    thread_id=thread_id,
+                )
         turn_params: dict[str, Any] = {
             "threadId": thread_id,
             "clientUserMessageId": client_user_message_id,
@@ -1186,6 +1381,10 @@ class AppServerClient:
         }
         if selected_effort is not None:
             turn_params["effort"] = selected_effort
+        if no_environments:
+            turn_params["environments"] = []
+        if output_schema is not None:
+            turn_params["outputSchema"] = dict(output_schema)
         turn_started = self.request(
             "turn/start",
             turn_params,
@@ -1277,7 +1476,9 @@ class AppServerClient:
                 ),
             ):
                 selected_model = self.select_model(model or request.get("model"))
-                self.request("thread/resume", {"threadId": thread_id})
+                self.runtime_context = {}
+                resumed = self.request("thread/resume", {"threadId": thread_id, **self._runtime_thread_params(selected_model)})
+                self._verify_runtime_context(resumed, operation="thread/resume", thread_id=thread_id, model=selected_model)
                 return self._start_turn_with_model(
                     thread_id,
                     append_lane_binding(request["prompt"], request.get("input_binding")),
@@ -1345,7 +1546,10 @@ class AppServerClient:
     def close(self) -> None:
         process = self.process
         self.process = None
+        lock_fd = getattr(self, "_instance_lock_fd", None)
+        self._instance_lock_fd = None
         if not process:
+            release_instance_lock(lock_fd)
             return
         try:
             if process.stdin:
@@ -1357,6 +1561,9 @@ class AppServerClient:
                 process.wait(timeout=3)
             except subprocess.TimeoutExpired:
                 process.kill()
+                process.wait(timeout=3)
+        finally:
+            release_instance_lock(lock_fd)
 
     def __enter__(self) -> "AppServerClient":
         self.start()

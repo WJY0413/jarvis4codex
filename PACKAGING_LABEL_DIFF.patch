@@ -1,0 +1,20 @@
+--- a/packages/jarvis_control/contact_task.py
++++ b/packages/jarvis_control/contact_task.py
+@@ -30 +30 @@
+-BUILD = "Jarvis dot 0.2.5+dot.4"
++BUILD = "Jarvis dot 0.2.5+dot.5-candidate"
+--- a/packages/jarvis_control/file_task.py
++++ b/packages/jarvis_control/file_task.py
+@@ -28 +28 @@
+-BUILD = "Jarvis dot 0.2.5+dot.4"
++BUILD = "Jarvis dot 0.2.5+dot.5-candidate"
+--- a/packages/jarvis_control/operations.py
++++ b/packages/jarvis_control/operations.py
+@@ -20 +20 @@
+-BUILD = "Jarvis dot 0.2.5+dot.4"
++BUILD = "Jarvis dot 0.2.5+dot.5-candidate"
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -7 +7 @@
+-version = "0.2.5+dot.4"
++version = "0.2.5+dot.5"

@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from jarvis_runtime.coo_dispatcher_store import ProcessLock
+from jarvis_runtime.cancellation import cancel_management, cancellation_path, require_dispatch_open, report_guard, dispatch_roots
 
 from jarvis_control.provisioning import (
     TaskMonitorResumeRequest,
@@ -31,6 +32,7 @@ class CodexAppServerTaskProvisioningAdapter:
     """Queue one task; the MCP process never starts or owns an App Server."""
 
     name = "codex-app-server-provisioning"
+    management_cancellation_version = "jarvis-management-cancellation/v1"
     _HOST_HEALTH_MAX_AGE = timedelta(seconds=30)
 
     def __init__(
@@ -56,33 +58,35 @@ class CodexAppServerTaskProvisioningAdapter:
             project, project_path = config.resolve_project(request.project)
             hold_id = request.hold_id or f"hold-{request.request_id}"
             paths = self._paths(hold_id)
-            _write_json(paths["request"], {
-                "mode": "create",
-                "request_id": request.request_id,
-                "source_ref": request.source_ref,
-                "hold_id": hold_id,
-                "project": project,
-                "project_path": str(project_path),
-                "title": request.title,
-                "prompt": request.prompt,
-                "model": request.model,
-                "reasoning_effort": request.reasoning_effort,
-                "max_turns": request.max_turns,
-                "auto_continue": request.auto_continue,
-                "continue_prompt": request.continue_prompt,
-                "notifications": dict(request.notifications or {}),
-                "input_binding": dict(request.input_binding or {}),
-                "turn_history_path": str(self._state_dir / "turn-history.sqlite"),
-                "initial_turn_count": 1,
-                "initial_total_turn_count": 1,
-            })
-            _write_json(paths["ack"], _accepted_ack(
-                request_id=request.request_id,
-                hold_id=hold_id,
-                turn_count=1,
-                total_turn_count=1,
-                max_turns=request.max_turns,
-            ))
+            with report_guard(paths["request"].parent / ".dispatch-gate"):
+                require_dispatch_open(paths["request"].parent)
+                _write_json(paths["request"], {
+                    "mode": "create",
+                    "request_id": request.request_id,
+                    "source_ref": request.source_ref,
+                    "hold_id": hold_id,
+                    "project": project,
+                    "project_path": str(project_path),
+                    "title": request.title,
+                    "prompt": request.prompt,
+                    "model": request.model,
+                    "reasoning_effort": request.reasoning_effort,
+                    "max_turns": request.max_turns,
+                    "auto_continue": request.auto_continue,
+                    "continue_prompt": request.continue_prompt,
+                    "notifications": dict(request.notifications or {}),
+                    "input_binding": dict(request.input_binding or {}),
+                    "turn_history_path": str(self._state_dir / "turn-history.sqlite"),
+                    "initial_turn_count": 1,
+                    "initial_total_turn_count": 1,
+                })
+                _write_json(paths["ack"], _accepted_ack(
+                    request_id=request.request_id,
+                    hold_id=hold_id,
+                    turn_count=1,
+                    total_turn_count=1,
+                    max_turns=request.max_turns,
+                ))
         except Exception as exc:
             return TaskProvisionReceipt(
                 request_id=request.request_id,
@@ -102,6 +106,23 @@ class CodexAppServerTaskProvisioningAdapter:
             max_turns=request.max_turns,
             phase="queued_for_user_host",
         )
+
+    def creation_enabled(self) -> bool:
+        return self._config_loader(self._config_path).live_creation_enabled is True
+
+    def contract_snapshot(self) -> dict[str, Any]:
+        config = self._config_loader(self._config_path)
+        projects = {name: config.resolve_project(name)[1] for name in config.allowed_projects}
+        from jarvis_runtime.linux_cloud import child_environment
+        if getattr(config, "linux_cloud", False):
+            child_environment(config)  # Validate supported isolated routing; do not output values.
+        return {"projects": sorted(projects), "projects_exist": all(path.is_dir() for path in projects.values()),
+                "configuration_valid": True, "live_creation_enabled": config.live_creation_enabled,
+                "codex_home_resolution": {"input": config.expected_codex_home_input,
+                    "base_dir": config.expected_codex_home_base_dir, "resolved": config.expected_codex_home},
+                "profile_is_label_only": config.profile_is_label_only, "worker_capacity": config.worker_capacity,
+                "runtime_constraints": config.runtime_constraints, "runtime_environments": config.runtime_environments,
+                "linux_cloud": config.linux_cloud, "model_policy": {"model": config.default_model, "reasoning_effort": config.default_reasoning_effort, "source": "frozen deployment; no TEST caller override"}}
 
     def preflight_projects(self) -> list[str]:
         """Return configured public project identifiers without writing a task request."""
@@ -197,14 +218,17 @@ class CodexAppServerTaskProvisioningAdapter:
             return {"status": "host_not_ready", "reason": "HoldHost profile does not match"}
         codex_home = str(getattr(config, "expected_codex_home", "") or "").strip()
         if not codex_home or not _same_path(health.get("codex_home"), codex_home):
-            return {"status": "host_not_ready", "reason": "HoldHost CODEX_HOME does not match"}
+            return {"status": "host_not_ready", "reason": "HoldHost CODEX_HOME does not match",
+                    "expected_codex_home": codex_home, "observed_codex_home": health.get("codex_home"),
+                    "resolution": health.get("codex_home_resolution")}
         if not _same_path(health.get("state_dir"), self._state_dir):
             return {"status": "host_not_ready", "reason": "HoldHost state_dir does not match"}
         return {"status": "ready"}
 
     def ensure_hold_host_ready(self, *, required_workers: int) -> dict[str, str]:
         """Reuse a live matching Host or start one before a Loop provisions work."""
-        required_workers = max(int(required_workers), 1)
+        config = self._config_loader(self._config_path)
+        required_workers = max(int(required_workers), getattr(config, "worker_capacity", 1), 1)
         health = self.hold_host_health(required_workers=required_workers)
         if health.get("status") == "ready":
             return {"status": "ready", "phase": "already_running"}
@@ -228,6 +252,19 @@ class CodexAppServerTaskProvisioningAdapter:
             input_binding = dict(request.input_binding or {})
             config = self._config_loader(self._config_path)
             hold_id = request.hold_id or request.monitor_id or f"hold-{request.request_id}"
+            dispatch_ancestors = set()
+            for parent_name in ("task-holds", "task-monitors"):
+                parent = self._state_dir / parent_name
+                if parent.is_dir():
+                    for root in parent.iterdir():
+                        if not root.is_dir(): continue
+                        old_request = _read_json_file(root / "request.json") or {}
+                        old_ack = _read_json_file(root / "ack.json") or {}
+                        old_result = _read_json_file(root / "result.json") or {}
+                        if request.task_id in {old_request.get("thread_id"), old_ack.get("thread_id"), old_result.get("thread_id")}:
+                            require_dispatch_open(root, old_request)
+                            for ancestor in dispatch_roots(root, old_request):
+                                dispatch_ancestors.add(ancestor.relative_to(self._state_dir).as_posix())
             if request.hold_id or request.monitor_id:
                 previous = self.hold_status(hold_id)
                 if str(previous.get("status") or "") in {"accepted", "holding", "running"}:
@@ -260,32 +297,35 @@ class CodexAppServerTaskProvisioningAdapter:
                 initial_turn_count = 1
                 initial_total_turn_count = 1
             paths = self._paths(hold_id)
-            _archive_terminal_result(paths["result"])
-            _write_json(paths["request"], {
-                "mode": "resume",
-                "request_id": request.request_id,
-                "source_ref": request.source_ref,
-                "hold_id": hold_id,
-                "thread_id": request.task_id,
-                "prompt": request.prompt,
-                "model": request.model,
-                "reasoning_effort": request.reasoning_effort,
-                "max_turns": max_turns,
-                "auto_continue": request.auto_continue,
-                "continue_prompt": request.continue_prompt,
-                "notifications": dict(request.notifications or {}),
-                "input_binding": input_binding,
-                "turn_history_path": str(self._state_dir / "turn-history.sqlite"),
-                "initial_turn_count": initial_turn_count,
-                "initial_total_turn_count": initial_total_turn_count,
-            })
-            _write_json(paths["ack"], _accepted_ack(
-                request_id=request.request_id,
-                hold_id=hold_id,
-                turn_count=initial_turn_count,
-                total_turn_count=initial_total_turn_count,
-                max_turns=max_turns,
-            ))
+            with report_guard(paths["request"].parent / ".dispatch-gate"):
+                require_dispatch_open(paths["request"].parent)
+                _archive_terminal_result(paths["result"])
+                _write_json(paths["request"], {
+                    "mode": "resume",
+                    "dispatch_ancestors": sorted(dispatch_ancestors),
+                    "request_id": request.request_id,
+                    "source_ref": request.source_ref,
+                    "hold_id": hold_id,
+                    "thread_id": request.task_id,
+                    "prompt": request.prompt,
+                    "model": request.model,
+                    "reasoning_effort": request.reasoning_effort,
+                    "max_turns": max_turns,
+                    "auto_continue": request.auto_continue,
+                    "continue_prompt": request.continue_prompt,
+                    "notifications": dict(request.notifications or {}),
+                    "input_binding": input_binding,
+                    "turn_history_path": str(self._state_dir / "turn-history.sqlite"),
+                    "initial_turn_count": initial_turn_count,
+                    "initial_total_turn_count": initial_total_turn_count,
+                })
+                _write_json(paths["ack"], _accepted_ack(
+                    request_id=request.request_id,
+                    hold_id=hold_id,
+                    turn_count=initial_turn_count,
+                    total_turn_count=initial_total_turn_count,
+                    max_turns=max_turns,
+                ))
         except Exception as exc:
             return TaskProvisionReceipt(
                 request_id=request.request_id, status="failed", observed_at=observed_now(), reason=str(exc)
@@ -356,7 +396,16 @@ class CodexAppServerTaskProvisioningAdapter:
                                 "reason": "lifecycle evidence is not bound to the current request_id"}
                         non_dispatch = (close.get("request_id") == current.get("request_id") == value.get("request_id")
                                         and close.get("non_dispatch_confirmed") is True)
-                        return {**value, **({"terminal_confirmed": True} if non_dispatch else {}), "hold_released": (
+                        cancelled = cancellation_path(root, current) is not None
+                        released = (terminal and path.name == "result.json" and (value.get("terminal_confirmed") is True or non_dispatch)
+                                    and not (root / ".user-host-claim").exists())
+                        bound_close = close if close.get("request_id") == current.get("request_id") else {}
+                        management_status = ("closed" if released else "closing" if bound_close.get("execution_state") == "running" else "closed_unconfirmed")
+                        management = {"scheduling_closed": True, "management_closed": True,
+                            "management_status": management_status, "close_report": close,
+                            "cancellation_record": str(cancellation_path(root, current)),
+                            "cancellation": _read_json_file(cancellation_path(root, current))} if cancelled else {}
+                        return {**value, **management, **({"terminal_confirmed": True} if non_dispatch else {}), "hold_released": (
                             terminal and path.name == "result.json" and (value.get("terminal_confirmed") is True or non_dispatch)
                             and not (root / ".user-host-claim").exists()
                         )}
@@ -451,85 +500,84 @@ class CodexAppServerTaskProvisioningAdapter:
         return {"status": "stop_requested", "hold_id": hold_id}
 
     def close_hold(self, hold_id: str, *, request_id: str | None = None, parent_close=None) -> dict[str, Any]:
-        """Durably request exact closure before any stop/interrupt side effect."""
+        """Cancel scheduling unconditionally; execution closure needs real owner evidence."""
         from adapters.codex_app_server.jarvis_hold_host_service import JarvisHoldHost
         paths = self._existing_paths(hold_id)
         if paths is None:
             raise RuntimeError("hold state was not found")
         root = paths["request"].parent
+        current = _read_json_file(paths["request"]) or {}
+        binding = current.get("request_id")
+        if not binding or (current.get("hold_id") or current.get("monitor_id")) != hold_id:
+            raise RuntimeError("close requires an exact durable Hold/request identity")
+        for name in ("ack", "result"):
+            saved = _read_json_file(paths[name]) or {}
+            if saved.get("request_id") and saved["request_id"] != binding:
+                raise RuntimeError(f"{name} identity conflicts; no unrelated request cancelled")
+        cancellation = cancel_management(root, scope="hold", subject_id=hold_id,
+            request_id=binding, close_request_id=request_id or f"close:{binding}",
+            original=paths["request"].read_bytes())
         close_path = root / "close.json"
-        with ProcessLock(close_path.with_suffix(".lock"), owner_alive=self._pid_alive):
-            current = _read_json_file(paths["request"]) or {}
-            if str(current.get("hold_id") or current.get("monitor_id") or "") != hold_id:
-                raise RuntimeError("close request hold identity mismatch")
-            binding = current.get("request_id")
-            if not binding:
-                raise RuntimeError("close requires durable request_id")
-            report = _read_json_file(close_path) or {}
-            if report.get("request_id") != binding:
-                prior = [*report.get("prior_attempts", []), {k: v for k, v in report.items() if k != "prior_attempts"}] if report else []
-                report = {"schema": "jarvis-close-report/v1", "hold_id": hold_id, "request_id": binding,
-                    "close_request_id": request_id or f"close:{binding}", "requested_at": observed_now().isoformat(),
-                    "report_status": "pending", "scheduling_closed": False, "execution_state": "unknown",
-                    "terminal_confirmed": False, "hold_released": False, "prior_attempts": prior}
-                _write_json(close_path, report)
-            if parent_close and report.get("parent_close") != dict(parent_close):
-                if report.get("parent_close"):
-                    raise RuntimeError("conflicting parent Loop close binding")
-                report["parent_close"] = dict(parent_close)
-                _write_json(close_path, report)
         try:
-            with ProcessLock(paths["request"].with_suffix(".lock"), owner_alive=self._pid_alive):
-                current = _read_json_file(paths["request"]) or {}
-                if current.get("request_id") != binding:
-                    raise RuntimeError("Hold binding changed after close was recorded; no stop applied")
-                saved = _read_json_file(paths["result"]) or {}
-                ack = _read_json_file(paths["ack"]) or {}
-                for name, evidence in (("result", saved), ("ack", ack)):
-                    if evidence.get("request_id") and evidence["request_id"] != binding:
-                        raise RuntimeError(f"{name} request_id conflicts with current Hold binding; no stop applied")
-                # Exact unclaimed queued work can be cancelled even without a Host.
-                if (not saved and ack.get("request_id") == binding and ack.get("status") == "accepted"
-                        and ack.get("phase") == "queued_for_user_host" and not (root / ".user-host-claim").exists()):
-                    observing = current.get("mode") == "recover" or bool(current.get("turn_id"))
-                    saved = {"request_id": binding, "hold_id": hold_id, "status": "unknown" if observing else "cancelled",
-                        "phase": "observation_stopped_before_dispatch" if observing else "stopped_before_dispatch",
-                        "terminal_confirmed": not observing,
-                        "total_turn_count": 0, "local_observer_stopped": True, "observed_at": observed_now().isoformat()}
-                    if observing:
-                        saved.update(thread_id=current.get("thread_id"), turn_id=current.get("turn_id"),
-                            reason="queued local observation stopped; existing external execution is unconfirmed")
-                    _write_json(paths["request"], {**current, "stop_requested": True})
-                    _write_json(paths["result"], saved)
-                    _write_json(paths["ack"], saved)
-                elif not saved or saved.get("terminal_confirmed") is not True:
-                    if current.get("stop_requested") is not True:
-                        _write_json(paths["request"], {**current, "stop_requested": True})
-            data = self.hold_status(hold_id)
-            action = None
-            observer_cancelled = data.get("phase") == "observation_stopped_before_dispatch" and data.get("local_observer_stopped") is True
-            if not observer_cancelled and not data.get("hold_released") and data.get("thread_id") and data.get("turn_id"):
-                host = JarvisHoldHost(state_dir=self._state_dir, launcher_config=self._config_path)
-                action = host.request_host_stop(hold_id, data["thread_id"], data["turn_id"])
-                if paths["result"].exists() and data.get("terminal_confirmed") is not True:
-                    action = host.reconcile_hold(hold_id)
-                data = self.hold_status(hold_id)
-            elif (not observer_cancelled and data.get("thread_id") and paths["result"].exists() and self._config_path.is_file()
-                    and data.get("dispatch_evidence") != "not_sent"):
-                action = JarvisHoldHost(state_dir=self._state_dir, launcher_config=self._config_path).reconcile_hold(hold_id)
-            # Missing legacy identity is diagnostic only, never terminal proof for this request.
-            evidence = data if data.get("request_id") else {"request_id": binding,
-                "status": data.get("status") if data.get("status") in {"accepted", "holding", "running"} else "unknown",
-                "reason": "legacy lifecycle evidence has no request_id; execution remains unconfirmed"}
-            report = refresh_close_report(root, evidence, action=action)
-            data = self.hold_status(hold_id)
-            status = "closed" if report.get("report_status") == "completed" else (
-                "closed_unconfirmed" if report.get("management_closed") else "closing")
-            return {**data, "status": status, "lifecycle_status": data.get("status"), "close_report": report}
+            with report_guard(root / ".close-report.guard"):
+                report = _read_json_file(close_path) or {}
+                if report and report.get("request_id") != binding:
+                    raise RuntimeError("existing close report names another request")
+                report.setdefault("schema", "jarvis-close-report/v1")
+                report.update(hold_id=hold_id, request_id=binding,
+                    close_request_id=cancellation["close_request_id"], requested_at=cancellation["requested_at"],
+                    scheduling_closed=True, management_closed=True, cancellation=cancellation)
+                if parent_close:
+                    if report.get("parent_close") not in (None, dict(parent_close)):
+                        raise RuntimeError("conflicting parent Loop close binding")
+                    report["parent_close"] = dict(parent_close)
+                _write_json(close_path, report)
         except Exception as exc:
-            # First write has already succeeded; keep an actionable failure report.
-            refresh_close_report(root, {"request_id": binding, "status": "failed"}, failure=str(exc))
-            raise
+            # Cancellation is already durable even when a report writer is unavailable.
+            return {"status": "closed_unconfirmed", "hold_id": hold_id, "request_id": binding,
+                "scheduling_closed": True, "management_closed": True,
+                "terminal_confirmed": False, "hold_released": False,
+                "close_report": {"report_status": "unresolved", "execution_state": "unknown",
+                    "scheduling_closed": True, "management_closed": True,
+                    "terminal_confirmed": False, "hold_released": False,
+                    "external_execution_unresolved": True,
+                    "cancellation": cancellation, "report_error": str(exc)}}
+        delivery_error = None
+        try:
+            # Compatibility delivery only. Never reap a PID-based stale lock.
+            with ProcessLock(paths["request"].with_suffix(".lock"), timeout_seconds=0.1, owner_alive=lambda pid: True):
+                latest = _read_json_file(paths["request"]) or {}
+                if latest.get("request_id") != binding:
+                    raise RuntimeError("request changed after cancellation; dispatch remains blocked")
+                if latest.get("stop_requested") is not True:
+                    _write_json(paths["request"], {**latest, "stop_requested": True})
+        except Exception as exc:
+            delivery_error = str(exc)
+        try:
+            data = self.hold_status(hold_id)
+        except Exception as exc:
+            data = {"request_id": binding, "hold_id": hold_id, "status": "unknown", "reason": str(exc)}
+        action = {"status": "not_sent", "reason": "no exact current owner identity"}
+        if data.get("thread_id") and data.get("turn_id") and not data.get("hold_released"):
+            try:
+                action = JarvisHoldHost(state_dir=self._state_dir, launcher_config=self._config_path).request_host_stop(
+                    hold_id, data["thread_id"], data["turn_id"])
+            except Exception as exc:
+                action = {"status": "unconfirmed", "reason": str(exc)}
+        if delivery_error:
+            action = {**action, "legacy_stop_delivery_error": delivery_error}
+        try:
+            report = refresh_close_report(root, data, action=action)
+        except Exception as exc:
+            report = {"report_status": "unresolved", "management_closed": True,
+                "scheduling_closed": True, "execution_state": "unknown",
+                "terminal_confirmed": False, "hold_released": False,
+                "cancellation": cancellation, "report_error": str(exc)}
+        outcome = ("closed" if report.get("report_status") == "completed" else
+                   "closing" if report.get("execution_state") == "running" else "closed_unconfirmed")
+        return {**data, "status": outcome, "management_status": outcome,
+            "lifecycle_status": data.get("status"), "scheduling_closed": True,
+            "management_closed": True, "close_report": report}
 
     def read_turn_history(
         self, *, task_id: str | None = None, hold_id: str | None = None,
@@ -804,7 +852,7 @@ def refresh_close_report(root: Path, evidence: dict[str, Any], *, action=None, f
     path = root / "close.json"
     if not path.exists():
         return {}
-    with ProcessLock(path.with_suffix(".lock"), owner_alive=_pid_is_alive):
+    with report_guard(root / ".close-report.guard"):
         report = _read_json_file(path) or {}
         request = _read_json_file(root / "request.json") or {}
         if report.get("request_id") != request.get("request_id") or evidence.get("request_id") != request.get("request_id"):
@@ -819,13 +867,15 @@ def refresh_close_report(root: Path, evidence: dict[str, Any], *, action=None, f
         completed = terminal and released
         stopped = evidence.get("local_observer_stopped") is True and (
             no_claim or evidence.get("holder_exit_confirmed") is True)
-        unknown = not terminal and evidence.get("status") in {"failed", "unknown", "interrupted"}
-        fields = {"scheduling_closed": request.get("stop_requested") is True or completed,
+        cancelled = cancellation_path(root, request) is not None
+        owned_stop_pending = isinstance(action, dict) and action.get("status") == "stop_requested"
+        unknown = not terminal and not owned_stop_pending and (cancelled or evidence.get("status") in {"failed", "unknown", "interrupted"})
+        fields = {"scheduling_closed": cancelled or request.get("stop_requested") is True or completed,
             "lifecycle_status": evidence.get("lifecycle_status") or evidence.get("status"),
             "execution_state": "not_started" if not_sent else "terminal" if terminal else "unknown" if unknown else "running",
             "terminal_confirmed": terminal, "hold_released": released,
-            "management_closed": completed or stopped,
-            "external_execution_unresolved": not terminal and stopped,
+            "management_closed": cancelled or completed or stopped,
+            "external_execution_unresolved": not terminal and (cancelled or stopped),
             "report_status": "failed" if failure else "completed" if completed else "unresolved" if unknown or terminal else "pending",
             "thread_id": evidence.get("thread_id"), "turn_id": evidence.get("turn_id"),
             "reason": failure or evidence.get("reason")}

@@ -1808,6 +1808,9 @@ class WakeController:
                 "started_at": started_at,
                 "thread_status": "unknown",
                 "error": str(exc),
+                "thread_id": getattr(exc, "thread_id", None),
+                "turn_id": getattr(exc, "turn_id", None),
+                "turn_status": getattr(exc, "terminal_status", None),
                 **desktop,
             }
 
@@ -2061,12 +2064,16 @@ class StandardBridgeHeartbeatTransport:
             reasoning_effort=request.reasoning_effort,
             client_user_message_id=request.request_id,
         )
-        if result.get("outcome") != "turn_completed":
-            raise HeartbeatError(f"standard Bridge resume failed: {result.get('outcome')}")
+        turn_id = str(result.get("turn_id") or "")
+        terminal_status = str(result.get("turn_status") or "")
+        if result.get("outcome") != "turn_completed" and not (
+                result.get("thread_id") == request.thread_id and turn_id
+                and terminal_status in {"failed", "error", "interrupted", "cancelled", "canceled"}):
+            raise HeartbeatError(f"standard Bridge resume outcome requires readback: {result.get('outcome')}: {result.get('error')}")
         return self.bridge.StartedTurn(
             thread_id=request.thread_id,
-            turn_id=str(result.get("turn_id") or ""),
-            status="completed",
+            turn_id=turn_id,
+            status=terminal_status or "completed",
         )
 
 

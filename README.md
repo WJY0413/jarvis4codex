@@ -1,114 +1,45 @@
-# Jarvis Control Plane 0.2.5
+# Jarvis dot 0.2.5+dot.5 — source release candidate
 
-Jarvis provides durable task holding, bounded loops, monitoring and local heartbeat scheduling through MCP. The Codex App Server adapter owns native turns; Monitor decides whether a completed turn may continue, and Hold executes only the command bound to that Hold and turn.
+Jarvis dot is a Linux cloud adaptation of the Jarvis 0.2.5 control plane. It shares the existing core and is currently Linux-only. It is not an upstream OpenAI release. Windows users must continue using the original main/v0.2.5 distribution, not install this dot variant. The intended publishing target is a dedicated dot branch of [WJY0413/jarvis4codex](https://github.com/WJY0413/jarvis4codex), without rewriting the original main branch or its history.
 
-The public MCP tools are `jarvis_create`, `jarvis_hold`, `jarvis_close`, `jarvis_loop`, `jarvis_read`, `jarvis_resume`, `jarvis_monitor`, `jarvis_heartbeat`, `jarvis_update` and `jarvis_notify`. Harness-specific operations remain in adapters behind the control-plane contracts.
+## Observed capability
 
-## New in 0.2.5
+This exact candidate code completed one fresh, unchanged original Jarvistest P0–P7 run on 2026-10-01. P0–P4 and P6 completed; P5 read back the same active action as `interrupted`; P7 recovered a genuine persisted starting intent to the required `requires_readback` state without a replacement. All actions and readbacks used the public Jarvis API. There were 12 native model turns: 11 completed and one interrupted. See [VALIDATION.md](VALIDATION.md).
 
-- Opt-in loopback Streamable HTTP lets multiple MCP clients share one explicitly started server process. The default remains stdio; installation does not switch registrations or start a second instance.
-- Explicit model IDs pass through to the upstream task request without a model-list allowlist. An explicit `jarvis_connection.model_connections` mapping can route any non-empty ID to its named local connection. Gateway health catalogs do not certify or restrict model availability; real upstream errors remain authoritative. Unmapped models retain existing native/default routing, not an arbitrary private endpoint.
-- `jarvis_close` durably records closure requests and outcomes for one Hold or Loop. It stops further scheduling and can interrupt the precisely owned current turn. `closed` requires terminal and release evidence; `closed_unconfirmed` means local management stopped but external execution is still unknown and capacity is not claimed as released. Live local owners remain `closing`. Identity conflicts and failed durable writes return errors, never synthetic success.
-- Loop closure survives stale state saves and reports child closure automatically. Recovery never starts an unavailable gateway; no shared Host or unrelated writer is killed to force closure.
+The new close implementation durably cancels future management and requests interruption only through a proven exact owner. Actual execution and resource release remain separate: an unknown owner can remain `closed_unconfirmed`. Closing never creates replacement work. See [CLOSE-CANCELLATION.md](CLOSE-CANCELLATION.md).
 
-## Existing capabilities
+The earlier dot.4 functional lineage separately processed 100 historical company-research assignments across ten fixed threads. It yielded 83 real receiver seals and independent structural accepts, 16 receiver rejections and one no-submission source-error outcome. Those business executions were not run on dot.5; source review identified material quality issues, so they are not a send-ready prospect list. The historical original suite's P5 limitation is preserved separately from this new run.
 
-- Durable Hold ownership and exact host-aware recovery. Explicit `--workers` capacity is preserved (for example, 20); an active Host is not restarted to resize it.
-- Optional `turns_per_thread` bounds each thread within a Loop. Set it to 5 for five-turn rotation; continuation preserves logical task identity and remaining lane work.
-- Reviewable business results remain distinct from explicit runtime safety stops; unknown owner termination stays fail-closed.
-- Finite lanes with arbitrary positive batch sizes, exact candidate binding, last-batch handling, per-item saved output/receipt verification and optional Draft 2020-12 output schemas. Open-ended work can omit lanes.
-- Native observer reads distinguish raw observer status from execution evidence: `read_source`, `execution_source` and `execution_status`. An interrupted observer is not proof that the owning Hold stopped; missing authoritative evidence remains unknown.
-- Local heartbeat scheduling, terminal reconciliation and optional outbox notifications. Delivery is successful only with its delivery receipt; enqueueing is not delivery.
-- Programmatic `jarvis_update` checks or activates automatic selection of the newest validated local Codex Desktop runtime without polling, downloading, or restarting Codex Desktop.
+## Components
 
-Result verification supports saved JSON files and receipts, plus the explicitly selected `final_answer_json` intake mode. Runtime completion and technical output verification do not imply business-quality acceptance.
+- Existing Jarvis MCP control plane: create, Hold, bounded Loop, readback, continuation, callbacks, relay, delivery and conservative recovery
+- Linux bootstrap: independent officially authenticated CODEX_HOME, clean process environment, config-relative paths and actual model/provider/policy readback
+- `jarvis_control.contact_task`: one assigned company per invocation, stable typed form, real receiver result and exact native-turn evidence
+- `jarvis_control.contact_campaign`: a specialized, independent 10×10 secondary-research allocation and work-item issuer; no production queue claims
+- `jarvis_schema`: a thin versioned schema adapter (`1.0.0-contact-v25`), preserving the original V2.5 form and receiver contract
+- `jarvis_control.file_task`: fixed caller-authorized file inputs/outputs through separate official file-service RPCs; not native model filesystem tools
 
-## Install the Python package
+## Install and configure
 
-Requires Python 3.11 or newer. Native task operations additionally require a compatible Codex CLI/App Server, a configured local account/profile, and explicitly allowed project paths. Windows is the primary tested host environment.
+Use Python 3.11+ in an isolated virtual environment and an already-authorized official Codex CLI/App Server. The observed runtime was Codex `0.159.0-alpha.7`; experimental fields must be revalidated after a runtime upgrade.
 
-From an extracted release or checkout:
-
-```powershell
+```sh
 python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install .
+.venv/bin/python -m pip install .
 ```
 
-The package declares its MCP and JSON Schema dependencies in `pyproject.toml`. On other platforms, use the equivalent virtual-environment Python path. Installation alone does not register MCP, start background services, migrate existing runtime state or configure notification delivery.
+Do not install or run this dot variant on Windows. A Windows Python 3.14 import check failed because the Linux TEST inbox receiver uses `os.O_DIRECTORY` at module import; zero Windows tests executed. Use the original main/v0.2.5 distribution on Windows. Installing the package does not log in, copy credentials, register an MCP service or start any model work.
 
-## Configure an isolated instance
+Read [JARVIS_DOT.md](JARVIS_DOT.md), [CONTACT_TASK.md](CONTACT_TASK.md) and [JARVIS_CONTROLLER.md](JARVIS_CONTROLLER.md). Shipped examples keep `live_creation_enabled=false`. Review the project allowlist and independent home before enabling a specific deployment. `profile` is only a label, not a native Codex profile selector.
 
-Keep credentials and runtime state outside source control. These are configuration **examples**; replace every example path/profile/project before running a native task. Use a new local configuration directory and a dedicated state directory.
+## Safety and limitations
 
-Create `launcher.json` in that configuration directory:
+- Model processes use the supported `CODEX_EXEC_SERVER_URL=none` capability restriction and verify empty environments, read-only sandbox and approval `never`
+- Existing proxy/CA settings are preserved, while unrelated platform authentication and routing variables are excluded
+- No protected host directory, sandbox policy or credential is modified
+- Native model shell/file tools remain unavailable in this mode; controller-side fixed file/form operations do not restore those tools
+- Unknown dispatch, receiver-write, authentication, permission or quota outcomes pause for reconciliation; they do not authorize replacement work
+- Keep the owning process alive until native terminal evidence is recorded. Premature owner exit may leave external execution unconfirmed; durable cancellation does not prove exit or release capacity
+- Release examples include no account, recipient, customer, database or runtime configuration
 
-```json
-{
-  "version": 1,
-  "dispatcher_thread_id": "configure-your-controller-task",
-  "codex_cli": "auto",
-  "profile": "your-configured-profile",
-  "expected_codex_home": "C:/example/codex-home",
-  "live_creation_enabled": false,
-  "allowed_projects": {"ExampleProject": "C:/example/project"}
-}
-```
-
-Leave creation disabled until the instance's project allowlist and account/profile have been reviewed. Create `transport.json` beside it:
-
-```json
-{
-  "db_path": "../state/bridge-heartbeats.sqlite",
-  "health_path": "../state/bridge-health.json",
-  "lock_path": "../state/bridge.lock",
-  "native_task_launcher_config": "launcher.json",
-  "heartbeat_contracts_dir": "../state/heartbeat-contracts",
-  "desktop_recovery_enabled": false,
-  "standard_bridge_package_root": "C:/example/jarvis-control-plane/packages"
-}
-```
-
-`standard_bridge_package_root` must be an absolute path to the release's `packages` directory (or the installed directory containing `jarvis_codex_bridge`). Copy `templates/local-heartbeat.config.example.json` into the same configuration directory as `local-heartbeat.json`; its relative state paths resolve from the configuration location.
-
-Register this command and arguments with your MCP client, using absolute paths for that client:
-
-```text
-<venv-python> -m jarvis_mcp.entrypoint --config <config-dir>/transport.json --launcher-config <config-dir>/launcher.json --state-dir <state-dir> --local-heartbeat-config <config-dir>/local-heartbeat.json
-```
-
-This starts the default stdio transport for that client. To explicitly share one server, run that same command once with `--transport streamable-http --port <chosen-port>` and register `http://127.0.0.1:<chosen-port>/mcp` in each intended MCP client instead of per-client commands. The HTTP listener is loopback-only; all ten tools use the same serialization lock. It is not a remote authenticated service. Use different ports, configurations and state directories for independent instances. Starting or upgrading one instance does not automatically start or upgrade another.
-
-For long-running local scheduling, the existing host module uses the same configuration:
-
-```text
-<venv-python> -m adapters.codex_app_server.jarvis_local_heartbeat_host --config <config-dir>/transport.json --launcher-config <config-dir>/launcher.json --state-dir <state-dir> --local-heartbeat-config <config-dir>/local-heartbeat.json run-forever
-```
-
-To persist an explicit capacity, keep the same worker argument in the instance startup entry:
-
-```text
-<venv-python> -m adapters.codex_app_server.jarvis_hold_host_service --state-dir <state-dir> --launcher-config <config-dir>/launcher.json --workers 20
-```
-
-Use the same source snapshot, configuration and state directory for MCP and both hosts. The host health receipt exposes actual `worker_capacity`; a saved startup argument alone does not prove the running capacity.
-
-Loop startup initializes or checks the normal-user Hold host. Run the instance under the account whose Codex profile and state it uses. Stop and drain existing work before changing a running instance's source snapshot. Refresh persistent MCP connections after an upgrade; new files do not replace code already loaded in an old client.
-
-## Notifications
-
-Omit `--notification-config` to leave the notification adapter unconfigured. `templates/feishu-notification.config.example.json` intentionally has an empty recipient and cannot load as an active sender. To enable it, explicitly configure your own recipient, Python executable and compatible dispatcher/outbox delivery service, then pass the filled configuration. No credentials, recipient IDs or running delivery bridge are distributed with this release. Leave notification requests disabled for isolated tests.
-
-## Validate source changes
-
-Use the existing contract and runtime test modules; no live Codex task or production database is required:
-
-```powershell
-$env:PYTHONPATH = 'packages;packages/jarvis_runtime'
-.\.venv\Scripts\python.exe -m unittest tests.adapter_contract.test_hold_host_recovery tests.adapter_contract.test_task_provisioning_adapter tests.contract.test_codex_bridge tests.contract.test_jarvis_loop tests.contract.test_jarvis_mcp tests.jarvis_runtime.test_jarvis_heartbeat_service tests.jarvis_runtime.test_jarvis_task_hold_host tests.monitor.test_hold_turn_monitor
-```
-
-## Release provenance
-
-This release integrates the accepted shared MCP transport, explicit-model routing and durable closure changes on the previous public release. Private local development ancestry, installation receipts and business-task records are not imported.
-
-The new release content and assets are sanitized. Existing public repository history is retained; this release does not rewrite or purge that history. See `updates/current/NEXT_VERSION_CHANGELOG.md` for release notes.
+This is a sanitized **source candidate**, not a published or installed release. Packaged Python modules are byte-identical to the frozen code used by the new original suite. Apply it as an allowlisted overlay on a dedicated branch; retain the upstream license, tests and history. See [PACKAGING.md](PACKAGING.md) for rollback and exclusions.

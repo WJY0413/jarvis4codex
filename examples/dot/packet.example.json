@@ -1,0 +1,47 @@
+{
+  "schema": "jarvis-linux-file-task/v1",
+  "task_id": "jarvis-dot-example",
+  "launcher_config": "launcher.example.json",
+  "workspace": "workspace",
+  "input_path": "input.json",
+  "input_sha256": "42f3effd805a4e57a1dbd5fcfc89dbaa5c44e345702555a596eb0c3a67652f31",
+  "output_paths": [
+    "outputs/v01/result.json",
+    "outputs/v02/result.json"
+  ],
+  "instructions": [
+    "Copy marker exactly. Uppercase words in order, sum all row values, and return scaled_values containing each value times 2.",
+    "Continue this exact conversation. Recompute from inline input: copy marker, uppercase words, sum all values, and return scaled_values containing each value times 3."
+  ],
+  "output_schema": {
+    "type": "object",
+    "properties": {
+      "marker": {
+        "type": "string"
+      },
+      "upper_words": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "sum": {
+        "type": "integer"
+      },
+      "scaled_values": {
+        "type": "array",
+        "items": {
+          "type": "integer"
+        }
+      }
+    },
+    "required": [
+      "marker",
+      "upper_words",
+      "sum",
+      "scaled_values"
+    ],
+    "additionalProperties": false
+  },
+  "max_bytes": 4096
+}

@@ -12,6 +12,7 @@ import json
 import os
 import time
 import uuid
+from urllib.parse import unquote
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -21,6 +22,7 @@ from jarvis_runtime.jarvis_native_task_launcher import AppServerClient, NativeTa
 from adapters.codex_app_server.jarvis_connection import route_for_model
 from adapters.codex_app_server.task_provisioning_adapter import append_terminal_turn_history, read_turn_history, verify_candidate_output, receive_candidate_final_answer, _pid_is_alive
 from jarvis_runtime.coo_dispatcher_store import ProcessLock
+from jarvis_runtime.cancellation import cancellation_path, commit_dispatch, DispatchCancelledBeforeSend
 from jarvis_control.provisioning import lane_batch_ids, lane_batch_size, final_answer_mode
 
 
@@ -142,7 +144,7 @@ def _turn_input_binding(request: dict[str, Any], total_turn_count: int) -> dict[
 def _task_id(request: dict[str, Any], hold_id: str) -> str:
     source = request.get("source_ref") or ""
     if source.startswith("jarvis_loop_task:"):
-        return source.removeprefix("jarvis_loop_task:")
+        return unquote(source.removeprefix("jarvis_loop_task:"))
     return hold_id.rsplit(":", 1)[0] if hold_id.startswith("loop-") and ":" in hold_id else hold_id
 
 
@@ -182,6 +184,16 @@ def hold_task(
     host_stop_selected = False
     dispatch_evidence = "unknown" if request.get("mode") == "recover" else "not_sent"
 
+    def runtime_fields() -> dict[str, Any]:
+        # Legacy/mocked clients need not implement this optional contract.
+        context = getattr(client, "runtime_context", None)
+        if not isinstance(context, dict) or not context:
+            return {}
+        allowed = {"model", "modelProvider", "sandbox", "approvalPolicy",
+                   "operation", "thread_id", "constraints_verified",
+                   "environments", "environments_verified", "reasoningEffort", "codex_home", "codex_home_verified"}
+        return {"runtime_context": {key: value for key, value in context.items() if key in allowed}}
+
     def control_poll() -> None:
         nonlocal interrupt_at, host_stop_selected
         try:
@@ -189,6 +201,10 @@ def hold_task(
         except PermissionError:
             return  # Retry observation on the next bounded poll; do not stop healthy work.
         control = current.get("host_stop")
+        if cancellation_path(request_path.parent, current) and control is None:
+            # This holder owns this client and these exact runtime IDs. No OS PID lookup.
+            control = {"request_id": request_id, "hold_id": hold_id,
+                       "thread_id": thread_id, "turn_id": turn_id}
         if control is None:
             if not (current.get("mode") == "recover" and current.get("stop_requested") is True):
                 return  # Preserve the ordinary stop-after-current-turn contract.
@@ -222,7 +238,8 @@ def hold_task(
             raise RuntimeError("Hold request changed while a turn was owned")
         close_path = request_path.with_name("close.json")
         close = _read_json(close_path) if close_path.exists() else {}
-        return current.get("stop_requested") is True or close.get("request_id") == request_id
+        return (cancellation_path(request_path.parent, current) is not None
+                or current.get("stop_requested") is True or close.get("request_id") == request_id)
 
     def verify_output() -> dict[str, Any]:
         nonlocal verification
@@ -238,9 +255,7 @@ def hold_task(
     def report(next_phase: str, details: dict[str, Any] | None = None) -> None:
         nonlocal phase, thread_id, turn_id, dispatch_evidence
         phase = next_phase
-        if phase == "turn_starting":
-            dispatch_evidence = "possibly_sent"
-        elif phase == "turn_started":
+        if phase == "turn_started":
             dispatch_evidence = "sent"
         # Capture dispatch identity before ack replacement can fail. Do not recover
         # a turn by guessing the latest turn on a reused thread.
@@ -262,6 +277,7 @@ def hold_task(
             "total_turn_count": initial_total_turn_count,
             "max_turns": max_turns,
             "observed_at": _now(),
+            **runtime_fields(),
             **(details or {}),
         })
 
@@ -285,6 +301,18 @@ def hold_task(
                 allow_start=str(request.get("mode") or "create") != "recover",
             )
             client = AppServerClient(launcher_config)
+            def before_turn_dispatch(params):
+                nonlocal dispatch_evidence
+                try:
+                    commit_dispatch(request_path.parent, request, params)
+                except DispatchCancelledBeforeSend:
+                    dispatch_evidence = "not_sent"
+                    raise
+                except Exception:
+                    dispatch_evidence = "unknown"  # Existing/uncertain commit is never proof of non-dispatch.
+                    raise
+                dispatch_evidence = "possibly_sent"
+            client.before_turn_dispatch = before_turn_dispatch
             report("launcher_config_loaded")
             input_binding = _turn_input_binding(request, initial_total_turn_count)
             mode = str(request.get("mode") or "create")
@@ -302,7 +330,7 @@ def hold_task(
                 terminal_confirmed = False
                 created = client.resume_turn_async(
                     thread_id,
-                    str(request.get("prompt") or "").strip(),
+                    str(request.get("prompt") or ""),
                     client_user_message_id=request_id,
                     model=request.get("model"),
                     reasoning_effort=request.get("reasoning_effort"),
@@ -331,6 +359,7 @@ def hold_task(
             "total_turn_count": initial_total_turn_count,
             "max_turns": max_turns,
             "observed_at": _now(),
+            **runtime_fields(),
         })
         turn_count = initial_turn_count
         total_turn_count = initial_total_turn_count
@@ -407,6 +436,7 @@ def hold_task(
                     "reason": decision.reason,
                     "error": decision.error,
                     "observed_at": _now(),
+                    **runtime_fields(),
                 })
                 if decision.action != "CONTINUE":
                     break
@@ -440,6 +470,7 @@ def hold_task(
                     "total_turn_count": total_turn_count,
                     "max_turns": max_turns,
                     "observed_at": _now(),
+                    **runtime_fields(),
                 })
                 if mode == "recover":
                     # This request is an exact recovery binding, not just an
@@ -470,6 +501,7 @@ def hold_task(
             "host_stop": interrupt_at is not None,
             "terminal_evidence": "owner_turn_completed",
             "observed_at": _now(),
+            **runtime_fields(),
         })
         return 0
     except Exception as exc:
@@ -481,6 +513,7 @@ def hold_task(
             "max_turns": max_turns,
             "terminal_confirmed": terminal_confirmed, "reason": str(exc), "observed_at": _now(),
             "dispatch_evidence": dispatch_evidence,
+            **runtime_fields(),
         }
         if host_stop_selected or interrupt_at is not None:
             failure.update(host_stop=True, execution_evidence="requires_owner_terminal")

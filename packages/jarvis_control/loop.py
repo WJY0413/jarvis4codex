@@ -7,10 +7,12 @@ from datetime import datetime, timezone
 import json
 import math
 import os
+from urllib.parse import quote
 from pathlib import Path
 from typing import Any, Mapping, Protocol
 
 from jarvis_runtime.coo_dispatcher_store import ProcessLock
+from jarvis_runtime.cancellation import cancel_management, cancellation_path, require_dispatch_open
 from .provisioning import output_schema_validator, lane_batch_size, lane_batch_ids, final_answer_mode
 
 
@@ -55,13 +57,17 @@ def _aggregate_close_reports(state: dict[str, Any]) -> None:
         return
     failures = [f"{child['hold_id']}: {reports[child['hold_id']].get('reason') or 'close failed'}"
         for child in children if reports[child["hold_id"]].get("report_status") == "failed"]
-    close.update(report_status="failed" if failures else "completed" if complete else "unresolved" if stopped else "pending",
+    running = any(reports[child["hold_id"]].get("execution_state") == "running"
+                  and reports[child["hold_id"]].get("terminal_confirmed") is not True for child in children)
+    close.update(report_status="failed" if failures else "completed" if complete else "pending" if running else "unresolved" if stopped else "pending",
         reason="; ".join(failures) or None,
-        scheduling_closed=True, execution_state="terminal" if complete else "unknown",
+        scheduling_closed=True, execution_state="terminal" if complete else "running" if running else "unknown",
         terminal_confirmed=complete, management_closed=stopped, external_execution_unresolved=stopped and not complete)
     if complete:
         state["cleanup"]["status"] = "completed"
         state["status"] = state["cleanup"]["target"]
+    elif running:
+        state["status"] = "stopping"
     elif stopped:
         state["status"] = "closed_unconfirmed"
 
@@ -85,7 +91,8 @@ class LoopStore:
             value = json.loads(self._path(loop_id).read_text(encoding="utf-8"))
         except FileNotFoundError as exc:
             raise ValueError("loop state was not found") from exc
-        if not isinstance(value, dict) or value.get("schema") != "jarvis-loop-state/v1":
+        if (not isinstance(value, dict) or value.get("schema") != "jarvis-loop-state/v1"
+                or value.get("loop_id") != loop_id):
             raise ValueError("loop state is invalid")
         return value
 
@@ -263,8 +270,8 @@ class LoopController:
         self._store.save(loop_id, state)
         return self._result(state)
 
-    @staticmethod
-    def _acquire(runtime: LoopRuntime, state: Mapping[str, Any], child: dict[str, Any]) -> None:
+    def _acquire(self, runtime: LoopRuntime, state: Mapping[str, Any], child: dict[str, Any]) -> None:
+        require_dispatch_open(self._store._path(state["loop_id"]).parent)
         offset = child.get("completed_rounds", 0)
         key = f"{state['loop_id']}:{child['slot']}" + (f":after-{offset}" if offset else "")
         resume = child["acquire"] == "resume" and not offset
@@ -275,8 +282,8 @@ class LoopController:
         child["thread_turn_limit"] = budget
         receipt = runtime.hold(
             request_id=f"{key}:acquire", prompt=child["prompt"],
-            source_ref=(f"jarvis_loop_task:{state['loop_id']}" if state.get("turns_per_thread") is not None
-                        else f"jarvis_loop:{state['loop_id']}:{child['slot']}"),
+            source_ref=(f"jarvis_loop_task:{quote(state['loop_id'], safe='')}" if state.get("turns_per_thread") is not None
+                        else f"jarvis_loop:{quote(state['loop_id'], safe='')}:{child['slot']}"),
             task_id=child.get("task_id") if resume else None,
             project=None if resume else state["project"],
             title=child.get("title") or (f"Jarvis loop {state['request_id']} {child['slot']}" if offset else None),
@@ -300,6 +307,8 @@ class LoopController:
             state = self._store.load(loop_id)
         except ValueError as exc:
             return LoopResult("invalid_request", loop_id, {}, str(exc))
+        if cancellation_path(self._store._path(loop_id).parent) and not state.get("close"):
+            return self.close(runtime, loop_id=loop_id)
         if state.get("status") == "closed_unconfirmed":
             return self._result(state)
         if state.get("close") and not state.get("cleanup"):
@@ -376,11 +385,17 @@ class LoopController:
     def close(self, runtime: LoopRuntime, *, loop_id: str, request_id: str | None = None) -> LoopResult:
         try:
             state = self._store.load(loop_id)
+            marker = cancel_management(self._store._path(loop_id).parent, scope="loop", subject_id=loop_id,
+                request_id=state["request_id"], close_request_id=(state.get("close") or {}).get("close_request_id") or request_id or f"close:{loop_id}",
+                original=self._store._path(loop_id).read_bytes())
             if state.get("close", {}).get("report_status") not in {"completed", "unresolved"}:
                 state.setdefault("close", {"schema": "jarvis-close-report/v1", "loop_id": loop_id,
                     "close_request_id": request_id or f"close:{loop_id}", "requested_at": datetime.now(timezone.utc).isoformat(),
-                    "report_status": "pending", "scheduling_closed": False, "terminal_confirmed": False})
+                    "report_status": "pending", "scheduling_closed": True, "terminal_confirmed": False,
+                    "cancellation": marker})
                 self._store.save(loop_id, state)  # Durable intent before cancel/child effects.
+            state.setdefault("close", {}).update(cancellation=marker, scheduling_closed=True)
+            self._store.save(loop_id, state)
             if state.get("status") == "closed_unconfirmed":
                 return self._result(state)
             if state.get("cleanup", {}).get("status") == "completed" and _cleanup_evidence_confirmed(state):
@@ -391,7 +406,16 @@ class LoopController:
                 return self._result(state)
             return self.stop(runtime, loop_id=loop_id)
         except (OSError, ValueError, RuntimeError) as exc:
-            return LoopResult("failed", loop_id, {}, str(exc))
+            if "marker" not in locals():
+                return LoopResult("failed", loop_id, {}, str(exc))
+            state["status"] = "closed_unconfirmed"
+            state.setdefault("close", {}).update(scheduling_closed=True, management_closed=True,
+                terminal_confirmed=False, execution_state="unknown", report_status="unresolved",
+                cancellation=marker, external_execution_unresolved=True, reason=str(exc))
+            try: self._store.save(loop_id, state)
+            except (OSError, ValueError, RuntimeError) as save_error:
+                state["close"]["report_error"] = str(save_error)
+            return self._result(state)
 
     def stop(self, runtime: LoopRuntime, *, loop_id: str) -> LoopResult:
         try:
@@ -418,7 +442,10 @@ class LoopController:
         if cleanup.get("status") == "completed":
             return
         if not cleanup.get("heartbeat_cancelled"):
-            state["heartbeat"] = self._cancel(runtime, state)
+            try:
+                state["heartbeat"] = self._cancel(runtime, state)
+            except Exception as exc:
+                state["heartbeat"] = {"status": "failed", "reason": str(exc)}
             cleanup["heartbeat_cancelled"] = state["heartbeat"].get("status") in {
                 "completed", "cancelled", "canceled", "not_required",
             }
@@ -449,8 +476,11 @@ class LoopController:
             elif child.get("stop_receipt", {}).get("status") != "stop_requested":
                 stopper = getattr(runtime, "stop_hold", None)
                 child["stop_receipt"] = stopper(hold_id) if callable(stopper) else {"status": "unsupported"}
-            receipt = runtime.monitor(action="status", request_id=f"{state['loop_id']}:{child['slot']}:cleanup",
-                                      source_ref=f"jarvis_loop:{state['loop_id']}:{child['slot']}", hold_id=hold_id)
+            try:
+                receipt = runtime.monitor(action="status", request_id=f"{state['loop_id']}:{child['slot']}:cleanup",
+                                          source_ref=f"jarvis_loop:{state['loop_id']}:{child['slot']}", hold_id=hold_id)
+            except Exception as exc:
+                receipt = {"status": "requires_readback", "reason": str(exc)}
             child["last_receipt"] = receipt
             data = receipt.get("data") or {}
             lifecycle = data.get("lifecycle_status") or data.get("status")
@@ -463,16 +493,19 @@ class LoopController:
             state["status"] = cleanup["target"]
         if state.get("close"):
             complete = released and cleanup.get("heartbeat_cancelled") is True
-            local_closed = management_closed and cleanup.get("heartbeat_cancelled") is True
+            local_closed = (cancellation_path(self._store._path(state["loop_id"]).parent) is not None
+                            or (management_closed and cleanup.get("heartbeat_cancelled") is True))
             failures = [f"{item.get('hold_id')}: {item['close_receipt'].get('reason') or item['close_receipt']['status']}"
                 for item in state["children"] if (item.get("close_receipt") or {}).get("status") in {"failed", "unsupported", "invalid_request"}]
-            state["close"].update(report_status="failed" if failures else "completed" if complete else "unresolved" if local_closed else "pending",
+            owner_running = any((item.get("close_receipt") or {}).get("status") == "closing"
+                                for item in state["children"])
+            state["close"].update(report_status="completed" if complete else "pending" if owner_running else "unresolved" if local_closed else "failed" if failures else "pending",
                 reason="; ".join(failures) or None,
-                scheduling_closed=True, execution_state="terminal" if complete else "unknown",
+                scheduling_closed=True, execution_state="terminal" if complete else "running" if owner_running else "unknown",
                 terminal_confirmed=complete, management_closed=local_closed,
                 external_execution_unresolved=local_closed and not complete,
                 children=[{"hold_id": item.get("hold_id"), "receipt": item.get("close_receipt")} for item in state["children"]])
-            if local_closed and not complete:
+            if local_closed and not complete and not owner_running:
                 state["status"] = "closed_unconfirmed"
 
     def _observe(self, runtime: LoopRuntime, state: dict[str, Any]) -> None:
@@ -544,7 +577,7 @@ class LoopController:
                     path = self._store._path(state["loop_id"])
                     with ProcessLock(path.with_suffix(".lock")):
                         latest = self._store.load(state["loop_id"])
-                        if latest.get("close") or latest.get("cleanup"):
+                        if (cancellation_path(path.parent) or latest.get("close") or latest.get("cleanup")):
                             state.clear()
                             state.update(latest)
                             return False

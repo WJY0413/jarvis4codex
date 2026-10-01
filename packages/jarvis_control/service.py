@@ -4,6 +4,9 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 from typing import Any, Mapping, Protocol
+from pathlib import Path
+from datetime import datetime, timezone, timedelta
+from .operations import ControllerOperations
 
 from jarvis_codex_bridge import CapabilityRequest, ExistingThreadBridge, JarvisCapabilityPort
 
@@ -31,12 +34,97 @@ class JarvisControl:
         provisioner: TaskProvisioningPort | None = None,
         notifier: NotificationPort | None = None,
         loop_controller: LoopController | None = None,
+        operation_root: Path | None = None,
+        dispatch_manager: Any = None,
     ) -> None:
         self._capabilities = capabilities
         self._bridge = bridge
         self._provisioner = provisioner
         self._notifier = notifier
         self._loop_controller = loop_controller
+        self._operations = ControllerOperations(self, operation_root) if operation_root is not None else None
+        self._dispatch_manager = dispatch_manager
+        self._registry_reader = lambda: []
+        self._deployment_paths = {}
+
+    def contract_check(self, *, request_id: str, contract_id: str, expected_code_sha256: str, expected_config_sha256: str) -> dict[str, Any]:
+        if self._operations is None:
+            return self.unsupported(tool="jarvis_contract_check", reason="durable controller operations are not configured")
+        try:
+            return self._operations.contract_check(request_id, contract_id, expected_code_sha256, expected_config_sha256)
+        except Exception as exc:
+            return self._receipt("jarvis_contract_check", "failed", request_id=request_id, reason=str(exc))
+
+    def operation_read(self, *, request_id: str) -> dict[str, Any]:
+        if self._operations is None:
+            return self.unsupported(tool="jarvis_receipt", reason="durable controller operations are not configured")
+        try:
+            return self._operations.read(request_id)
+        except Exception as exc:
+            return self._receipt("jarvis_receipt", "requires_readback", request_id=request_id, reason=str(exc))
+
+    def route_output(self, *, kind: str, request_id: str, run_id: str, source_thread_id: str,
+                     source_turn_id: str, target_thread_id: str, source_ref: str,
+                     target_input: str | None = None) -> dict[str, Any]:
+        if self._operations is None:
+            return self.unsupported(tool="jarvis_" + kind, reason="durable controller operations are not configured")
+        try:
+            return self._operations.route(kind=kind, request_id=request_id, run_id=run_id,
+                source_thread_id=source_thread_id, source_turn_id=source_turn_id,
+                target_thread_id=target_thread_id, source_ref=source_ref, target_input=target_input)
+        except Exception as exc:
+            return self._receipt("jarvis_" + kind, "blocked", request_id=request_id, reason=str(exc))
+
+    def read_delivery(self, *, message_id: str | None = None, request_id: str | None = None) -> dict[str, Any]:
+        reader = getattr(self._notifier, "read_delivery", None)
+        if not callable(reader):
+            return self.unsupported(tool="jarvis_read_delivery", reason="receiver-side delivery readback is not configured")
+        try:
+            data = dict(reader(message_id=message_id, request_id=request_id))
+            verified = data.get("delivery_status") == "delivered" and bool(data.get("message_id"))
+            return self._receipt("jarvis_read_delivery", "completed" if verified else "requires_readback",
+                request_id=request_id, data=data, readback={"verified": verified, "terminal": verified})
+        except Exception as exc:
+            return self._receipt("jarvis_read_delivery", "requires_readback", request_id=request_id, reason=str(exc))
+
+    def dispatch(self, *, action: str, request_id: str, run_id: str, target_thread_id: str | None = None,
+                 prompt: str | None = None, source_ref: str | None = None) -> dict[str, Any]:
+        if self._dispatch_manager is None or self._operations is None:
+            return self.unsupported(tool="jarvis_dispatch", reason="owned dispatch lifecycle is not configured")
+        try:
+            if action == "start":
+                self._operations.ensure_test_target(run_id, target_thread_id)
+                if not callable(getattr(self._provisioner, "creation_enabled", None)) or not self._provisioner.creation_enabled():
+                    raise ValueError("live creation is disabled")
+                from jarvis_codex_bridge import ResumeRequest
+                request = ResumeRequest(request_id=request_id, thread_id=target_thread_id,
+                    prompt=prompt or "", source_ref=source_ref or "")
+                data = self._dispatch_manager.start(request, owner_scope=run_id, pause_before_dispatch=True)
+            elif action in {"read", "release", "stop", "recover"}:
+                if action == "release" and not self._provisioner.creation_enabled():
+                    raise ValueError("live creation is disabled")
+                data = getattr(self._dispatch_manager, action)(request_id, owner_scope=run_id)
+            else:
+                raise ValueError("unknown owned dispatch action")
+            status = str(data.get("status") or "requires_readback")
+            return self._receipt("jarvis_dispatch", status, request_id=request_id,
+                target_thread_id=data.get("thread_id"), turn_id=data.get("turn_id"), reason=data.get("reason"), data=data,
+                readback={"verified": True, "terminal": status in {"completed", "failed", "requires_readback", "owner_stopped"}})
+        except Exception as exc:
+            return self._receipt("jarvis_dispatch", "blocked", request_id=request_id, reason=str(exc))
+
+    def capacity(self, *, request_id: str, run_id: str, project: str, inputs: list[str]) -> dict[str, Any]:
+        """A bounded concurrent batch routed through the existing Host/Holder."""
+        if not run_id or not isinstance(inputs, list) or not 1 <= len(inputs) <= 64 or any(not isinstance(x, str) or not x.strip() for x in inputs):
+            return self._receipt("jarvis_capacity", "invalid_request", request_id=request_id, reason="run_id and 1..64 declared nonempty TEST inputs required")
+        if self._provisioner is None or not self._provisioner.creation_enabled():
+            return self._receipt("jarvis_capacity", "blocked", request_id=request_id, reason="live creation unavailable")
+        if self._operations is None:
+            return self.unsupported(tool="jarvis_capacity", reason="durable capacity receipts unavailable")
+        try:
+            return self._operations.capacity(request_id=request_id, run_id=run_id, project=project, inputs=inputs)
+        except Exception as exc:
+            return self._receipt("jarvis_capacity", "blocked", request_id=request_id, reason=str(exc))
 
     def loop(self, *, action: str, loop_id: str | None = None, **options: Any) -> dict[str, Any]:
         """Use the existing Holder and Monitor ports as one bounded loop."""
@@ -57,6 +145,9 @@ class JarvisControl:
             )
         if action == "start":
             try:
+                enabled = getattr(self._provisioner, "creation_enabled", None)
+                if callable(enabled) and not enabled():
+                    raise ValueError("live creation is disabled for this deployment")
                 _validate_start(options)
             except ValueError as exc:
                 return self._receipt("jarvis_loop", "invalid_request", request_id=options.get("request_id"), reason=str(exc))
@@ -147,7 +238,7 @@ class JarvisControl:
         *,
         request_id: str,
         project: str,
-        title: str,
+        title: str | None = None,
         prompt: str,
         source_ref: str,
         model: str | None = None,
@@ -158,16 +249,33 @@ class JarvisControl:
         hold_id: str | None = None,
         notifications: Mapping[str, Any] | None = None,
         input_binding: Mapping[str, Any] | None = None,
+        run_id: str | None = None,
+        role: str | None = None,
+        test_only: bool = False,
     ) -> dict[str, Any]:
         if self._provisioner is None:
             return self.unsupported(
                 tool="jarvis_create", reason="no task-creation adapter is configured"
             )
         try:
+            if test_only and (self._operations is None or not run_id or not role):
+                raise ValueError("TEST provisioning requires run_id, role and durable operation receipts")
+            if test_only:
+                previous = self._operations.receipts.read("target:" + run_id + ":" + role)
+                if previous:
+                    if previous.get("provision_request_id") != request_id:
+                        raise ValueError("TEST run role already belongs to another request")
+                    return previous["provision_receipt"]
+            config_check = getattr(self._provisioner, "creation_enabled", None)
+            if callable(config_check) and not config_check():
+                raise ValueError("live creation is disabled for this deployment")
+            readiness = self._provisioner.ensure_hold_host_ready(required_workers=1)
+            if readiness.get("status") != "ready":
+                return self._receipt("jarvis_create", "blocked", request_id=request_id, reason=readiness.get("reason"), data=readiness)
             provision = self._provisioner.provision(TaskProvisionRequest(
                 request_id=request_id,
                 project=project,
-                title=title,
+                title=title or ("Jarvis " + (role or "task") + " " + request_id[:64]),
                 prompt=prompt,
                 source_ref=source_ref,
                 model=model,
@@ -181,7 +289,7 @@ class JarvisControl:
             ))
         except ValueError as exc:
             return self._receipt("jarvis_create", "invalid_request", request_id=request_id, reason=str(exc))
-        return self._receipt(
+        receipt = self._receipt(
             "jarvis_create",
             provision.status,
             request_id=provision.request_id,
@@ -194,6 +302,9 @@ class JarvisControl:
                 "terminal": provision.status == "completed",
             },
         )
+        if test_only:
+            self._operations.register_test_target(run_id=run_id, role=role, request_id=request_id, provision=receipt)
+        return receipt
 
     def hold(
         self,
@@ -275,6 +386,9 @@ class JarvisControl:
         # Kept only for wire compatibility. All public resume calls are now monitor-owned.
         del hold_with_monitor
         try:
+            enabled = getattr(self._provisioner, "creation_enabled", None)
+            if callable(enabled) and not enabled():
+                raise ValueError("live creation is disabled for this deployment")
             request = TaskMonitorResumeRequest(
                 request_id=request_id, task_id=task_id, prompt=prompt, source_ref=source_ref,
                 monitor_id=monitor_id, hold_id=hold_id, max_turns=max_turns, model=model,
@@ -307,6 +421,11 @@ class JarvisControl:
                 "jarvis_read",
                 "completed",
                 data={
+                    "jarvis_contract_check": {"available": self._operations is not None},
+                    "jarvis_callback": {"available": self._operations is not None},
+                    "jarvis_relay": {"available": self._operations is not None},
+                    "jarvis_dispatch": {"available": self._dispatch_manager is not None},
+                    "jarvis_read_delivery": {"available": callable(getattr(self._notifier, "read_delivery", None))},
                     "jarvis_create": {
                         "available": self._provisioner is not None,
                         "reason": None if self._provisioner is not None else "no task-creation adapter is configured",
@@ -320,6 +439,11 @@ class JarvisControl:
                         "available": self._loop_controller is not None,
                         "requires_hold_monitor": True,
                     },
+                    "jarvis_close": {"available": callable(getattr(self._provisioner, "close_hold", None)),
+                        "durable_management_cancellation": getattr(self._provisioner, "management_cancellation_version", None) == "jarvis-management-cancellation/v1",
+                        "cancellation_version": getattr(self._provisioner, "management_cancellation_version", None),
+                        "unknown_execution_status": "closed_unconfirmed",
+                        "terminal_requires_owner_evidence": True, "automatic_replacement": False},
                     "jarvis_read": {"available": True, "read_only": True},
                     "jarvis_resume": {
                         "available": callable(getattr(self._provisioner, "resume_with_monitor", None)),
@@ -337,6 +461,8 @@ class JarvisControl:
                     "jarvis_notify": {
                         "available": self._notifier is not None,
                         "reason": None if self._notifier is not None else "no notification adapter is configured",
+                        "target": getattr(getattr(self._notifier, "config", None), "recipient", None),
+                        "receiver_readback_available": callable(getattr(self._notifier, "read_delivery", None)),
                     },
                 },
             )
@@ -362,7 +488,8 @@ class JarvisControl:
                     "execution_evidence": state.execution_evidence,
                     "turns": [
                         {"turn_id": turn.turn_id, "status": turn.status, "error": turn.error,
-                         "execution_status": turn.effective_status, "execution_source": turn.execution_source}
+                         "execution_status": turn.effective_status, "execution_source": turn.execution_source,
+                         "items": [dict(item) for item in turn.items]}
                         for turn in state.turns
                     ],
                 },

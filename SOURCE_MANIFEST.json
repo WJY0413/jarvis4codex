@@ -1,0 +1,190 @@
+{
+  "schema": "jarvis-dot-source-candidate/v1",
+  "version": "0.2.5+dot.5",
+  "status": "original-suite-validated candidate; not published or deployed",
+  "github_target": "WJY0413/jarvis4codex",
+  "candidate_code_sha256": "342373b0be8a32b630b52501ce88ee644585edb4a2b7f2b5a423fa057dd60f45",
+  "baseline_dot4_code_sha256": "f183207f7cec1da165e4946d111c92a2e958fdd5317b40e3d4b6620903d3125a",
+  "functional_patch_sha256": "d10b506aa60551e3ed49333dc16b717bbbf9b0ff84880c4cc4e8ff55b17345f7",
+  "r2_contact_behavior_preserved": true,
+  "source_changes": [
+    {
+      "path": "CLOSE-CANCELLATION.md",
+      "before_sha256": null,
+      "after_sha256": "9eb0c9fe817f64f36d986698f62339d8b55ec2e1549d86913c6d542b4ac8820a"
+    },
+    {
+      "path": "JARVIS_DOT.md",
+      "before_sha256": "006ad4f7c5e2c6e515b8e8acb09169ae1ae25d5585602590a226c46d448c5e50",
+      "after_sha256": "b2d99864514cff651e3831e8caee228a70034da69d776b4fa24abe776e29490c"
+    },
+    {
+      "path": "ORIGINAL_TEST_STANDARD.md",
+      "before_sha256": "ecdc8e1159acab46fef0107b8f855418a04bd13a432efdb1182c558cda3e6b63",
+      "after_sha256": "3e45c6a13bd433bc3e4676e50e7df7ff230d0b4900fa1ef5ab979a70b687e280"
+    },
+    {
+      "path": "PACKAGING.md",
+      "before_sha256": "24ef887fad819f0a1701ba060b36c31fa8da6fa3229e4526198232c933dff169",
+      "after_sha256": "c2f93889edf8559ff35bec3aa0593f850efb3edbd5bf1f2fe5dcc82535aad01a"
+    },
+    {
+      "path": "PACKAGING_LABEL_DIFF.patch",
+      "before_sha256": "9e05e3b55bd05dd6666db61ea9379df5a8eed6a505395b071023b551ecb29dc2",
+      "after_sha256": "2455a2f236066179be9afd79b5bc52c8fb55a4a7c293e82d6d3cc891d8c70786"
+    },
+    {
+      "path": "README.md",
+      "before_sha256": "d3fde795f20be1c551e909e8c939f1797989f2fd0c34ce56b829307a5bb8d6fe",
+      "after_sha256": "533bd0c26f148d9fda57b3a3d93b464b11b2f22ab1afd1cf1b662e10d1566eed"
+    },
+    {
+      "path": "VALIDATION.md",
+      "before_sha256": "33ee6ed57f010efad971c9edbb1c9cdf443b16088e99beb2b57dda2dcb7e515a",
+      "after_sha256": "332f81a04984eedc8a1c9ffc5ec65cbc52130c3280c77d98fcf09863d62067f2"
+    },
+    {
+      "path": "packages/adapters/codex_app_server/jarvis_hold_host_service.py",
+      "before_sha256": "3675cc13c536cc3be094d9d9df6eabd778d2bebfbe34fe216a2c9702d423bbe4",
+      "after_sha256": "b8165936cde46be63d0960cf114a1fdc86dcccebd9311b3a9e23d9db88206c4e"
+    },
+    {
+      "path": "packages/adapters/codex_app_server/jarvis_task_hold_host.py",
+      "before_sha256": "eb26a443892a6d9f9108092d240452b9d834914ba142b21975abce744b58cb5c",
+      "after_sha256": "c221084f0c07482454a9cfbb0beabcf9a111ab7d2efa75bd16ba2d4b12bc09e6"
+    },
+    {
+      "path": "packages/adapters/codex_app_server/task_provisioning_adapter.py",
+      "before_sha256": "f9f720b2f7f1ff3890ce27d93562a2677cf1962458de5cbde3b404643b5c8d13",
+      "after_sha256": "92b62ecf2ccff9d6e97f4ce6643d2a1ca70749d796df2dfa5d72e62f2138d2b4"
+    },
+    {
+      "path": "packages/jarvis_control/contact_task.py",
+      "before_sha256": "7b4097c051257d78ff6ebc481184bad443c819b29171cd8c86094e4b9aabfe5b",
+      "after_sha256": "f13e73bc8affca4401d3cafffa534dbd5de481698e056dfbf4695851433b9bfc"
+    },
+    {
+      "path": "packages/jarvis_control/file_task.py",
+      "before_sha256": "589319c611352fd9c071e232fa3cfa9e8890d10620435b311b12ba947cfdc218",
+      "after_sha256": "c309da00d6dfa9b74105477db01697e055dd3985df8c9ea38ad7d64df1b63af2"
+    },
+    {
+      "path": "packages/jarvis_control/loop.py",
+      "before_sha256": "b8755a6a0071db4545e3fbda5d504852461b02755f4c6131252303bbd7f4638f",
+      "after_sha256": "28e846ae9e0c3ae151222b36b412c30069c1c2d042cfb836c807532238e5d4b1"
+    },
+    {
+      "path": "packages/jarvis_control/operations.py",
+      "before_sha256": "f820b88b639b3a72cafe8d3570b866b02db6b4d028ec6c0dd9ecb81a1b00ab8a",
+      "after_sha256": "0fa6625195ffb8c13ac33a41d792d8faa9c0ff8651f959772e57679a72d839aa"
+    },
+    {
+      "path": "packages/jarvis_control/service.py",
+      "before_sha256": "b29a0e30240143e858622bf07538448e229b14ae62c7ba3c6be5fc65c2ae02d3",
+      "after_sha256": "ddc1d055b3de63f4acf7d7b8095f9cf1e8a9335b45356abdf4d03fd810b446a5"
+    },
+    {
+      "path": "packages/jarvis_mcp/server.py",
+      "before_sha256": "28d6faf154098d2554e0cbafcec500834312eac71040d9a21150df965d43da6b",
+      "after_sha256": "12adf7d6e452e578c457f91b1e4f2d381bf274ec0731d42b8fc75ec013747512"
+    },
+    {
+      "path": "packages/jarvis_runtime/cancellation.py",
+      "before_sha256": null,
+      "after_sha256": "45a2dab7ee2af234a04b1ba869b097bfcae4421bb5230b94b7442a0206c2ba64"
+    },
+    {
+      "path": "packages/jarvis_runtime/jarvis_native_task_launcher.py",
+      "before_sha256": "155055b67a9e19474188018dd64b95e12997c6fc0048923b3059241f3600881f",
+      "after_sha256": "8ddd1e2598f579017ce6e77a09b05cbe5de9e064fbcd7dcffb182044c132a4fc"
+    },
+    {
+      "path": "pyproject.toml",
+      "before_sha256": "cf4cb5a147ae4d6f113dc6fe2008ca501b85d50699d7188c937c1f5304ab8eab",
+      "after_sha256": "0050974723b96b19b54a1aff7b92e27174e7ff33ec43178d8062472791715095"
+    }
+  ],
+  "validation": {
+    "original_P0_P7_required_effects_met": true,
+    "native_model_turns": 12,
+    "completed": 11,
+    "interrupted": 1,
+    "retries": 0,
+    "replacements": 0,
+    "engineering_checks_not_acceptance": 28,
+    "historical_business_run_not_dot5": true
+  },
+  "scan_findings": [],
+  "files": {
+    ".gitignore": "eec37557dc1beebd0e3b9e7d1be157780f927f0793b2e2a7fae295285c5a73b9",
+    "CLOSE-CANCELLATION.md": "9eb0c9fe817f64f36d986698f62339d8b55ec2e1549d86913c6d542b4ac8820a",
+    "CONTACT_TASK.md": "e65992fb238fb03666a78f6ab2a124bf588895ca07cbf55c562575a884ab19ee",
+    "JARVIS_CONTROLLER.md": "0efa62d86ff7d57274d2a82a651b29e0bf6f0d9544927528d72a20fd48512ed7",
+    "JARVIS_DOT.md": "b2d99864514cff651e3831e8caee228a70034da69d776b4fa24abe776e29490c",
+    "ORIGINAL_TEST_STANDARD.md": "3e45c6a13bd433bc3e4676e50e7df7ff230d0b4900fa1ef5ab979a70b687e280",
+    "PACKAGING.md": "c2f93889edf8559ff35bec3aa0593f850efb3edbd5bf1f2fe5dcc82535aad01a",
+    "PACKAGING_LABEL_DIFF.patch": "2455a2f236066179be9afd79b5bc52c8fb55a4a7c293e82d6d3cc891d8c70786",
+    "README.md": "533bd0c26f148d9fda57b3a3d93b464b11b2f22ab1afd1cf1b662e10d1566eed",
+    "VALIDATION.md": "332f81a04984eedc8a1c9ffc5ec65cbc52130c3280c77d98fcf09863d62067f2",
+    "examples/dot/launcher.example.json": "9217894a73b1f41d95783d1f107032f53d894c7c7be2a27a06dbcbbb3d0bdd4e",
+    "examples/dot/packet.example.json": "09768838e564125b8a1d53e161ee6b18b7b77b36eb41d1c958211efd97cb0f0f",
+    "examples/dot/workspace/input.json": "42f3effd805a4e57a1dbd5fcfc89dbaa5c44e345702555a596eb0c3a67652f31",
+    "examples/dot/workspace/outputs/.keep": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "packages/adapters/__init__.py": "857e1a5eab3fb8a6f94d1c44a0bf1dbec300e1131fb51b75ea3c7784d3d6e35b",
+    "packages/adapters/codex_app_server/__init__.py": "7ac6688ee3e6ff3b3c30cdca205475fe3dac49197c63ea0bbf19817ce5a2d694",
+    "packages/adapters/codex_app_server/jarvis_connection.py": "fd4ca16f3eae3ea5f82393a646649f13ac4c52775afc2d5d708c04b48e5e0290",
+    "packages/adapters/codex_app_server/jarvis_hold_host_service.py": "b8165936cde46be63d0960cf114a1fdc86dcccebd9311b3a9e23d9db88206c4e",
+    "packages/adapters/codex_app_server/jarvis_local_heartbeat_host.py": "40280695f5169219755c6f77971e342fc7be58f44da70d5507e8799b3fe15143",
+    "packages/adapters/codex_app_server/jarvis_task_hold_host.py": "c221084f0c07482454a9cfbb0beabcf9a111ab7d2efa75bd16ba2d4b12bc09e6",
+    "packages/adapters/codex_app_server/mcp_wiring.py": "3e7e1bd42158cdbcc60b793f36cca1dbdbcd1bedbb33e1167c208296e1025e2e",
+    "packages/adapters/codex_app_server/monitor_adapter.py": "e8dbfabad40bab702e36cfbd74838d05b6a4f418831119755de7762eb8b51ac3",
+    "packages/adapters/codex_app_server/task_provisioning_adapter.py": "92b62ecf2ccff9d6e97f4ce6643d2a1ca70749d796df2dfa5d72e62f2138d2b4",
+    "packages/adapters/feishu_outbox_notification.py": "ae97b241a494d086db6c12086d33b3e05e3ac77511e1529b656d73996beb62fc",
+    "packages/adapters/local_test_inbox.py": "8f1c84185755261ffe8fcc8ff55a22f7ac4602a8ce5595351fbb64cfebee335f",
+    "packages/adapters/local_test_inbox_receiver.py": "19d5dc30de4fb7dbbc5479bf4b604189bb32291314dead86734c72ce63dd70a9",
+    "packages/jarvis_codex_bridge/__init__.py": "53014013f3750295fa787f568b7680db0a36101c1a88086b1f77054e31cbc052",
+    "packages/jarvis_codex_bridge/contracts.py": "dee89543ecf057abbb73d4aaa8ccf05a95ab5864eaeb82beda0a8a7ea2f3b3da",
+    "packages/jarvis_codex_bridge/dispatch_owner.py": "0389cb87cbf13e9b0cf9e9032f3399473fdcaabc4738b6697ab4dd6a39893166",
+    "packages/jarvis_codex_bridge/journal.py": "4b2f3494dd11c4d062561ed7087a5950850054a90d51aaf319cd7b7ea97b5de4",
+    "packages/jarvis_codex_bridge/monitor.py": "ec94cf6a9c0e82287488125cba7077edf5edad81787737d9a44ba63314156853",
+    "packages/jarvis_codex_bridge/port.py": "d58b766b15da023418a72c95a7ff93857fb507ab60a6c6b12cdc85dc0abb3f9c",
+    "packages/jarvis_codex_bridge/service.py": "3f7120dddb8b8361ce886afc1b20247598732734fe3806a1b0cdefb21ee072d6",
+    "packages/jarvis_codex_bridge/transport.py": "d3a5d4389c67adcf31d85ca1a987ed7cc26ac06b0ecbe91b5530cfd76f05c00f",
+    "packages/jarvis_contracts/__init__.py": "b2cd80e5c758af5e475bdb99f2b9f9762fd2b94c0cdb0a3f2bb725fedc3b29f5",
+    "packages/jarvis_contracts/models.py": "f7aede362200c735107edafa16c253c3f3124e070d2b3d5dcf03a05d58ece4c4",
+    "packages/jarvis_control/__init__.py": "1548f27727adc42a90495ad35c0b7b0e906ed73de613b9eed26411e624435b74",
+    "packages/jarvis_control/contact_campaign.py": "c69d337daebdba76cbc59e1377898728da957122c17ad9d06fe967b8dc12f696",
+    "packages/jarvis_control/contact_task.py": "f13e73bc8affca4401d3cafffa534dbd5de481698e056dfbf4695851433b9bfc",
+    "packages/jarvis_control/file_task.py": "c309da00d6dfa9b74105477db01697e055dd3985df8c9ea38ad7d64df1b63af2",
+    "packages/jarvis_control/loop.py": "28e846ae9e0c3ae151222b36b412c30069c1c2d042cfb836c807532238e5d4b1",
+    "packages/jarvis_control/operations.py": "0fa6625195ffb8c13ac33a41d792d8faa9c0ff8651f959772e57679a72d839aa",
+    "packages/jarvis_control/provisioning.py": "602af42b03c3543a07ce66b49b72e07b0644597650e3bbc75c2c319c92e87c5c",
+    "packages/jarvis_control/service.py": "ddc1d055b3de63f4acf7d7b8095f9cf1e8a9335b45356abdf4d03fd810b446a5",
+    "packages/jarvis_engine/__init__.py": "afae1f15d543c1b3d66e49f60c7b88017cd49d2d18766c8c7c2aa889ba81553e",
+    "packages/jarvis_engine/service.py": "a6018262270c359baf3bbeca8a66d7d039339f821cd2f70d98c205e487e104bc",
+    "packages/jarvis_harness_sdk/__init__.py": "cfed6d087fb595d8a941b5e002c1156580eef028a1dfc0625b599d74e04a0504",
+    "packages/jarvis_harness_sdk/adapter.py": "c36da55336a75698f2188e8d0ab38fd3d3e1ed1dc349d1e9fea7ed6ef7219409",
+    "packages/jarvis_mcp/__init__.py": "77d1c8e0f67716ff90eba53e56cb525276354051fa76d182ae0157f1b9490180",
+    "packages/jarvis_mcp/entrypoint.py": "a8acb94bd85ff91ee195c29537bb0d457ed12d6ad3c56cb629557bfa95021216",
+    "packages/jarvis_mcp/server.py": "12adf7d6e452e578c457f91b1e4f2d381bf274ec0731d42b8fc75ec013747512",
+    "packages/jarvis_monitor/__init__.py": "2c693be820310347ecc26e345e42713e2fbafb48c5b78b88eeda052bb8013e12",
+    "packages/jarvis_monitor/hold_turn_monitor.py": "40956b5ea7b0498ba177298581f6a890517d7ac4b5804116b1bbdb2c47d24503",
+    "packages/jarvis_monitor/service.py": "e24612d183171df4217b8081eeb6ce6a5792227478e05068d84b0c903ce1fcdf",
+    "packages/jarvis_runtime/attendance_end_of_day_memo_probe.py": "c05b787611e1fcef3a8e1a9c02acfc41ebbdf9d7d5cb945410f32aabfae867ba",
+    "packages/jarvis_runtime/cancellation.py": "45a2dab7ee2af234a04b1ba869b097bfcae4421bb5230b94b7442a0206c2ba64",
+    "packages/jarvis_runtime/coo_dispatcher_store.py": "0df2507e2c7e9943bbba544c881c4de1cadb44113a2459c12867c098ffe478c9",
+    "packages/jarvis_runtime/jarvis_heartbeat_service.py": "f8eb8d3ca6d1aa747c37f0225921da5591fe7e883dc7693f4ba9f873b5748325",
+    "packages/jarvis_runtime/jarvis_local_heartbeat.py": "8d898da8a39311491cd7d90f92ea18f7f0678dfac4dcd0af73e6b03a4e3cf3d1",
+    "packages/jarvis_runtime/jarvis_monitor_service.py": "6ab41d69d55b6393911ad1a75c36cb08576c3defe621f6803bddfc45d64ffb20",
+    "packages/jarvis_runtime/jarvis_native_task_launcher.py": "8ddd1e2598f579017ce6e77a09b05cbe5de9e064fbcd7dcffb182044c132a4fc",
+    "packages/jarvis_runtime/linux_cloud.py": "cf5da4c7bf67f706671ccef96907c55e26636e055a175e3949d1673b3839ff63",
+    "packages/jarvis_runtime/workbench_queue_progress_probe.py": "4a0c1cc7e31642e366354cdefd7be70aa0c29d88edc0d8fa4d08ecde971809d7",
+    "packages/jarvis_schema/__init__.py": "658eda8979de293327ee2bd8633980a7018a0ce7d9448e49f38189cfa3532ea6",
+    "packages/jarvis_schema/contact_v25.py": "2feee7197218b0c76a31d4a6c37e2f17202e0c33172da53bbd26dba4209c670b",
+    "pyproject.toml": "0050974723b96b19b54a1aff7b92e27174e7ff33ec43178d8062472791715095",
+    "templates/feishu-notification.config.example.json": "6145eaa7ba6ecb82a0ce1472c8a05c68499761f868ef3e07511a1b915fbc34f1",
+    "templates/local-heartbeat.config.example.json": "42f5394018990a047841850118e47f071812c8ad36559e9d57cf636f8f501a67"
+  },
+  "manifest_self_excluded": true,
+  "platform": "Linux only; Windows import failed before tests, use main/v0.2.5"
+}

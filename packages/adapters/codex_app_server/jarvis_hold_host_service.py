@@ -16,11 +16,13 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
 from jarvis_runtime.coo_dispatcher_store import ProcessLock
+from jarvis_runtime.cancellation import cancellation_path
 from jarvis_runtime.jarvis_native_task_launcher import AppServerClient, NativeTaskLauncherConfig
 
 try:  # Supports both package import and the deployed direct-script entry point.
@@ -72,8 +74,12 @@ def initialize_user_host(
     launcher = _read_json(launcher_config)
     if launcher is None:
         return {"status": "failed", "reason": "HoldHost launcher config is unreadable"}
-    profile = str(launcher.get("profile") or "").strip()
-    codex_home = str(launcher.get("expected_codex_home") or "").strip()
+    try:
+        parsed_launcher = NativeTaskLauncherConfig(launcher_config)
+    except Exception as exc:
+        return {"status": "failed", "reason": f"HoldHost launcher config is invalid: {exc}"}
+    profile = parsed_launcher.profile
+    codex_home = parsed_launcher.expected_codex_home
     if not profile or not codex_home:
         return {"status": "failed", "reason": "HoldHost launcher config requires profile and expected_codex_home"}
     health_checks = {"now": now, "pid_alive": pid_alive or _pid_is_alive, "pid_started_at": pid_started_at or _pid_started_at}
@@ -238,7 +244,27 @@ def _pid_is_alive(pid: int) -> bool:
 
 
 def _pid_started_at(pid: int) -> datetime | None:
-    if os.name != "nt":  # pragma: no cover - Windows user-host deployment is the supported path.
+    if sys.platform.startswith("linux"):
+        # Preserve the existing PID-reuse check with an independently read birth time.
+        # /proc field 22 is starttime (clock ticks since boot); comm may contain spaces.
+        try:
+            process_stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+            fields = process_stat.rsplit(")", 1)[1].split()
+            start_ticks = int(fields[19])
+            boot_time = next(
+                int(line.split()[1])
+                for line in Path("/proc/stat").read_text(encoding="utf-8").splitlines()
+                if line.startswith("btime ")
+            )
+            ticks_per_second = int(os.sysconf("SC_CLK_TCK"))
+            if pid <= 0 or start_ticks < 0 or ticks_per_second <= 0:
+                return None
+            return datetime.fromtimestamp(
+                boot_time + start_ticks / ticks_per_second, tz=timezone.utc
+            )
+        except (OSError, ValueError, IndexError, StopIteration):
+            return None
+    if os.name != "nt":  # Unsupported platforms stay fail-closed.
         return None
     import ctypes
 
@@ -277,12 +303,15 @@ class JarvisHoldHost:
     """One small seam: consume accepted local requests and hold their App Server turns."""
 
     def __init__(self, *, state_dir: Path, launcher_config: Path, workers: int = 5) -> None:
-        self.state_dir = state_dir
-        self.launcher_config = launcher_config
-        launcher = _read_json(launcher_config) or {}
-        self.profile = str(launcher.get("profile") or "").strip()
-        self.codex_home = str(launcher.get("expected_codex_home") or "").strip()
+        self.state_dir = state_dir.resolve()
+        self.launcher_config = launcher_config.resolve()
+        launcher = NativeTaskLauncherConfig(self.launcher_config)
+        self.profile = launcher.profile
+        self.codex_home = launcher.expected_codex_home
+        self.codex_home_resolution = {"input": launcher.expected_codex_home_input,
+            "base_dir": launcher.expected_codex_home_base_dir, "resolved": launcher.expected_codex_home}
         self.started_at = _now()
+        self.instance_id = uuid.uuid4().hex
         self.requests_roots = (state_dir / "task-holds", state_dir / "task-monitors")
         self.health_path = state_dir / "hold-host.json"
         self.workers = max(int(workers), 1)
@@ -303,7 +332,7 @@ class JarvisHoldHost:
                     continue
                 request = _read_json(request_path)
                 ack = _read_json(ack_path)
-                if request is None or ack is None or result_path.exists():
+                if request is None or ack is None or result_path.exists() or cancellation_path(root, request):
                     continue
                 if str(ack.get("status") or "") != "accepted":
                     if self._requeue_dead_claim(root, request_path, ack_path, request, ack):
@@ -313,7 +342,7 @@ class JarvisHoldHost:
                     if self._requeue_dead_claim(root, request_path, ack_path, request, ack):
                         return True
                     continue
-                if not self._claim(root, ack_path, ack, request):
+                if not self._claim(root, ack_path, ack, request, host_instance_id=self.instance_id):
                     if self._requeue_dead_claim(root, request_path, ack_path, request, ack):
                         return True
                     continue
@@ -395,6 +424,8 @@ class JarvisHoldHost:
         root: Path, request_path: Path, ack_path: Path, request: dict[str, Any], ack: dict[str, Any],
     ) -> bool:
         try:
+            if cancellation_path(root, request):
+                return False  # Cancellation never requires a legacy PID death guess.
             claim_dir = root / ".user-host-claim"
             owner = _read_json(claim_dir / "owner.json")
             try:
@@ -403,8 +434,8 @@ class JarvisHoldHost:
                 return False
             thread_id = str(ack.get("thread_id") or request.get("thread_id") or "").strip()
             turn_id = str(ack.get("turn_id") or request.get("turn_id") or "").strip()
-            if owner_pid <= 0 or _pid_is_alive(owner_pid):
-                return False
+            if owner_pid <= 0 or sys.platform.startswith("linux") or _pid_is_alive(owner_pid):
+                return False  # Linux orphan recovery requires future namespace-aware ownership proof.
             if not thread_id or not turn_id:
                 if str(ack.get("phase") or "") not in {"claimed_by_user_host", "queued_for_user_host", "thread_starting"} or str(request.get("mode") or "create") != "create":
                     return False
@@ -450,21 +481,22 @@ class JarvisHoldHost:
             return False
 
     @staticmethod
-    def _claim(root: Path, ack_path: Path, ack: dict[str, Any], request: dict[str, Any] | None = None) -> bool:
+    def _claim(root: Path, ack_path: Path, ack: dict[str, Any], request: dict[str, Any] | None = None, *, host_instance_id: str | None = None) -> bool:
         claim_dir = root / ".user-host-claim"
+        if cancellation_path(root, request): return False
         try:
             claim_dir.mkdir()
         except FileExistsError:
             return False
         claimed = False
         try:
-            _write_json(claim_dir / "owner.json", {"pid": os.getpid(), "observed_at": _now()})
+            _write_json(claim_dir / "owner.json", {"pid": os.getpid(), "observed_at": _now(), "host_instance_id": host_instance_id})
             current = _read_json(root / "request.json")
             current_ack = _read_json(ack_path) or {}
             expected = request if request is not None else current
             # A delayed scanner may acquire the directory after another worker finished.
             # Recheck before replacing the acknowledgement, not only before mkdir.
-            if (current is None or expected is None or (root / "result.json").exists()
+            if (current is None or expected is None or cancellation_path(root, current) or (root / "result.json").exists()
                     or current.get("request_id") != expected.get("request_id")
                     or current.get("hold_id") != expected.get("hold_id")
                     or current_ack.get("request_id", current.get("request_id")) != current.get("request_id")
@@ -512,7 +544,7 @@ class JarvisHoldHost:
             return {**rejected, "reason": "Exact Hold/thread/turn required"}
         root = matches[0]
         try:
-            with ProcessLock((root / "request.json").with_suffix(".lock"), timeout_seconds=0.1, owner_alive=_pid_is_alive):
+            with ProcessLock((root / "request.json").with_suffix(".lock"), timeout_seconds=0.1, owner_alive=lambda pid: True):
                 request = _read_json(root / "request.json") or {}
                 ack = _read_json(root / "ack.json") or {}
                 result = _read_json(root / "result.json") or {}
@@ -541,7 +573,9 @@ class JarvisHoldHost:
                             and not (root / ".user-host-claim").exists())}
                 health = _read_json(self.health_path) or {}
                 owner = _read_json(root / ".user-host-claim" / "owner.json") or {}
-                if ("exact_hold_stop_v1" not in (health.get("capabilities") or [])
+                if (not owner.get("host_instance_id")
+                        or owner.get("host_instance_id") != health.get("host_instance_id")
+                        or "exact_hold_stop_v1" not in (health.get("capabilities") or [])
                         or health.get("pid") != owner.get("pid")
                         or hold_id not in (health.get("active_hold_ids") or [])
                         or not _matching_health(self.state_dir, self.profile, self.codex_home, now=_now,
@@ -730,7 +764,8 @@ class JarvisHoldHost:
                     for root in requests_root.iterdir():
                         if stop.is_set():
                             break
-                        if not root.is_dir() or (root / "result.json").exists():
+                        if (not root.is_dir() or (root / "result.json").exists()
+                                or cancellation_path(root, _read_json(root / "request.json") or {})):
                             continue
                         with scheduled_lock:
                             if root in scheduled:
@@ -785,10 +820,12 @@ class JarvisHoldHost:
                 _write_json(self.health_path, {
                     "profile": self.profile,
                     "codex_home": self.codex_home,
+                    "codex_home_resolution": self.codex_home_resolution,
                     "state_dir": str(self.state_dir.resolve()),
                     "status": "holding" if active_hold_ids else status,
                     "pid": os.getpid(),
                     "host_started_at": self.started_at,
+                    "host_instance_id": self.instance_id,
                     "request_id": request_id,
                     "worker_capacity": self.workers,
                     "active_count": len(active_hold_ids),

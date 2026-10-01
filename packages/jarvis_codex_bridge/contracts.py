@@ -8,7 +8,7 @@ from typing import Any, Literal
 
 
 BridgeStatus = Literal[
-    "completed", "busy", "failed", "requires_readback", "duplicate"
+    "starting", "completed", "busy", "failed", "interrupted", "requires_readback", "duplicate"
 ]
 
 
@@ -86,6 +86,8 @@ class BridgeReceipt:
     output: str | None = None
     reason: str | None = None
     replayed: bool = False
+    request_digest: str | None = None
+    owner: dict[str, Any] | None = None
 
     def as_dict(self) -> dict[str, Any]:
         value = asdict(self)

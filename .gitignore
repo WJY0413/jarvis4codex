@@ -1,13 +1,12 @@
-__pycache__/
-*.py[cod]
-.pytest_cache/
 .venv/
+__pycache__/
+*.pyc
 build/
 dist/
 *.egg-info/
-
-# Runtime state belongs in the configured Jarvis data root, never source control.
 runtime/
 state/
-logs/
-output/
+auth.json
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm

@@ -23,7 +23,7 @@ class JarvisMcpServer:
         self._control_lock = threading.RLock()
         self.mcp = MCPServer(
             "jarvis-control",
-            title="Jarvis Control Plane",
+            title="Jarvis dot",
             version="0.2.5",
             instructions=(
                 "Use jarvis_read before a state-changing call when you need capability or thread context. "
@@ -34,6 +34,7 @@ class JarvisMcpServer:
             ),
         )
         self._register_tools()
+        self.control._registry_reader = lambda: [{"name": tool.name, "inputSchema": tool.parameters, "description": tool.description} for tool in self.mcp._tool_manager.list_tools()]
 
     def run_stdio(self) -> None:
         """Run the already-wired server on local standard input/output."""
@@ -60,6 +61,36 @@ class JarvisMcpServer:
             return getattr(self.control, method)(**kwargs)
 
     def _register_tools(self) -> None:
+        @self.mcp.tool(name="jarvis_contract_check", description="Evaluate the declared controller contract against the actual running build, registry and effective deployment; persist exact terminal check evidence.", annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False))
+        def jarvis_contract_check(request_id: str, contract_id: str, expected_code_sha256: str, expected_config_sha256: str) -> CallToolResult:
+            return _tool_result(self._invoke("contract_check", request_id=request_id, contract_id=contract_id, expected_code_sha256=expected_code_sha256, expected_config_sha256=expected_config_sha256))
+
+        @self.mcp.tool(name="jarvis_receipt", description="Read an exact durable operation receipt and its source/target evidence. Never dispatch a new action.", annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False))
+        def jarvis_receipt(request_id: str) -> CallToolResult:
+            return _tool_result(self._invoke("operation_read", request_id=request_id))
+
+        @self.mcp.tool(name="jarvis_callback", description="Deliver a verified exact source-completion callback to a declared eligible TEST target and retain both identities/readbacks.", annotations=ToolAnnotations(destructiveHint=False, idempotentHint=True, openWorldHint=False))
+        def jarvis_callback(request_id: str, run_id: str, source_thread_id: str, source_turn_id: str, target_thread_id: str, target_input: str, source_ref: str) -> CallToolResult:
+            return _tool_result(self._invoke("route_output", kind="callback", request_id=request_id, run_id=run_id, source_thread_id=source_thread_id, source_turn_id=source_turn_id, target_thread_id=target_thread_id, target_input=target_input, source_ref=source_ref))
+
+        @self.mcp.tool(name="jarvis_relay", description="Read one completed source's raw final output and relay it unchanged to an eligible TEST target. Completion requires exact target input and output equality.", annotations=ToolAnnotations(destructiveHint=False, idempotentHint=True, openWorldHint=False))
+        def jarvis_relay(request_id: str, run_id: str, source_thread_id: str, source_turn_id: str, target_thread_id: str, source_ref: str) -> CallToolResult:
+            return _tool_result(self._invoke("route_output", kind="relay", request_id=request_id, run_id=run_id, source_thread_id=source_thread_id, source_turn_id=source_turn_id, target_thread_id=target_thread_id, source_ref=source_ref))
+
+        @self.mcp.tool(name="jarvis_read_delivery", description="Read a real configured receiver's stored message, recipient, exact body and hash by message or request identity.", annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False))
+        def jarvis_read_delivery(message_id: str | None = None, request_id: str | None = None) -> CallToolResult:
+            return _tool_result(self._invoke("read_delivery", message_id=message_id, request_id=request_id))
+
+        @self.mcp.tool(name="jarvis_capacity", description="Run exactly the declared bounded concurrent TEST inputs; Jarvis selects its implementation and returns separate child identities.", annotations=ToolAnnotations(destructiveHint=False, idempotentHint=False, openWorldHint=False))
+        def jarvis_capacity(request_id: str, run_id: str, project: str, inputs: list[str]) -> CallToolResult:
+            return _tool_result(self._invoke("capacity", request_id=request_id, run_id=run_id, project=project, inputs=inputs))
+
+        @self.mcp.tool(name="jarvis_dispatch", description="Manage a normal owned, durable dispatch intent for an eligible TEST target. A paused owner can be stopped at its real pre-dispatch boundary; recovery never dispatches a replacement.", annotations=ToolAnnotations(destructiveHint=False, idempotentHint=True, openWorldHint=False))
+        def jarvis_dispatch(action: Literal["start", "read", "release", "stop", "recover"], request_id: str, run_id: str,
+                            target_thread_id: str | None = None, prompt: str | None = None, source_ref: str | None = None) -> CallToolResult:
+            return _tool_result(self._invoke("dispatch", action=action, request_id=request_id, run_id=run_id,
+                target_thread_id=target_thread_id, prompt=prompt, source_ref=source_ref))
+
         @self.mcp.tool(
             name="jarvis_create",
             description="Ask Jarvis to create and hold a task. Return only after hold owns the exact first turn.",
@@ -67,9 +98,9 @@ class JarvisMcpServer:
         )
         def jarvis_create(
             project: str,
-            title: str,
             prompt: str,
             request_id: str,
+            title: str | None = None,
             source_ref: str = "mcp:jarvis_create",
             model: str | None = None,
             reasoning_effort: str | None = None,
@@ -78,6 +109,9 @@ class JarvisMcpServer:
             continue_prompt: str = "继续",
             hold_id: str | None = None,
             notifications: dict[str, Any] | None = None,
+            run_id: str | None = None,
+            role: str | None = None,
+            test_only: bool = False,
         ) -> CallToolResult:
             return _tool_result(self._invoke("create",
                 request_id=request_id,
@@ -91,7 +125,7 @@ class JarvisMcpServer:
                 auto_continue=auto_continue,
                 continue_prompt=continue_prompt,
                 hold_id=hold_id,
-                notifications=notifications,
+                notifications=notifications, run_id=run_id, role=role, test_only=test_only,
             ))
 
         @self.mcp.tool(
@@ -180,7 +214,7 @@ class JarvisMcpServer:
 
         @self.mcp.tool(
             name="jarvis_close",
-            description="Durably close exactly one loop_id or standalone hold_id. Stop future work and request supported interruption only for a proven exact current owner. No turn_id required. closed requires terminal/release evidence; closed_unconfirmed means local management stopped but external execution is unknown, never released or replaced automatically. Records a closure report; no shared Host kill, history deletion or chat archival. Prefer loop_id for Loop-managed work.",
+            description="Durably cancel management of exactly one loop_id or standalone hold_id even when its owner is unknown. Cancel queued work, auto-continuation and resume; request interruption only through a proven exact owner. A dispatch already committed before cancellation may remain in flight. No turn_id required. closed requires terminal/release evidence; closed_unconfirmed means local management stopped but external execution is unknown, never released or replaced automatically. Records a closure report; no shared Host kill, history deletion or chat archival. Prefer loop_id for Loop-managed work.",
             annotations=ToolAnnotations(destructiveHint=True, idempotentHint=True, openWorldHint=False),
         )
         def jarvis_close(
