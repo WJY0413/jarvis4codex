@@ -1,0 +1,69 @@
+{
+  "schema": "jarvis-026-code-only-handoff/v1",
+  "target_release": "0.2.6",
+  "repository": "WJY0413/jarvis4codex",
+  "linux_base_commit": "17903f679baa8746d0edf3bf65088b9c11aa3934",
+  "aggregate_algorithm": "SHA256 of UTF-8 sorted path TAB sha256 LF records",
+  "linux_base_source_aggregate_sha256": "705ba9c7b6c79e08614bc5bc64739ad666ea792a3e111149bf08c68738d4480d",
+  "original_contract_aggregate_sha256": "02ffce7822b30b356234b3415ee611b7e1b266aed4dc87910bcb478f22db5ce2",
+  "baseline_verified_against_original_per_file_manifest": true,
+  "linux_TaskA_revision1_aggregate_sha256": "ea546121c6bd27911732aad208d697ae0b7538f800c108de43c10200c3db5dda",
+  "patches": [
+    {
+      "file": "TASK-A-LINUX-CODE.patch",
+      "sha256": "c6c9a54618994cbe8bb017872d18a737ff6efe56f73d39b1403f62ec928b50df",
+      "changed_files": [
+        {
+          "path": "packages/adapters/codex_app_server/task_provisioning_adapter.py",
+          "before_sha256": "92b62ecf2ccff9d6e97f4ce6643d2a1ca70749d796df2dfa5d72e62f2138d2b4",
+          "after_sha256": "9f256d16e4a5b36c5fb5cfa44d4bc8df8d895201be3cf0604b4314eb474dd436"
+        },
+        {
+          "path": "packages/jarvis_runtime/cancellation.py",
+          "before_sha256": "45a2dab7ee2af234a04b1ba869b097bfcae4421bb5230b94b7442a0206c2ba64",
+          "after_sha256": "014e58957acf1b827d32f7319901235f5e5414babb5d8f9ee8b8e252c8e6c281"
+        },
+        {
+          "path": "packages/adapters/codex_app_server/mcp_wiring.py",
+          "before_sha256": "3e7e1bd42158cdbcc60b793f36cca1dbdbcd1bedbb33e1167c208296e1025e2e",
+          "after_sha256": "3f0574527d3e7b1ab5aec351042ad2fad8974d3afe62ec4e52334f6514443ac4"
+        }
+      ],
+      "git_apply_check_and_byte_exact_result": true
+    },
+    {
+      "file": "WINDOWS-SELECTION-REFERENCE.patch",
+      "sha256": "1a9509b2571f19ca49e9932ed3315cb24854557748cdbbc279912e60f7425091",
+      "changed_files": [
+        {
+          "path": "packages/jarvis_runtime/jarvis_native_task_launcher.py",
+          "before_sha256": "1e655e343dfad4a7d7d2cb51e376a8539d6c0cb6da29f60e583962d0a417e0c0",
+          "after_sha256": "59a20d51bfb5ddd6a5e43b6a9e1da3c3a89213575d54437fdf66f480e882bd97"
+        }
+      ],
+      "git_apply_check_and_byte_exact_result": true
+    },
+    {
+      "file": "WINDOWS-HTTP-REFERENCE.patch",
+      "sha256": "f636616eff27b32f4edda97f66d3792c242c0254c913ea475132bbb9de93be0f",
+      "changed_files": [
+        {
+          "path": "packages/jarvis_mcp/server.py",
+          "before_sha256": "5427204ee405af2df1578786b862497e8810389a792612c0450a8f05bb463d0a",
+          "after_sha256": "45eb5c0644e89f6ff2f5cad9ebc51de592febc4370c968fe08f6cec8843a2cd3"
+        }
+      ],
+      "git_apply_check_and_byte_exact_result": true
+    }
+  ],
+  "scope": "Code-only integration handoff; no operational logs, sessions, local paths, configuration, credentials, or customer data.",
+  "TaskA_summary": [
+    "Serialize alias admission, cancellation and final commit on the existing stable thread boundary; retain commit-before-cancel uncertainty.",
+    "Resolve implicit Hold id before immutable request comparison, preserve exact request replay and reject conflicting declaration without mutation.",
+    "Route Linux owned dispatch through the existing guarded Holder contract, preserving exact native terminal outcome and model/effort/input intent.",
+    "Revision1 additionally closes stop/resume overwrite, evidence-backed legacy recovered-resume compatibility and unrelated-thread gate contention findings."
+  ],
+  "reference_patch_policy": "Windows selection and HTTP are reference-only. Linux owner must verify common ancestry and native/platform semantics before integration; never replace Linux launcher with Windows source.",
+  "excluded": "Canonical tests, private review packets, raw engineering logs and formal receipts are excluded from this public handoff.",
+  "release_gate": "Not a release or acceptance. Linux fallback integration, final 0.2.6 version metadata, narrow independent review and original full Jarvistest remain required. Existing main, jarvis-dot and tags remain unchanged."
+}

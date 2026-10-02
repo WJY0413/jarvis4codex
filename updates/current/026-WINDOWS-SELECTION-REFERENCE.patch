@@ -1,0 +1,516 @@
+diff --git a/packages/jarvis_runtime/jarvis_native_task_launcher.py b/packages/jarvis_runtime/jarvis_native_task_launcher.py
+--- a/packages/jarvis_runtime/jarvis_native_task_launcher.py
++++ b/packages/jarvis_runtime/jarvis_native_task_launcher.py
+@@ -4,6 +4,8 @@
+ from __future__ import annotations
+ 
+ import argparse
++from collections import OrderedDict
++from dataclasses import dataclass
+ import hashlib
+ import json
+ import logging
+@@ -45,6 +47,7 @@
+ DEFAULT_CONFIG_PATH = DEFAULT_ROOT / "native_task_launcher.config.json"
+ ORIGINS = {"cooper_direct", "jarvis_confirmed", "worker_delegated"}
+ REASONING_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh"}
++_THREAD_CWD_CACHE_LIMIT = 128
+ TERMINAL_RESULT_STATUSES = {
+     "created",
+     "partial",
+@@ -74,15 +77,63 @@
+ 
+ 
+ class NativeTaskCreationError(NativeTaskError):
+-    def __init__(self, message: str, *, thread_id: str | None = None):
++    def __init__(self, message: str, *, thread_id: str | None = None, cause: Exception | None = None):
+         super().__init__(message)
+         self.thread_id = thread_id
++        if cause is not None and isinstance(cause, _SelectionError):
++            self.code = cause.code
++            self.selection_evidence = cause.selection_evidence
+ 
+ 
+ class HostContextRequiredError(NativeTaskError):
+     """The App Server was launched from a context that cannot own Codex state."""
+ 
+     code = "JARVIS_HOST_CONTEXT_REQUIRED"
++
++
++class _SelectionError(NativeTaskError):
++    """Safe selection evidence; never include raw config, error data or stderr."""
++
++    code = "JARVIS_SELECTION_ERROR"
++
++    def __init__(self, message: str, **evidence: Any):
++        super().__init__(message)
++        self.selection_evidence = evidence
++
++
++def _selection_value(value: Any, field: str) -> str | None:
++    if value is None:
++        return None
++    if not isinstance(value, str) or not value.strip():
++        raise _SelectionError(f"invalid selection field: {field}", stage="validation", field=field)
++    return value.strip()
++
++
++@dataclass(frozen=True)
++class _NativeSelection:
++    model: str
++    reasoning_effort: str | None = None
++    service_tier: str | None = None
++    model_source: str = "request"
++    effort_source: str = "native_inherited"
++    tier_source: str = "native_inherited"
++    catalog_status: str = "not_read"
++    catalog_default: str | None = None
++    config_cwd: str | None = None
++
++    def evidence(self) -> dict[str, Any]:
++        return {
++            "model": self.model, "reasoning_effort": self.reasoning_effort,
++            "service_tier": self.service_tier,
++            "sources": {"model": self.model_source, "reasoning_effort": self.effort_source,
++                        "service_tier": self.tier_source},
++            "catalog_status": self.catalog_status, "catalog_default": self.catalog_default,
++            "config_cwd": self.config_cwd,
++            "config_catalog_mismatch": (
++                self.model_source.startswith("config/read") and self.catalog_default != self.model
++                if self.catalog_default is not None else None
++            ),
++        }
+ 
+ 
+ def _background_subprocess_kwargs() -> dict[str, Any]:
+@@ -206,6 +257,14 @@
+         )
+         self.codex_cli = str(raw.get("codex_cli") or "auto")
+         self.profile = str(raw.get("profile") or "").strip()
++        selection = raw.get("instance_selection", {})
++        selection_fields = {"model", "model_reasoning_effort", "service_tier"}
++        if not isinstance(selection, dict) or set(selection) - selection_fields:
++            raise NativeTaskError("instance_selection must contain only model, model_reasoning_effort or service_tier")
++        self.instance_selection = {
++            key: value for key, raw_value in selection.items()
++            if (value := _selection_value(raw_value, key)) is not None
++        }
+         connection = raw.get("jarvis_connection") or {}
+         if not isinstance(connection, dict):
+             raise NativeTaskError("jarvis_connection must be an object")
+@@ -838,10 +897,12 @@
+         self._request_id = 0
+         self._write_lock = threading.Lock()
+         self.initialize_result: dict[str, Any] | None = None
++        self._thread_cwds: OrderedDict[str, str] = OrderedDict()
+ 
+     def start(self) -> dict[str, Any]:
+         if self.process and self.process.poll() is None:
+             return self.initialize_result or {}
++        self._thread_cwds.clear()
+         env = os.environ.copy()
+         env["PYTHONUTF8"] = "1"
+         # The launcher may itself run under a sandboxed controller process.
+@@ -850,6 +911,9 @@
+         if self.config.expected_codex_home:
+             env["CODEX_HOME"] = str(self.config.expected_codex_home)
+         command = [*self.cli_command]
++        for key, value in getattr(self.config, "instance_selection", {}).items():
++            # Literal argv entries, not a shell or arbitrary runtime configuration.
++            command.extend(["-c", f"{key}={json.dumps(value, ensure_ascii=False)}"])
+         base_url = getattr(self.config, "connection_base_url_override", None)
+         if base_url:
+             command.extend(["-c", f"openai_base_url={base_url}"])
+@@ -906,6 +970,12 @@
+                 f"Codex home mismatch: expected {expected!r}, observed {codex_home!r}"
+             )
+         self.initialize_result = result
++        if getattr(self.config, "instance_selection", {}):
++            try:
++                self._effective_selection()
++            except Exception:
++                self.close()
++                raise
+         return result
+ 
+     def _read_stdout(self) -> None:
+@@ -968,6 +1038,14 @@
+                     deferred.append(item)
+                     continue
+                 if "error" in item:
++                    if method == "config/read":
++                        error = item["error"]
++                        code = error.get("code") if isinstance(error, dict) else None
++                        code = code if isinstance(code, int) else None
++                        raise _SelectionError(
++                            f"app-server config/read failed (rpc_id={request_id}, code={code})",
++                            stage="config/read", rpc_id=request_id, error_code=code,
++                        )
+                     raise NativeTaskError(
+                         f"app-server {method} failed: "
+                         + json.dumps(item["error"], ensure_ascii=False)
+@@ -977,8 +1055,20 @@
+         finally:
+             for item in deferred:
+                 self.response_queue.put(item)
++        if method == "config/read":
++            raise _SelectionError(
++                f"app-server config/read timed out (rpc_id={request_id})",
++                stage="config/read", rpc_id=request_id, error_code="timeout",
++            )
+         tail = "\n".join(self.stderr_lines[-10:])
+-        raise NativeTaskError(f"app-server {method} timed out; stderr={tail}")
++        stderr_evidence = {
++            "lines": len(self.stderr_lines),
++            "sha256": hashlib.sha256(tail.encode("utf-8")).hexdigest(),
++            "diagnostics": [marker for marker in (
++                "failed to initialize sqlite state runtime", "failed to clean up stale arg0 temp dirs",
++            ) if marker in tail],
++        }
++        raise NativeTaskError(f"app-server {method} timed out; stderr={json.dumps(stderr_evidence)}")
+ 
+     def probe(self) -> dict[str, Any]:
+         initialized = self.start()
+@@ -1007,27 +1097,115 @@
+ 
+     def select_model(self, requested: str | None = None) -> str:
+         if requested:
+-            # Explicit IDs belong to the selected upstream; CLI discovery can
+-            # be stale or unavailable. Retain initialization, never substitute.
++            # Keep the existing explicit-ID-only API, including role-bounded use.
+             self.start()
+             return requested
+-        models = self.available_models()
+-        supported: dict[str, dict[str, Any]] = {}
+-        for item in models:
+-            model_id = str(item.get("id") or item.get("model") or "").strip()
+-            if model_id:
+-                supported[model_id] = item
+-        if not supported:
+-            raise NativeTaskError("app-server model/list returned no supported models")
+-        default = next(
+-            (
+-                model_id
+-                for model_id, item in supported.items()
+-                if item.get("isDefault") is True
+-            ),
+-            None,
+-        )
+-        return default or next(iter(supported))
++        return self._resolve_selection(requested).model
++
++    def _remember_thread_cwd(
++        self, response: dict[str, Any], thread_id: str, *, require_current: bool = False,
++    ) -> None:
++        """Retain only the exact thread's native working directory, never its history."""
++        self._thread_cwds.pop(thread_id, None)
++        thread = response.get("thread")
++        if not isinstance(thread, dict) or thread.get("id") != thread_id:
++            raise _SelectionError("invalid thread selection context: thread.id",
++                                  stage="thread_context", field="thread.id")
++        if require_current and "cwd" not in response:
++            raise _SelectionError("thread selection context is missing current cwd",
++                                  stage="thread_context", field="cwd")
++        # Start/resume expose the current context at the top level. Thread.cwd
++        # is the captured directory and is also available from metadata reads.
++        cwd = response["cwd"] if "cwd" in response else thread.get("cwd")
++        if cwd is None and "cwd" not in response and "cwd" not in thread:
++            return
++        if not isinstance(cwd, str) or not cwd or not Path(cwd).is_absolute():
++            raise _SelectionError("invalid thread selection context: cwd",
++                                  stage="thread_context", field="cwd")
++        self._thread_cwds[thread_id] = cwd
++        if len(self._thread_cwds) > _THREAD_CWD_CACHE_LIMIT:
++            self._thread_cwds.popitem(last=False)
++
++    def _selection_cwd(self, thread_id: str) -> str:
++        if thread_id not in self._thread_cwds:
++            # thread/read exposes captured cwd, which may differ from the live
++            # context after a resume. Reattach this exact thread without history
++            # or overrides and require the current native directory instead.
++            response = self.request("thread/resume", {"threadId": thread_id, "excludeTurns": True})
++            self._remember_thread_cwd(response, thread_id, require_current=True)
++        cwd = self._thread_cwds.get(thread_id)
++        if cwd is None:
++            raise _SelectionError("thread selection context is missing cwd",
++                                  stage="thread_context", field="cwd")
++        self._thread_cwds.move_to_end(thread_id)
++        return cwd
++
++    def _effective_selection(self, cwd: str | None = None) -> tuple[dict[str, str | None], dict[str, str]]:
++        """Project one real response immediately; do not retain unrelated values."""
++        params: dict[str, Any] = {"includeLayers": False}
++        if cwd is not None:
++            params["cwd"] = cwd
++        response = self.request("config/read", params)
++        config, origins = response.get("config"), response.get("origins")
++        if not isinstance(config, dict) or not isinstance(origins, dict):
++            raise _SelectionError("invalid config/read selection response", stage="config/read", error_code="invalid_response")
++        fields = ("model", "model_reasoning_effort", "service_tier")
++        selected = {key: _selection_value(config.get(key), key) for key in fields}
++        sources = {}
++        for key in fields:
++            origin = origins.get(key)
++            name = origin.get("name") if isinstance(origin, dict) else None
++            kind = name.get("type") if isinstance(name, dict) else None
++            sources[key] = "config/read:" + (kind if kind in {"sessionFlags", "user", "system", "project", "managed"} else "effective")
++        for key, expected in getattr(self.config, "instance_selection", {}).items():
++            if selected[key] != expected:
++                raise _SelectionError("instance selection not confirmed by config/read: " + key,
++                                      stage="instance_verification", field=key, error_code="mismatch")
++        return selected, sources
++
++    def _resolve_selection(
++        self, requested_model: str | None = None, requested_effort: str | None = None,
++        *, requested_tier: str | None = None, cwd: str | None = None,
++        thread_id: str | None = None,
++    ) -> _NativeSelection:
++        self.start()
++        if requested_model and requested_effort is not None and requested_tier is not None:
++            return _NativeSelection(requested_model, requested_effort, requested_tier,
++                                    effort_source="request", tier_source="request")
++        if thread_id is not None:
++            cwd = self._selection_cwd(thread_id)
++        effective, sources = self._effective_selection(cwd)
++        model = requested_model or effective["model"]
++        model_source = "request" if requested_model else sources["model"]
++        catalog_default = None
++        catalog_status = "not_read"
++        ids = []
++        if not requested_model:
++            catalog_status = "read"
++            try:
++                models = self.available_models()
++                ids = [str(item.get("id") or item.get("model") or "").strip() for item in models]
++                catalog_default = next((model_id for model_id, item in zip(ids, models)
++                                        if model_id and item.get("isDefault") is True), None)
++            except NativeTaskError:
++                if model is None:
++                    raise
++                # Diagnosis may be unavailable; a configured ID is never substituted.
++                catalog_status = "unavailable"
++        if model is None:
++            model = catalog_default or next((value for value in ids if value), None)
++            if model is None:
++                raise _SelectionError("app-server model/list returned no supported models",
++                                      stage="catalog_fallback", error_code="empty_catalog")
++            model_source = "model/list:default" if catalog_default else "model/list:first"
++        effort = requested_effort if requested_effort is not None else effective["model_reasoning_effort"]
++        tier = requested_tier if requested_tier is not None else effective["service_tier"]
++        return _NativeSelection(
++            model, effort, tier, model_source,
++            "request" if requested_effort is not None else sources["model_reasoning_effort"] if effort is not None else "native_inherited",
++            "request" if requested_tier is not None else sources["service_tier"] if tier is not None else "native_inherited",
++            catalog_status, catalog_default, cwd,
++        )
+ 
+     def start_turn(
+         self,
+@@ -1037,14 +1215,17 @@
+         client_user_message_id: str,
+         model: str | None = None,
+         reasoning_effort: str | None = None,
++        service_tier: str | None = None,
+     ) -> dict[str, Any]:
+-        selected_model = self.select_model(model)
++        selection = self._resolve_selection(model, reasoning_effort, requested_tier=service_tier,
++                                            thread_id=thread_id)
+         return self._start_turn_with_model(
+             thread_id,
+             prompt,
+             client_user_message_id=client_user_message_id,
+-            selected_model=selected_model,
+-            selected_effort=reasoning_effort,
++            selected_model=selection.model,
++            selected_effort=selection.reasoning_effort,
++            selection=selection,
+         )
+ 
+     def start_turn_async(
+@@ -1055,6 +1236,7 @@
+         client_user_message_id: str,
+         model: str | None = None,
+         reasoning_effort: str | None = None,
++        service_tier: str | None = None,
+         input_binding: Mapping[str, Any] | None = None,
+         on_phase: Callable[[str, dict[str, Any]], None] | None = None,
+     ) -> dict[str, Any]:
+@@ -1063,15 +1245,17 @@
+         self.start()
+         _report_phase(on_phase, "app_server_initialized")
+         _report_phase(on_phase, "model_selecting")
+-        selected_model = self.select_model(model)
+-        _report_phase(on_phase, "model_selected", model=selected_model)
++        selection = self._resolve_selection(model, reasoning_effort, requested_tier=service_tier,
++                                            thread_id=thread_id)
++        _report_phase(on_phase, "model_selected", model=selection.model, selection=selection.evidence())
+         _report_phase(on_phase, "turn_starting", thread_id=thread_id)
+         started = self._start_turn(
+             thread_id,
+             append_lane_binding(prompt, input_binding),
+             client_user_message_id=client_user_message_id,
+-            selected_model=selected_model,
+-            selected_effort=reasoning_effort,
++            selected_model=selection.model,
++            selected_effort=selection.reasoning_effort,
++            selection=selection,
+         )
+         _report_phase(on_phase, "turn_started", thread_id=thread_id, turn_id=str(started["turn_id"]))
+         return started
+@@ -1084,13 +1268,15 @@
+         client_user_message_id: str,
+         model: str | None = None,
+         reasoning_effort: str | None = None,
++        service_tier: str | None = None,
+         input_binding: Mapping[str, Any] | None = None,
+         on_phase: Callable[[str, dict[str, Any]], None] | None = None,
+     ) -> dict[str, Any]:
+         """Reattach one durable thread in this App Server before starting its turn."""
+         self.start()
+         _report_phase(on_phase, "thread_resuming", thread_id=thread_id)
+-        self.request("thread/resume", {"threadId": thread_id})
++        resumed = self.request("thread/resume", {"threadId": thread_id})
++        self._remember_thread_cwd(resumed, thread_id)
+         _report_phase(on_phase, "thread_resumed", thread_id=thread_id)
+         return self.start_turn_async(
+             thread_id,
+@@ -1098,6 +1284,7 @@
+             client_user_message_id=client_user_message_id,
+             model=model,
+             reasoning_effort=reasoning_effort,
++            service_tier=service_tier,
+             input_binding=input_binding,
+             on_phase=on_phase,
+         )
+@@ -1123,24 +1310,27 @@
+             thread_id = str(thread.get("id") or "") if isinstance(thread, dict) else ""
+             if not thread_id:
+                 raise NativeTaskCreationError("thread/start response is missing thread.id")
++            self._remember_thread_cwd(started, thread_id)
+             _report_phase(on_phase, "thread_started", thread_id=thread_id)
+             _report_phase(on_phase, "model_selecting", thread_id=thread_id)
+-            selected_model = self.select_model(request.get("model"))
+-            _report_phase(on_phase, "model_selected", thread_id=thread_id, model=selected_model)
++            selection = self._resolve_selection(request.get("model"), request.get("reasoning_effort"),
++                                                requested_tier=request.get("service_tier"), thread_id=thread_id)
++            _report_phase(on_phase, "model_selected", thread_id=thread_id, model=selection.model, selection=selection.evidence())
+             _report_phase(on_phase, "turn_starting", thread_id=thread_id)
+             created = self._start_turn(
+                 thread_id,
+                 append_lane_binding(prompt, request.get("input_binding")),
+                 client_user_message_id=request_id,
+-                selected_model=selected_model,
+-                selected_effort=request.get("reasoning_effort"),
++                selected_model=selection.model,
++                selected_effort=selection.reasoning_effort,
++                selection=selection,
+             )
+             _report_phase(on_phase, "turn_started", thread_id=thread_id, turn_id=str(created["turn_id"]))
+             return {**created, "thread_id": thread_id, "title": title}
+         except NativeTaskCreationError:
+             raise
+         except Exception as exc:
+-            raise NativeTaskCreationError(str(exc), thread_id=locals().get("thread_id")) from exc
++            raise NativeTaskCreationError(str(exc), thread_id=locals().get("thread_id"), cause=exc) from exc
+ 
+     def _start_turn_with_model(
+         self,
+@@ -1150,6 +1340,7 @@
+         client_user_message_id: str,
+         selected_model: str,
+         selected_effort: str | None = None,
++        selection: _NativeSelection | None = None,
+     ) -> dict[str, Any]:
+         started = self._start_turn(
+             thread_id,
+@@ -1157,6 +1348,7 @@
+             client_user_message_id=client_user_message_id,
+             selected_model=selected_model,
+             selected_effort=selected_effort,
++            selection=selection,
+         )
+         turn_id = str(started["turn_id"])
+         completed = self.wait_for_turn_terminal(thread_id, turn_id)
+@@ -1183,6 +1375,7 @@
+         client_user_message_id: str,
+         selected_model: str,
+         selected_effort: str | None = None,
++        selection: _NativeSelection | None = None,
+     ) -> dict[str, Any]:
+         turn_params: dict[str, Any] = {
+             "threadId": thread_id,
+@@ -1192,6 +1385,14 @@
+         }
+         if selected_effort is not None:
+             turn_params["effort"] = selected_effort
++        if selection is not None and selection.service_tier is not None:
++            # Supported one-turn override; do not change the durable thread tier.
++            turn_params["serviceTierForTurn"] = selection.service_tier
++        evidence = (selection or _NativeSelection(
++            selected_model, selected_effort,
++            effort_source="request" if selected_effort is not None else "native_inherited",
++        )).evidence()
++        logging.getLogger(__name__).info("Native selection: %s", json.dumps(evidence, ensure_ascii=False))
+         turn_started = self.request(
+             "turn/start",
+             turn_params,
+@@ -1209,6 +1410,7 @@
+             "turn_status": str(turn.get("status") or "inProgress"),
+             "model": selected_model,
+             "reasoning_effort": selected_effort,
++            "selection_evidence": evidence,
+         }
+ 
+     def wait_for_turn_readback(self, thread_id: str, turn_id: str, *, require_final_answer: bool = False) -> str:
+@@ -1270,6 +1472,7 @@
+         client_user_message_id: str,
+         model: str | None = None,
+         reasoning_effort: str | None = None,
++        service_tier: str | None = None,
+     ) -> dict[str, Any]:
+         self.start()
+         try:
+@@ -1282,23 +1485,26 @@
+                     + 60
+                 ),
+             ):
+-                selected_model = self.select_model(model or request.get("model"))
+-                self.request("thread/resume", {"threadId": thread_id})
++                resumed = self.request("thread/resume", {"threadId": thread_id})
++                self._remember_thread_cwd(resumed, thread_id)
++                selection = self._resolve_selection(
++                    model or request.get("model"),
++                    reasoning_effort if reasoning_effort is not None else request.get("reasoning_effort"),
++                    requested_tier=service_tier if service_tier is not None else request.get("service_tier"),
++                    thread_id=thread_id,
++                )
+                 return self._start_turn_with_model(
+                     thread_id,
+                     append_lane_binding(request["prompt"], request.get("input_binding")),
+                     client_user_message_id=client_user_message_id,
+-                    selected_model=selected_model,
+-                    selected_effort=(
+-                        reasoning_effort
+-                        if reasoning_effort is not None
+-                        else request.get("reasoning_effort")
+-                    ),
++                    selected_model=selection.model,
++                    selected_effort=selection.reasoning_effort,
++                    selection=selection,
+                 )
+         except Exception as exc:
+             if isinstance(exc, NativeTaskCreationError):
+                 raise
+-            raise NativeTaskCreationError(str(exc), thread_id=thread_id) from exc
++            raise NativeTaskCreationError(str(exc), thread_id=thread_id, cause=exc) from exc
+ 
+     def wait_for_turn_terminal(
+         self,
+@@ -1349,6 +1555,7 @@
+         )
+ 
+     def close(self) -> None:
++        self._thread_cwds.clear()
+         process = self.process
+         self.process = None
+         if not process:
