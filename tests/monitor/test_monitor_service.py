@@ -60,5 +60,59 @@ class MonitorServiceTest(unittest.TestCase):
             self.due_now(store,monitor["monitor_id"]); adapter.bot_status="failed"; self.assertEqual(service.run_once()[0]["outcome"],"requires_readback")
             self.assertEqual(store.get(monitor["monitor_id"])["monitor_status"],"REQUIRES_READBACK")
 
+    def test_two_outputs_preserve_prior_terminal_failures_across_restart_without_resending(self):
+        # PKG-2: Astra's FAILED/QUEUED -> FAILED/DELIVERED reproduction.
+        for first_status in ("failed", "expired", "delivered"):
+            with self.subTest(first_status=first_status), tempfile.TemporaryDirectory() as temp:
+                class TwoOutputs(FakeAdapter):
+                    def __init__(self):
+                        super().__init__()
+                        self.statuses = {"a": first_status, "b": "queued"}
+                    def enqueue_bot_notification(self, **kwargs):
+                        self.notifications.append(kwargs)
+                        return {"outbox_id": "a" if len(self.notifications) == 1 else "b"}
+                    def read_bot_delivery(self, outbox_id): return {"delivery_status": self.statuses[outbox_id]}
+                adapter = TwoOutputs()
+                store = MonitorStore(Path(temp) / "monitor.sqlite")
+                mid = store.start({"observed_thread_id": "child-1", "outputs": [{"type": "notify_jarvis_bot"}, {"type": "notify_jarvis_bot"}]})["monitor_id"]
+                service = MonitorService(store, adapter)
+                service.run_once(); self.due_now(store, mid)
+                adapter.state = {"id": "child-1", "status": "idle", "turns": [{"id": "turn-1", "status": "completed"}]}
+                service.run_once(); self.due_now(store, mid)
+                self.assertEqual(service.run_once()[0]["outcome"], "output_pending")
+                adapter.statuses["b"] = "delivered"
+                store = MonitorStore(store.db_path)
+                self.due_now(store, mid)
+                expected = "COMPLETED" if first_status == "delivered" else "REQUIRES_READBACK"
+                self.assertEqual(MonitorService(store, adapter).run_once()[0]["outcome"], expected.lower())
+                self.assertEqual(store.get(mid)["monitor_status"], expected)
+                self.assertEqual(len(adapter.notifications), 2)
+                self.assertEqual(adapter.resumes, [])
+                self.due_now(store, mid)
+                self.assertEqual(MonitorService(store, adapter).run_once(), [])
+                self.assertEqual(len(adapter.notifications), 2)
+
+    def test_persisted_unknown_pending_or_missing_output_is_not_success(self):
+        # PKG-2: old uncertain/incomplete delivery evidence cannot mean COMPLETED.
+        for uncertain in ("PENDING", "UNKNOWN", "COMPLETED", None):
+            with self.subTest(uncertain=uncertain), tempfile.TemporaryDirectory() as temp:
+                adapter = FakeAdapter()
+                store = MonitorStore(Path(temp) / "monitor.sqlite")
+                mid = store.start({"observed_thread_id": "child-1", "outputs": [{"type": "notify_jarvis_bot"}, {"type": "notify_jarvis_bot"}]})["monitor_id"]
+                service = MonitorService(store, adapter)
+                service.run_once(); self.due_now(store, mid)
+                adapter.state = {"id": "child-1", "status": "idle", "turns": [{"id": "turn-1", "status": "completed"}]}
+                service.run_once()
+                with store.session() as db:
+                    db.execute("UPDATE monitor_deliveries SET delivery_status='DELIVERED' WHERE output_index=0")
+                    if uncertain is None:
+                        db.execute("DELETE FROM monitor_deliveries WHERE output_index=1")
+                    else:
+                        db.execute("UPDATE monitor_deliveries SET delivery_status=? WHERE output_index=1", (uncertain,))
+                self.due_now(store, mid)
+                self.assertEqual(service.run_once()[0]["outcome"], "requires_readback")
+                self.assertEqual(store.get(mid)["monitor_status"], "REQUIRES_READBACK")
+                self.assertEqual(len(adapter.notifications), 2)
+
 
 if __name__ == "__main__": unittest.main()

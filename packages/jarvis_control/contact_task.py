@@ -27,7 +27,7 @@ from jarvis_schema import contact_v25 as schema_adapter
 from jarvis_runtime.coo_dispatcher_store import ProcessLock
 from jarvis_runtime.jarvis_native_task_launcher import AppServerClient, NativeTaskLauncherConfig
 
-BUILD = "Jarvis dot 0.2.5+dot.5-candidate"
+BUILD = "Jarvis 0.2.6 Linux (dot.1)"
 ALLOWED_ITEMS = {"userMessage", "agentMessage", "reasoning", "contextCompaction", "webSearch", "dynamicToolCall"}
 
 

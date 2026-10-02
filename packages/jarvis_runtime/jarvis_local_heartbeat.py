@@ -9,7 +9,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from contextlib import contextmanager
+from contextlib import contextmanager, ExitStack
 import json
 import os
 from pathlib import Path
@@ -17,6 +17,7 @@ import sqlite3
 import time
 import uuid
 from typing import Any, Callable, Mapping
+from jarvis_codex_bridge.journal import ClaimBusy, file_lock
 
 
 ACTIVE = "ACTIVE"
@@ -254,18 +255,27 @@ class HeartbeatService:
         return {**evidence, **computer_time(), **self.store.summary()}
 
     def run_once(self) -> dict[str, Any]:
-        results = []
-        for heartbeat in self.store.claim_due():
-            receipt = self.function_runner(heartbeat["function_name"], json.loads(heartbeat["arguments_json"]), {
-                "heartbeat_id": heartbeat["heartbeat_id"],
-                "run_number": int(heartbeat["run_count"]) + 1,
-                **computer_time(),
-            })
-            results.append(self.store.record(heartbeat, receipt))
-        health = {"status": "tick_completed", "pid": os.getpid(), "observed_at": _now().isoformat(),
-                  **computer_time(), **self.store.summary()}
-        self._publish_health(health)
-        return {"results": results, "health": health}
+        # Every entrypoint shares a kernel-held lock for the actual store DB.
+        # It spans claim -> function -> record; an interval cannot steal ownership.
+        db_path = self.store.config.db_path.resolve()
+        with ExitStack() as owner:
+            try:
+                owner.enter_context(file_lock(db_path.with_name(db_path.name + ".execution.lock"), blocking=False))
+            except ClaimBusy:
+                return {"status": "busy", "reason": "another heartbeat tick owns this database",
+                        "results": [], "health": self.health()}
+            results = []
+            for heartbeat in self.store.claim_due():
+                receipt = self.function_runner(heartbeat["function_name"], json.loads(heartbeat["arguments_json"]), {
+                    "heartbeat_id": heartbeat["heartbeat_id"],
+                    "run_number": int(heartbeat["run_count"]) + 1,
+                    **computer_time(),
+                })
+                results.append(self.store.record(heartbeat, receipt))
+            health = {"status": "tick_completed", "pid": os.getpid(), "observed_at": _now().isoformat(),
+                      **computer_time(), **self.store.summary()}
+            self._publish_health(health)
+            return {"results": results, "health": health}
 
     def _publish_health(self, health: Mapping[str, Any]) -> None:
         path = self.config.health_path

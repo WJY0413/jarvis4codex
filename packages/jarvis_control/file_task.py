@@ -25,7 +25,7 @@ from jsonschema import Draft202012Validator
 from jarvis_runtime.jarvis_native_task_launcher import AppServerClient, NativeTaskLauncherConfig, NativeTaskError
 from jarvis_runtime.linux_cloud import config_path
 
-BUILD = "Jarvis dot 0.2.5+dot.5-candidate"
+BUILD = "Jarvis 0.2.6 Linux (dot.1)"
 TEXT_ITEMS = {"userMessage", "agentMessage", "reasoning", "contextCompaction"}
 
 
@@ -130,6 +130,8 @@ class FileTaskClient(AppServerClient):
         method = value.get("method", "")
         allowed = {"initialize", "initialized", "fs/readFile", "fs/writeFile"} if self.role == "files" else {
             "initialize", "initialized", "thread/start", "thread/resume", "thread/read", "turn/start"}
+        if self.role == "model":
+            allowed.add("thread/items/list")
         if method not in allowed:
             raise FileTaskError("RPC method not allowed for this client role")
         self._record("sent", value)

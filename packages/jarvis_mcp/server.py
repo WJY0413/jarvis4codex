@@ -24,7 +24,7 @@ class JarvisMcpServer:
         self.mcp = MCPServer(
             "jarvis-control",
             title="Jarvis dot",
-            version="0.2.5",
+            version="0.2.6",
             instructions=(
                 "Use jarvis_read before a state-changing call when you need capability or thread context. "
                 "Use jarvis_hold for a managed lifecycle: Hold executes turns and Monitor issues a verified "
@@ -42,17 +42,90 @@ class JarvisMcpServer:
 
     def run_http(self, *, port: int) -> None:
         """Explicit single-process, loopback-only service; no per-client sessions."""
+        import logging
+
+        import anyio
+        import uvicorn
+        from uvicorn.main import STARTUP_FAILURE
+
         if not 1 <= port <= 65535:
             raise ValueError("HTTP port must be between 1 and 65535")
-        self.mcp.run(
-            "streamable-http", host="127.0.0.1", port=port,
-            stateless_http=True, json_response=True,
-            transport_security=TransportSecuritySettings(
-                enable_dns_rebinding_protection=True,
-                allowed_hosts=[f"127.0.0.1:{port}"],
-                allowed_origins=[f"http://127.0.0.1:{port}"],
-            ),
-        )
+        logger = logging.getLogger("uvicorn.error")
+
+        class ListenerAwareServer(uvicorn.Server):
+            listener_failed = False
+
+            async def on_tick(self, counter: int) -> bool:
+                if await super().on_tick(counter):
+                    return True
+                # Proactor accept errors can close the native socket without
+                # updating asyncio.Server.is_serving() or ending serve().
+                if not self.servers or any(
+                    not listener.is_serving() or not listener.sockets
+                    or any(sock.fileno() == -1 for sock in listener.sockets)
+                    for listener in self.servers
+                ):
+                    self.listener_failed = True
+                    self.should_exit = True
+                    logger.critical(
+                        "Jarvis HTTP listener unhealthy on 127.0.0.1:%s; "
+                        "draining wrapper requests before recovery", port,
+                    )
+                    return True
+                return False
+
+        async def serve() -> None:
+            # A process-lifetime budget also bounds faults after a successful
+            # rebuild. Never reset it into an unbounded restart loop.
+            retry_delays = (0.5, 1.0, 2.0)
+            retries = 0
+            while True:
+                # The SDK session manager is single-use. Rebuild only after
+                # the preceding serve and lifespan cleanup have completed.
+                app = self.mcp.streamable_http_app(
+                    host="127.0.0.1",
+                    stateless_http=True, json_response=True,
+                    transport_security=TransportSecuritySettings(
+                        enable_dns_rebinding_protection=True,
+                        allowed_hosts=[f"127.0.0.1:{port}"],
+                        allowed_origins=[f"http://127.0.0.1:{port}"],
+                    ),
+                )
+                server = ListenerAwareServer(uvicorn.Config(
+                    app, host="127.0.0.1", port=port,
+                    log_level=self.mcp.settings.log_level.lower(),
+                    timeout_graceful_shutdown=30,
+                ))
+                bind_failed = False
+                try:
+                    await server.serve()
+                except SystemExit as exc:
+                    # This exit also covers SDK startup failures. Check lifespan
+                    # below before treating it as a completed bind failure.
+                    if retries == 0 or exc.code != STARTUP_FAILURE:
+                        raise
+                    bind_failed = True
+                lifespan = server.lifespan
+                if lifespan.startup_failed or lifespan.shutdown_failed or lifespan.error_occurred:
+                    phase = "startup" if lifespan.startup_failed else "cleanup"
+                    context = "recovery " if retries else ""
+                    reason = f"{context}lifespan {phase} failed"
+                    logger.critical("Jarvis HTTP listener unhealthy on 127.0.0.1:%s; %s", port, reason)
+                    raise RuntimeError(f"Jarvis HTTP listener unhealthy on 127.0.0.1:{port}; {reason}")
+                if bind_failed:
+                    logger.error("Jarvis HTTP recovery attempt %s failed to bind 127.0.0.1:%s", retries, port)
+                elif not server.listener_failed:
+                    return
+                if retries == len(retry_delays):
+                    logger.critical("Jarvis HTTP listener unhealthy on 127.0.0.1:%s; recovery budget exhausted", port)
+                    raise RuntimeError(f"Jarvis HTTP listener unhealthy on 127.0.0.1:{port}; recovery budget exhausted")
+                delay = retry_delays[retries]
+                retries += 1
+                logger.warning("Jarvis HTTP recovery attempt %s/%s after %ss on 127.0.0.1:%s",
+                               retries, len(retry_delays), delay, port)
+                await anyio.sleep(delay)
+
+        anyio.run(serve)
 
     def _invoke(self, method: str, **kwargs: Any) -> dict[str, Any]:
         # One adapter call at a time protects shared request/response queues and
@@ -228,7 +301,7 @@ class JarvisMcpServer:
 
         @self.mcp.tool(
             name="jarvis_read",
-            description="Read Jarvis capability availability or a known existing task. This tool does not change state.",
+            description="Read Jarvis capability availability or a known existing task. With subject=thread, task_id and turn_id, read fresh exact-turn status/error and a declared final-only item projection with full-scan counts. Omit turn_id for the unchanged full-history thread read. This tool does not change state.",
             annotations=ToolAnnotations(readOnlyHint=True, idempotentHint=True, openWorldHint=False),
         )
         def jarvis_read(

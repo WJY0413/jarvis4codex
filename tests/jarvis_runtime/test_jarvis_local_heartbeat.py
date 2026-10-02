@@ -3,11 +3,14 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 import json
 import os
+from dataclasses import replace
 from pathlib import Path
 import tempfile
 import threading
 import time
 import unittest
+import subprocess
+import sys
 from unittest.mock import patch
 
 from jarvis_local_heartbeat import HeartbeatService, JarvisControlHeartbeat, LocalHeartbeatConfig, LocalHeartbeatStore
@@ -270,6 +273,102 @@ class LocalHeartbeatTest(unittest.TestCase):
         stored = self.store.get(str(heartbeat["heartbeat_id"]))
         self.assertEqual(stored["run_count"], 1)
         self.assertEqual(stored["status"], "COMPLETED")
+
+    def test_shared_db_overlapping_services_have_one_owner_and_one_bounded_run(self):
+        # PKG-3: Astra's nested second tick after one interval, before accounting.
+        now = datetime(2030, 1, 1, tzinfo=timezone.utc)
+        with patch("jarvis_local_heartbeat._now", return_value=now) as clock:
+            self.store.create(self.request())
+            alias = self.config.db_path.with_name(self.config.db_path.name.upper()) if os.name == "nt" else self.config.db_path
+            other = HeartbeatService(replace(self.config, db_path=alias), function_runner=lambda *args: self.fail("busy owner dispatched"))
+            calls, busy = [], []
+            def runner(function, arguments, context):
+                calls.append(dict(context))
+                clock.return_value = now + timedelta(seconds=31)
+                busy.append(other.run_once())
+                self.assertFalse(self.config.health_path.exists())
+                return {"status": "completed"}
+            result = HeartbeatService(self.config, store=self.store, function_runner=runner).run_once()
+            self.assertEqual(busy[0]["status"], "busy")
+            self.assertEqual(busy[0]["results"], [])
+            self.assertEqual([call["run_number"] for call in calls], [1])
+            self.assertEqual(len(result["results"]), 1)
+            stored = self.store.get(str(self.request()["heartbeat_id"]))
+            self.assertEqual((stored["run_count"], stored["status"]), (1, "COMPLETED"))
+            self.assertEqual(other.run_once()["results"], [])
+
+    def test_different_db_services_do_not_block_each_other(self):
+        # PKG-3: execution ownership is scoped to DB identity, never global.
+        config = replace(self.config, db_path=self.config.db_path.with_name("other.sqlite"),
+                         health_path=self.config.health_path.with_name("other-health.json"))
+        other_store = LocalHeartbeatStore(config)
+        self.store.create(self.request()); other_store.create(self.request())
+        calls = []
+        other = HeartbeatService(config, store=other_store,
+            function_runner=lambda *args: calls.append("other") or {"status": "completed"})
+        def runner(*args):
+            calls.append("first")
+            self.assertEqual(len(other.run_once()["results"]), 1)
+            return {"status": "completed"}
+        HeartbeatService(self.config, store=self.store, function_runner=runner).run_once()
+        self.assertEqual(calls, ["first", "other"])
+        for store in (self.store, other_store):
+            self.assertEqual(store.get(str(self.request()["heartbeat_id"]))["run_count"], 1)
+
+    def test_execution_lock_releases_after_runner_exception_and_preserves_failure_accounting(self):
+        # PKG-3: a raised function retains existing semantics and cannot leak owner.
+        now = datetime(2030, 1, 1, tzinfo=timezone.utc)
+        with patch("jarvis_local_heartbeat._now", return_value=now) as clock:
+            self.store.create(self.request())
+            with self.assertRaisesRegex(ValueError, "fake runner failure"):
+                HeartbeatService(self.config, store=self.store,
+                    function_runner=lambda *args: (_ for _ in ()).throw(ValueError("fake runner failure"))).run_once()
+            row = self.store.get(str(self.request()["heartbeat_id"]))
+            self.assertEqual((row["run_count"], row["failure_count"]), (0, 0))
+            clock.return_value = now + timedelta(seconds=31)
+            result = HeartbeatService(self.config, function_runner=lambda *args: {"status": "failed", "error": "fake receipt failure"}).run_once()
+            self.assertEqual(result["results"][0]["outcome"], "function_failed")
+            row = self.store.get(str(self.request()["heartbeat_id"]))
+            self.assertEqual((row["run_count"], row["failure_count"]), (0, 1))
+            clock.return_value = now + timedelta(seconds=62)
+            result = HeartbeatService(self.config, function_runner=lambda *args: {"status": "completed"}).run_once()
+            self.assertEqual(result["results"][0]["outcome"], "function_completed")
+            row = self.store.get(str(self.request()["heartbeat_id"]))
+            self.assertEqual((row["run_count"], row["failure_count"], row["status"]), (1, 0, "COMPLETED"))
+
+    def test_cancel_during_owned_function_is_accounted_without_revival(self):
+        # PKG-3: holding execution ownership must not lock out cancellation writes.
+        self.store.create(self.request())
+        def runner(*args):
+            LocalHeartbeatStore(self.config).cancel(str(self.request()["heartbeat_id"]))
+            return {"status": "completed"}
+        result = HeartbeatService(self.config, store=self.store, function_runner=runner).run_once()
+        row = self.store.get(str(self.request()["heartbeat_id"]))
+        self.assertEqual(result["results"][0]["outcome"], "function_completed")
+        self.assertEqual((row["run_count"], row["status"], row["next_run_epoch"]), (1, "CANCELLED", None))
+        self.assertEqual(HeartbeatService(self.config, function_runner=lambda *args: self.fail("cancelled task dispatched")).run_once()["results"], [])
+
+    def test_shared_db_owner_blocks_another_process_until_record_completes(self):
+        # PKG-3 promises cross-process exclusion, using only synthetic DB/fake actions.
+        self.store.create(self.request())
+        code = """import json, sys
+from pathlib import Path
+from jarvis_local_heartbeat import HeartbeatService, LocalHeartbeatConfig
+def forbidden(*args):
+    raise AssertionError('busy child dispatched a function')
+print(json.dumps(HeartbeatService(LocalHeartbeatConfig.load(Path(sys.argv[1])), function_runner=forbidden).run_once()))
+"""
+        runtime = Path(__import__("jarvis_local_heartbeat").__file__).resolve().parent
+        env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1",
+                   PYTHONPATH=os.pathsep.join((str(runtime.parent), str(runtime))))
+        def runner(*args):
+            process = subprocess.run([sys.executable, "-c", code, str(self.config_path)], env=env,
+                capture_output=True, text=True, timeout=10)
+            self.assertEqual(process.returncode, 0, process.stderr)
+            self.assertEqual(json.loads(process.stdout)["status"], "busy")
+            return {"status": "completed"}
+        HeartbeatService(self.config, store=self.store, function_runner=runner).run_once()
+        self.assertEqual(self.store.get(str(self.request()["heartbeat_id"]))["run_count"], 1)
 
     def test_control_health_returns_computer_clock_and_never_requires_codex(self) -> None:
         control = JarvisControlHeartbeat(self.config_path)

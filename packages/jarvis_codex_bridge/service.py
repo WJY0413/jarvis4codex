@@ -47,6 +47,13 @@ class ExistingThreadBridge:
     def observe_thread(self, thread_id: str) -> ThreadState:
         return self.transport.read_thread(thread_id)
 
+    def observe_turn(self, thread_id: str, turn_id: str) -> dict[str, object]:
+        """Use an optional fresh exact-turn reader; never fall back to history."""
+        reader = getattr(self.transport, "read_turn", None)
+        if not callable(reader):
+            raise NotImplementedError("configured transport has no exact-turn read capability")
+        return reader(thread_id, turn_id)
+
     def read_dispatch(self, request_id: str) -> BridgeReceipt | None:
         return self.journal.find_latest(request_id)
 

@@ -84,6 +84,16 @@ class MonitorStore:
         with self.session() as c: c.execute("UPDATE monitor_deliveries SET delivery_status=?,turn_id=?,outbox_id=?,error=?,updated_at=? WHERE delivery_id=?",(status,values.get("turn_id"),values.get("outbox_id"),values.get("error"),now(),delivery["delivery_id"]))
     def queued_deliveries(self, monitor_id: str):
         with self.session() as c: return [dict(row) for row in c.execute("SELECT * FROM monitor_deliveries WHERE monitor_id=? AND delivery_status='QUEUED'",(monitor_id,))]
+    def output_status(self, monitor: dict[str, object]) -> str:
+        with self.session() as c:
+            deliveries = [dict(row) for row in c.execute("SELECT * FROM monitor_deliveries WHERE monitor_id=?", (monitor["monitor_id"],))]
+        if any(d["delivery_status"] == "QUEUED" for d in deliveries):
+            return "OUTPUT_PENDING"
+        required = set(range(len(monitor["outputs"])))
+        current = {d["output_index"] for d in deliveries if d["fingerprint"] == monitor["last_fingerprint"]}
+        success_states = {"notify_jarvis_bot": "DELIVERED", "resume_thread": "COMPLETED", "resume_source_thread": "COMPLETED"}
+        successful = all(d["delivery_status"] == success_states.get(d["output_type"]) for d in deliveries)
+        return "COMPLETED" if current == required and successful else "REQUIRES_READBACK"
 
 
 class MonitorService:
@@ -93,16 +103,14 @@ class MonitorService:
         for monitor in self.store.due():
             mid=str(monitor["monitor_id"])
             if monitor["monitor_status"] == "OUTPUT_PENDING":
-                failed=False
                 for delivery in self.store.queued_deliveries(mid):
                     readback=self.adapter.read_bot_delivery(str(delivery.get("outbox_id") or ""))
                     status=str(readback.get("delivery_status") or "queued").upper()
                     if status in {"DELIVERED","FAILED","EXPIRED"}:
                         self.store.complete_delivery(delivery,status,error=str(readback.get("error") or "") or None)
-                        failed = failed or status in {"FAILED","EXPIRED"}
-                queued=self.store.queued_deliveries(mid)
-                self.store.status(mid,"OUTPUT_PENDING" if queued else ("REQUIRES_READBACK" if failed else "COMPLETED"))
-                results.append({"monitor_id":mid,"outcome":"output_pending" if queued else ("requires_readback" if failed else "completed")}); continue
+                status=self.store.output_status(monitor)
+                self.store.status(mid,status)
+                results.append({"monitor_id":mid,"outcome":status.lower()}); continue
             if datetime.now(timezone.utc)>=datetime.fromisoformat(str(monitor["expires_at"])): self.store.status(mid,"EXPIRED"); results.append({"monitor_id":mid,"outcome":"expired"}); continue
             try:
                 state=self.adapter.read_thread(str(monitor["observed_thread_id"])); turns=state.get("turns") or []; latest=turns[-1] if isinstance(turns,list) and turns else {}
@@ -113,19 +121,18 @@ class MonitorService:
                 self.store.observation(mid,event,fp,thread,turn_id,turn,int(monitor["interval_seconds"]))
                 if event!="terminal_changed": results.append({"monitor_id":mid,"outcome":event}); continue
                 if turn!="completed": self.store.status(mid,"REQUIRES_READBACK",turn); results.append({"monitor_id":mid,"outcome":"requires_readback"}); continue
-                pending=False
                 for i,output in enumerate(monitor["outputs"]):
                     assert isinstance(output,dict); kind=str(output["type"]); target=(str(output.get("target_thread_id") or "") if kind=="resume_thread" else str(monitor.get("source_thread_id") or "")) if kind.startswith("resume_") else None; client_id=f"monitor:{mid}:{fp[:12]}:{i}" if target else None
                     d=self.store.delivery(monitor,fp,i,output,target,client_id)
-                    if d["delivery_status"]!="PENDING": pending|=d["delivery_status"]=="QUEUED"; continue
+                    if d["delivery_status"]!="PENDING": continue
                     text=str(output.get("user_message_text") or output.get("notification_text") or ("JARVIS_MONITOR_COMPLETED_V1\n"+packed({"monitor_id":mid,"observed_thread_id":monitor["observed_thread_id"],"turn_id":turn_id})))
                     if target:
                         r=self.adapter.resume_thread(target,text,client_user_message_id=str(client_id),source_event_key=str(monitor["source_event_key"]),model=monitor.get("model") if isinstance(monitor.get("model"),str) else None,reasoning_effort=monitor.get("reasoning_effort") if isinstance(monitor.get("reasoning_effort"),str) else None)
                         if r.get("outcome")=="turn_completed":self.store.complete_delivery(d,"COMPLETED",turn_id=str(r.get("turn_id") or "") or None)
                         else:self.store.complete_delivery(d,"FAILED",error=str(r.get("error") or r.get("outcome"))); self.store.status(mid,"FAILED",str(r.get("outcome"))); break
                     else:
-                        r=self.adapter.enqueue_bot_notification(monitor_id=mid,observed_thread_id=str(monitor["observed_thread_id"]),notification_text=text,source_event_key=str(monitor["source_event_key"])); self.store.complete_delivery(d,"QUEUED",outbox_id=str(r.get("outbox_id") or "") or None); pending=True
-                else:self.store.status(mid,"OUTPUT_PENDING" if pending else "COMPLETED")
+                        r=self.adapter.enqueue_bot_notification(monitor_id=mid,observed_thread_id=str(monitor["observed_thread_id"]),notification_text=text,source_event_key=str(monitor["source_event_key"])); self.store.complete_delivery(d,"QUEUED",outbox_id=str(r.get("outbox_id") or "") or None)
+                else:self.store.status(mid,self.store.output_status(self.store.get(mid)))
                 results.append({"monitor_id":mid,"outcome":"terminal_changed"})
             except Exception as exc: self.store.status(mid,"FAILED",str(exc)); results.append({"monitor_id":mid,"outcome":"failed","error":str(exc)})
         return results

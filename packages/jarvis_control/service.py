@@ -469,6 +469,40 @@ class JarvisControl:
         if subject == "thread":
             if not task_id or not task_id.strip():
                 return self._receipt("jarvis_read", "invalid_request", reason="task_id is required for subject=thread")
+            if turn_id is not None:
+                if not isinstance(turn_id, str) or not turn_id.strip():
+                    return self._receipt("jarvis_read", "invalid_request", target_thread_id=task_id,
+                                         reason="a non-empty turn_id is required for exact-turn read")
+                if thread_id is not None and thread_id != task_id:
+                    return self._receipt("jarvis_read", "invalid_request", target_thread_id=task_id,
+                                         turn_id=turn_id, reason="thread_id conflicts with task_id")
+                reader = getattr(self._bridge, "observe_turn", None)
+                if not callable(reader):
+                    return self._receipt("jarvis_read", "unsupported", target_thread_id=task_id,
+                                         turn_id=turn_id, reason="bridge has no exact-turn read capability")
+                try:
+                    data = reader(task_id, turn_id)
+                    turns = data.get("turns") if isinstance(data, dict) else None
+                    if (not isinstance(data, dict) or data.get("thread_id") != task_id
+                            or data.get("turn_id") != turn_id or not isinstance(turns, list)
+                            or len(turns) != 1 or turns[0].get("turn_id") != turn_id
+                            or turns[0].get("items_scan_complete") is not True):
+                        raise RuntimeError("exact-turn readback identity or completeness mismatch")
+                except NotImplementedError as exc:
+                    return self._receipt("jarvis_read", "unsupported", target_thread_id=task_id,
+                                         turn_id=turn_id, reason=str(exc))
+                except Exception as exc:
+                    return self._receipt("jarvis_read", "failed", target_thread_id=task_id,
+                                         turn_id=turn_id, reason=str(exc))
+                return self._receipt(
+                    "jarvis_read", "completed", target_thread_id=task_id, turn_id=turn_id, data=data,
+                    readback={"verified": True,
+                              "native_terminal": turns[0]["status"] in {"completed", "failed", "interrupted"},
+                              "terminal": data.get("execution_status") in
+                                  {"completed", "failed", "interrupted", "cancelled", "canceled", "blocked"},
+                              "final_answer_present": turns[0].get("final_answer_present") is True,
+                              "final_answer_nonempty": turns[0].get("final_answer_nonempty") is True},
+                )
             try:
                 state = self._bridge.observe_thread(task_id)
             except Exception as exc:

@@ -49,7 +49,7 @@ def _loop_root(root: Path, request: dict | None) -> Path | None:
     return path_for(unquote(parts[0]))
 
 
-def dispatch_roots(root: Path, request: dict | None = None) -> list[Path]:
+def _recorded_roots(root: Path, request: dict | None = None) -> list[Path]:
     parent = _loop_root(root, request)
     roots = [parent, root] if parent is not None and parent != root else [root]
     for relative in (request or {}).get("dispatch_ancestors", []):
@@ -62,6 +62,43 @@ def dispatch_roots(root: Path, request: dict | None = None) -> list[Path]:
         if ancestor.is_symlink() or ancestor.parent.is_symlink():
             raise RuntimeError("symlink dispatch ancestor rejected")
         roots.append(ancestor)
+    return roots
+
+
+def _thread_bindings(root: Path, thread_id: str):
+    """Resolve aliases from current and legacy receipts; unknown JSON fails closed."""
+    for name in ("task-holds", "task-monitors"):
+        parent = root.parents[1] / name
+        if parent.is_symlink():
+            raise RuntimeError("symlink state registry rejected")
+        if not parent.is_dir():
+            continue
+        for alias in parent.iterdir():
+            if alias.is_symlink():
+                raise RuntimeError("symlink thread alias rejected")
+            if not alias.is_dir():
+                continue
+            records = {}
+            for filename in ("request.json", "ack.json", "result.json"):
+                path = alias / filename
+                if not os.path.lexists(path):
+                    continue
+                if path.is_symlink():
+                    raise RuntimeError("symlink thread binding rejected")
+                value = json.loads(path.read_text(encoding="utf-8"))
+                if not isinstance(value, dict):
+                    raise RuntimeError("invalid thread binding record")
+                records[filename] = value
+            if any(value.get("thread_id") == thread_id for value in records.values()):
+                yield alias, records.get("request.json", {})
+
+
+def dispatch_roots(root: Path, request: dict | None = None) -> list[Path]:
+    roots = _recorded_roots(root, request)
+    thread_id = (request or {}).get("thread_id")
+    if thread_id:
+        for alias, saved in _thread_bindings(root, thread_id):
+            roots.extend(_recorded_roots(alias, saved))
     return sorted(set(roots), key=lambda value: str(value.absolute()))
 
 
@@ -115,8 +152,59 @@ def _publish_cancellation(root: Path, *, scope: str, subject_id: str, request_id
         temporary.unlink(missing_ok=True)
 
 
+def _thread_gate(root: Path, thread_id: str) -> Path:
+    if not isinstance(thread_id, str) or not thread_id:
+        raise RuntimeError("exact native thread identity required")
+    key = hashlib.sha256(thread_id.encode("utf-8")).hexdigest()
+    return root.parents[1] / (".dispatch-thread-" + key)
+
+
+@contextmanager
+def _thread_guard(root: Path, thread_ids):
+    with ExitStack() as guards:
+        for thread_id in sorted(set(thread_ids)):
+            guards.enter_context(report_guard(_thread_gate(root, thread_id)))
+        yield
+
+
+@contextmanager
+def _hold_guard(root: Path, request: dict | None = None):
+    """Native identities first, then exact Hold/Loop; never wait on request.lock here."""
+    if root.is_symlink() or root.parent.is_symlink():
+        raise RuntimeError("symlink state registry rejected")
+    records = [request or {}]
+    for name in ("request.json", "ack.json", "result.json"):
+        path = root / name
+        if os.path.lexists(path):
+            if path.is_symlink():
+                raise RuntimeError("symlink thread binding rejected")
+            value = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(value, dict):
+                raise RuntimeError("invalid Hold identity record")
+            records.append(value)
+    identities = [value["thread_id"] for value in records if value.get("thread_id")]
+    with _thread_guard(root, identities), report_guard(root / ".dispatch-gate"):
+        yield
+
+
+@contextmanager
+def _dispatch_guard(root: Path, request: dict):
+    """Re-resolve all aliases inside the native boundary, then lock complete ancestry."""
+    with _thread_guard(root, [request["thread_id"]]):
+        roots = dispatch_roots(root, request)
+        with ExitStack() as guards:
+            for scope in roots:
+                guards.enter_context(report_guard(scope / ".dispatch-gate"))
+            yield roots
+
+
+def _require_roots_open(roots):
+    if any(os.path.lexists(root / MARKER) for root in roots):
+        raise DispatchCancelledBeforeSend("Jarvis management is cancelled; use a new explicitly authorized task identity")
+
+
 def cancel_management(root: Path, **kwargs) -> dict:
-    with report_guard(root / ".dispatch-gate"):
+    with _hold_guard(root):
         if kwargs.get("scope") == "hold":
             current = json.loads((root / "request.json").read_text(encoding="utf-8"))
             if current.get("request_id") != kwargs.get("request_id") or (current.get("hold_id") or current.get("monitor_id")) != kwargs.get("subject_id"):
@@ -126,23 +214,25 @@ def cancel_management(root: Path, **kwargs) -> dict:
 
 def commit_dispatch(root: Path, request: dict, params: dict) -> dict:
     """Linearize one actual turn/start before cancellation; never retry a commit."""
-    with ExitStack() as guards:
-        for scope in dispatch_roots(root, request):
-            guards.enter_context(report_guard(scope / ".dispatch-gate"))
+    binding = {**request, "thread_id": params.get("threadId")}
+    with _dispatch_guard(root, binding) as roots:
         current = json.loads((root / "request.json").read_text(encoding="utf-8"))
         if current.get("request_id") != request.get("request_id") or current.get("hold_id") != request.get("hold_id"):
             raise RuntimeError("dispatch request identity changed")
+        if any(value.get("thread_id") and value["thread_id"] != params.get("threadId")
+               for value in (current, request)):
+            raise RuntimeError("dispatch native thread identity changed")
         identity = {"request_id": request["request_id"], "hold_id": request.get("hold_id"),
                     "thread_id": params.get("threadId"), "client_user_message_id": params.get("clientUserMessageId")}
         if not identity["thread_id"] or not identity["client_user_message_id"]:
             raise RuntimeError("dispatch commit requires actual thread and user-message identity")
         key = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
         directory = root / "dispatch-commits"
-        directory.mkdir(exist_ok=True)
         target = directory / (key + ".json")
         if os.path.lexists(target):
             raise DispatchAlreadyCommitted("native turn command already committed; read back without replay")
-        require_dispatch_open(root, request)
+        _require_roots_open(roots)
+        directory.mkdir(exist_ok=True)
         value = {"schema": "jarvis-dispatch-commit/v1", **identity,
                  "params_sha256": hashlib.sha256(json.dumps(params, sort_keys=True).encode()).hexdigest(),
                  "committed_at": datetime.now(timezone.utc).isoformat(),

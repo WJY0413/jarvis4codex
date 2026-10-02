@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -21,6 +23,7 @@ from .contracts import (
 )
 from .service import ExistingThreadBridge
 from .transport import ExistingThreadTransport
+from .journal import file_lock, fsync_directory
 
 
 _TERMINAL = {"completed", "failed", "interrupted", "cancelled", "canceled", "blocked"}
@@ -48,6 +51,11 @@ class ThreadTerminalMonitor:
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
     def observe(self, monitor_id: str, route: ReceiptRoute) -> MonitorReceipt:
+        # Serialize the snapshot read and baseline update across monitor instances.
+        with file_lock(self.state_path.with_suffix(self.state_path.suffix + ".lock")):
+            return self._observe(monitor_id, route)
+
+    def _observe(self, monitor_id: str, route: ReceiptRoute) -> MonitorReceipt:
         thread_id = route.observed_thread_id
         state = self.transport.read_thread(thread_id)
         if state.thread_id != thread_id:
@@ -55,9 +63,16 @@ class ThreadTerminalMonitor:
         latest = state.turns[-1] if state.turns else None
         status = state.effective_status.strip().lower()
         fingerprint = self._fingerprint(state)
-        previous = {}
+        identity = json.dumps([monitor_id, thread_id, route.receipt_target_thread_id],
+                              ensure_ascii=False, separators=(",", ":"))
+        saved = {}
         if self.state_path.exists():
-            previous = json.loads(self.state_path.read_text(encoding="utf-8-sig"))
+            saved = json.loads(self.state_path.read_text(encoding="utf-8-sig"))
+        if saved.get("version") != 3:
+            # A global v2 fingerprint has no provable owner. Preserve its evidence,
+            # but require a fresh baseline for every explicit identity/route.
+            saved = {"version": 3, "monitors": {}, **({"legacy_state": saved} if saved else {})}
+        previous = saved["monitors"].get(identity, {})
         if not previous:
             # A monitor can be attached to an already completed/idle task.
             # That state is a baseline only: no receipt consumer may treat it
@@ -69,14 +84,28 @@ class ThreadTerminalMonitor:
             event = "terminal_changed"
         else:
             event = "active_or_unknown_changed"
-        self.state_path.parent.mkdir(parents=True, exist_ok=True)
-        self.state_path.write_text(
-            json.dumps(
-                {"version": 2, "fingerprint": fingerprint, "event": event},
-                ensure_ascii=False,
-            ),
-            encoding="utf-8",
-        )
+        saved["monitors"][identity] = {"fingerprint": fingerprint, "event": event}
+        temporary = self.state_path.with_name(f"{self.state_path.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            with temporary.open("w", encoding="utf-8") as stream:
+                json.dump(saved, stream, ensure_ascii=False)
+                stream.flush()
+                os.fsync(stream.fileno())
+            # Match the existing health publisher's Windows sharing retry pattern.
+            for attempt in range(20):
+                try:
+                    temporary.replace(self.state_path)
+                    break
+                except PermissionError:
+                    if attempt == 19:
+                        raise
+                    time.sleep(min(0.05 * (attempt + 1), 0.25))
+            fsync_directory(self.state_path.parent)
+        finally:
+            try:
+                temporary.unlink(missing_ok=True)
+            except PermissionError:
+                pass  # Cleanup must not mask the publication result.
         return MonitorReceipt(
             monitor_id=monitor_id,
             thread_id=thread_id,

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sys
 import json
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -97,4 +98,44 @@ def build_owned_dispatch_transport(options: dict[str, Any]) -> Any:
     if set(options) != {"config_path", "launcher_config_path", "state_dir"}:
         raise ValueError("invalid owned dispatch transport options")
     provisioner = CodexAppServerTaskProvisioningAdapter(Path(options["launcher_config_path"]), state_dir=Path(options["state_dir"]))
-    return _standard_transport(Path(options["config_path"]), execution_reader=provisioner.thread_execution_evidence)
+    transport = _standard_transport(Path(options["config_path"]), execution_reader=provisioner.thread_execution_evidence)
+    return _OwnedHoldDispatchTransport(transport, provisioner)
+
+
+class _OwnedHoldDispatchTransport:
+    """Keep owned dispatch on the same cancelled-thread/Holder pipe gates."""
+
+    def __init__(self, transport, provisioner):
+        self.transport, self.provisioner = transport, provisioner
+
+    def read_thread(self, thread_id):
+        return self.transport.read_thread(thread_id)
+
+    def resume_existing(self, request):
+        from jarvis_control.provisioning import TaskMonitorResumeRequest
+        from jarvis_codex_bridge import StartedTurn
+        receipt = self.provisioner.resume_with_monitor(TaskMonitorResumeRequest(
+            request_id=request.request_id, task_id=request.thread_id, prompt=request.prompt,
+            source_ref=request.source_ref, model=request.model, reasoning_effort=request.reasoning_effort,
+            max_turns=1, auto_continue=False,
+            notifications={"terminal": False, "milestones": []}))
+        if receipt.status not in {"accepted", "holding", "running", "completed"}:
+            raise RuntimeError(receipt.reason or "owned Holder dispatch was rejected")
+        config = self.provisioner._config_loader(self.provisioner._config_path)
+        deadline = time.monotonic() + config.turn_completion_timeout_seconds
+        while time.monotonic() < deadline:
+            data = self.provisioner.hold_status(receipt.hold_id)
+            if data.get("terminal_confirmed") is True and data.get("hold_released") is True:
+                if data.get("thread_id") != request.thread_id or not data.get("turn_id"):
+                    raise RuntimeError("owned Holder terminal identity mismatch")
+                native = self.transport.read_thread(request.thread_id)
+                matches = [turn for turn in native.turns if turn.turn_id == data["turn_id"]]
+                if (native.thread_id != request.thread_id or len(matches) != 1
+                        or matches[0].status.lower() not in {"completed", "failed", "error", "interrupted", "cancelled", "canceled"}
+                        or matches[0].effective_status.lower() != matches[0].status.lower()):
+                    raise RuntimeError("owned Holder exact native terminal is unverified")
+                return StartedTurn(request.thread_id, data["turn_id"], matches[0].status)
+            if data.get("status") in {"failed", "blocked", "cancelled", "canceled"}:
+                raise RuntimeError(data.get("reason") or "owned Holder outcome is unconfirmed")
+            time.sleep(0.1)
+        raise TimeoutError("owned Holder exact terminal readback timed out; no replacement")

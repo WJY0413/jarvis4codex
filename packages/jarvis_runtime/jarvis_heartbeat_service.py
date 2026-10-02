@@ -2054,6 +2054,55 @@ class StandardBridgeHeartbeatTransport:
             execution_evidence=evidence,
         )
 
+    def read_turn(self, thread_id: str, turn_id: str) -> dict[str, Any]:
+        """One exact native turn, with explicitly separate owner evidence."""
+        client = AppServerClient(self.launcher_config)
+        deadline = time.monotonic() + self.launcher_config.turn_readback_timeout_seconds
+        try:
+            client.start(deadline=deadline)
+            data = client.read_exact_turn(thread_id, turn_id, deadline=deadline)
+        finally:
+            client.close()
+        data["status"] = WakeController.status_text(data.get("status"))
+        turn = data["turns"][0]
+        native_status = turn["status"]
+        execution_status = "unknown" if native_status == "interrupted" else native_status
+        execution_source = "native_observer"
+        evidence = None
+        reader = getattr(self, "execution_reader", None)
+        if reader is not None:
+            try:
+                evidence = reader(thread_id, turn_id)
+            except Exception as exc:
+                evidence = {"status": "unknown", "source": "hold_evidence", "reason": str(exc),
+                            "thread_id": thread_id, "turn_id": turn_id}
+            if evidence is not None:
+                if (not isinstance(evidence, dict) or evidence.get("thread_id") != thread_id
+                        or evidence.get("turn_id") != turn_id):
+                    raise HeartbeatError("exact-turn owner evidence identity mismatch")
+                owner_status = str(evidence.get("status") or "unknown")
+                owner_terminal = evidence.get("terminal_confirmed") is True
+                compatible = (
+                    (native_status == "completed" and owner_status in {"completed", "blocked"})
+                    or (native_status == "failed" and owner_status in {"failed", "blocked"})
+                    or (native_status == "interrupted" and owner_status in
+                        {"interrupted", "cancelled", "canceled"})
+                )
+                if owner_terminal and compatible:
+                    execution_status = owner_status
+                    execution_source = str(evidence.get("source") or "hold_evidence")
+                else:
+                    # Owner records cannot turn contradictory fresh native state
+                    # into confirmed completion. Keep both observations visible.
+                    execution_status = "unknown"
+                    execution_source = "hold_evidence"
+        if time.monotonic() >= deadline:
+            raise HeartbeatError("Exact-turn readback deadline exhausted during execution evidence read")
+        turn.update(execution_status=execution_status, execution_source=execution_source)
+        data.update(execution_status=execution_status, execution_source=execution_source,
+                    execution_evidence=evidence)
+        return data
+
     def resume_existing(self, request: Any) -> Any:
         result = self.controller.run_existing_task(
             request.thread_id,

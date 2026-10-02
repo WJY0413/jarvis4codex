@@ -8,13 +8,17 @@ import os
 import re
 import sqlite3
 import sys
+from contextlib import nullcontext
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 from jarvis_runtime.coo_dispatcher_store import ProcessLock
-from jarvis_runtime.cancellation import cancel_management, cancellation_path, require_dispatch_open, report_guard, dispatch_roots
+from jarvis_runtime.cancellation import (
+    cancel_management, cancellation_path, require_dispatch_open, report_guard,
+    dispatch_roots, _hold_guard, _dispatch_guard, _require_roots_open,
+)
 
 from jarvis_control.provisioning import (
     TaskMonitorResumeRequest,
@@ -58,7 +62,7 @@ class CodexAppServerTaskProvisioningAdapter:
             project, project_path = config.resolve_project(request.project)
             hold_id = request.hold_id or f"hold-{request.request_id}"
             paths = self._paths(hold_id)
-            with report_guard(paths["request"].parent / ".dispatch-gate"):
+            with _hold_guard(paths["request"].parent):
                 require_dispatch_open(paths["request"].parent)
                 _write_json(paths["request"], {
                     "mode": "create",
@@ -249,98 +253,116 @@ class CodexAppServerTaskProvisioningAdapter:
 
     def resume_with_monitor(self, request: TaskMonitorResumeRequest) -> TaskProvisionReceipt:
         try:
-            input_binding = dict(request.input_binding or {})
-            config = self._config_loader(self._config_path)
+            self._config_loader(self._config_path)
             hold_id = request.hold_id or request.monitor_id or f"hold-{request.request_id}"
-            dispatch_ancestors = set()
-            for parent_name in ("task-holds", "task-monitors"):
-                parent = self._state_dir / parent_name
-                if parent.is_dir():
-                    for root in parent.iterdir():
-                        if not root.is_dir(): continue
-                        old_request = _read_json_file(root / "request.json") or {}
-                        old_ack = _read_json_file(root / "ack.json") or {}
-                        old_result = _read_json_file(root / "result.json") or {}
-                        if request.task_id in {old_request.get("thread_id"), old_ack.get("thread_id"), old_result.get("thread_id")}:
-                            require_dispatch_open(root, old_request)
-                            for ancestor in dispatch_roots(root, old_request):
-                                dispatch_ancestors.add(ancestor.relative_to(self._state_dir).as_posix())
-            if request.hold_id or request.monitor_id:
-                previous = self.hold_status(hold_id)
-                if str(previous.get("status") or "") in {"accepted", "holding", "running"}:
-                    raise RuntimeError("hold already owns an active turn")
-                if previous.get("thread_id") != request.task_id or previous.get("hold_released") is not True:
-                    raise RuntimeError("existing Hold identity or terminal release is unverified")
-                existing_total = _positive_int(previous.get("total_turn_count")) or _positive_int(previous.get("turn_count")) or 0
-                previous_paths = self._existing_paths(hold_id)
-                saved_request = _read_json_file(previous_paths["request"]) if previous_paths else None
-                saved_binding = (saved_request or {}).get("input_binding") or {}
-                if "result_verification" in saved_binding or "result_verification" in (request.input_binding or {}):
-                    if (not saved_request or "result_verification" not in saved_binding
-                            or previous.get("output_verification", {}).get("status") != "verified"
-                            or verify_candidate_output(saved_request, existing_total).get("status") != "verified"):
-                        raise RuntimeError("bound Hold current candidate is unverified; use a new request including the unfinished item")
-                if "output_schema" in saved_binding.get("result_verification", {}) or "lane_item_count" in saved_binding:
-                    if input_binding and input_binding != saved_binding:
-                        raise RuntimeError("existing Hold batch/output_schema binding cannot change on resume; use a new request")
-                    input_binding = dict(saved_binding)
-                max_turns = _positive_int(previous.get("max_turns")) or request.max_turns
-                initial_turn_count = 1
-                initial_total_turn_count = existing_total + 1
-                if "lane_item_count" in input_binding:
-                    # Total count indexes the finite lane; Monitor budgets this session only.
-                    lane_batch_ids(input_binding, initial_total_turn_count)
-                    size = lane_batch_size(input_binding)
-                    max_turns = (len(input_binding["candidate_ids"]) + size - 1) // size - existing_total
-            else:
-                max_turns = request.max_turns
-                initial_turn_count = 1
-                initial_total_turn_count = 1
-            paths = self._paths(hold_id)
-            with report_guard(paths["request"].parent / ".dispatch-gate"):
-                require_dispatch_open(paths["request"].parent)
+            hint_root = self._state_dir / "task-holds" / _safe_id(hold_id)
+            known_roots = dispatch_roots(hint_root, {"thread_id": request.task_id})
+            ancestors = {_state_reference(root, self._state_dir) for root in known_roots if root != hint_root}
+            declaration = {
+                "mode": "resume", "request_id": request.request_id, "hold_id": hold_id,
+                "thread_id": request.task_id, "source_ref": request.source_ref, "prompt": request.prompt,
+                "model": request.model, "reasoning_effort": request.reasoning_effort,
+                "max_turns": request.max_turns, "auto_continue": request.auto_continue,
+                "continue_prompt": request.continue_prompt,
+                "notifications": dict(request.notifications or {}), "input_binding": dict(request.input_binding or {}),
+            }
+            paths = self._existing_paths(hold_id) or self._paths(hold_id)
+            snapshot = _resume_snapshot(paths)
+            saved = _snapshot_json(snapshot, "request")
+            prepared = None
+            evidence = {}
+            if not saved or saved.get("request_id") != request.request_id:
+                _require_roots_open(known_roots)
+                prepared, evidence = self._prepare_resume(request, hold_id, snapshot)
+            binding = {**declaration, "dispatch_ancestors": sorted(ancestors)}
+            with _dispatch_guard(paths["request"].parent, binding) as roots:
+                resolved = self._existing_paths(hold_id)
+                if resolved is not None and resolved["request"].parent != paths["request"].parent:
+                    raise RuntimeError("resolved Hold identity changed during admission")
+                current_snapshot = _resume_snapshot(paths)
+                current = _snapshot_json(current_snapshot, "request")
+                if current and current.get("request_id") == request.request_id:
+                    existing = current.get("resume_declaration")
+                    if existing is None:
+                        existing = _legacy_resume_declaration(current)
+                    if json.dumps(existing, sort_keys=True) != json.dumps(declaration, sort_keys=True):
+                        raise RuntimeError("request_id is already bound to a conflicting resume declaration")
+                    return self._resume_readback(request.request_id, hold_id)
+                if current_snapshot != snapshot or prepared is None:
+                    raise RuntimeError("Hold generation or lifecycle evidence changed during admission")
+                if any(_file_identity(Path(path)) != identity for path, identity in evidence.items()):
+                    raise RuntimeError("verified output evidence changed during admission")
+                _require_roots_open(roots)
+                ancestors.update(_state_reference(root, self._state_dir) for root in roots
+                    if root != paths["request"].parent)
+                payload = {**declaration, **prepared, "dispatch_ancestors": sorted(ancestors),
+                    "resume_declaration": declaration,
+                    "turn_history_path": str(self._state_dir / "turn-history.sqlite")}
                 _archive_terminal_result(paths["result"])
-                _write_json(paths["request"], {
-                    "mode": "resume",
-                    "dispatch_ancestors": sorted(dispatch_ancestors),
-                    "request_id": request.request_id,
-                    "source_ref": request.source_ref,
-                    "hold_id": hold_id,
-                    "thread_id": request.task_id,
-                    "prompt": request.prompt,
-                    "model": request.model,
-                    "reasoning_effort": request.reasoning_effort,
-                    "max_turns": max_turns,
-                    "auto_continue": request.auto_continue,
-                    "continue_prompt": request.continue_prompt,
-                    "notifications": dict(request.notifications or {}),
-                    "input_binding": input_binding,
-                    "turn_history_path": str(self._state_dir / "turn-history.sqlite"),
-                    "initial_turn_count": initial_turn_count,
-                    "initial_total_turn_count": initial_total_turn_count,
-                })
-                _write_json(paths["ack"], _accepted_ack(
-                    request_id=request.request_id,
-                    hold_id=hold_id,
-                    turn_count=initial_turn_count,
-                    total_turn_count=initial_total_turn_count,
-                    max_turns=max_turns,
-                ))
+                _write_json(paths["request"], payload)
+                _write_json(paths["ack"], _accepted_ack(request_id=request.request_id, hold_id=hold_id,
+                    turn_count=prepared["initial_turn_count"], total_turn_count=prepared["initial_total_turn_count"],
+                    max_turns=prepared["max_turns"]))
         except Exception as exc:
-            return TaskProvisionReceipt(
-                request_id=request.request_id, status="failed", observed_at=observed_now(), reason=str(exc)
-            )
-        return TaskProvisionReceipt(
-            request_id=request.request_id,
-            status="accepted",
-            observed_at=observed_now(),
-            monitor_id=hold_id,
-            hold_id=hold_id,
-            turn_count=initial_turn_count,
-            total_turn_count=initial_total_turn_count,
-            max_turns=max_turns,
-            phase="queued_for_user_host",
-        )
+            return TaskProvisionReceipt(request_id=request.request_id, status="failed", observed_at=observed_now(), reason=str(exc))
+        return TaskProvisionReceipt(request_id=request.request_id, status="accepted", observed_at=observed_now(),
+            monitor_id=hold_id, hold_id=hold_id, turn_count=prepared["initial_turn_count"],
+            total_turn_count=prepared["initial_total_turn_count"], max_turns=prepared["max_turns"], phase="queued_for_user_host")
+
+    def _prepare_resume(self, request, hold_id, snapshot):
+        """Read-only planning and business verification; no admission lock is held."""
+        saved = _snapshot_json(snapshot, "request")
+        input_binding = dict(request.input_binding or {})
+        max_turns, total = request.max_turns, 1
+        evidence = {}
+        if not (request.hold_id or request.monitor_id):
+            if saved or snapshot["ack"] is not None or snapshot["result"] is not None:
+                raise RuntimeError("implicit Hold is already bound to another or unverified request_id")
+        else:
+            previous = self.hold_status(hold_id)
+            if str(previous.get("status") or "") in {"accepted", "holding", "running"}:
+                raise RuntimeError("hold already owns an active turn")
+            if previous.get("thread_id") != request.task_id or previous.get("hold_released") is not True:
+                raise RuntimeError("existing Hold identity or terminal release is unverified")
+            existing_total = _positive_int(previous.get("total_turn_count")) or _positive_int(previous.get("turn_count")) or 0
+            saved_binding = (saved or {}).get("input_binding") or {}
+            if "result_verification" in saved_binding or "result_verification" in input_binding:
+                if (not saved or "result_verification" not in saved_binding
+                        or previous.get("output_verification", {}).get("status") != "verified"):
+                    raise RuntimeError("bound Hold current candidate is unverified; use a new request including the unfinished item")
+                evidence = _output_evidence_identity(saved, existing_total)
+                if (verify_candidate_output(saved, existing_total).get("status") != "verified"
+                        or _output_evidence_identity(saved, existing_total) != evidence):
+                    raise RuntimeError("bound Hold current candidate is unverified or its output evidence changed")
+            if "output_schema" in saved_binding.get("result_verification", {}) or "lane_item_count" in saved_binding:
+                if input_binding and input_binding != saved_binding:
+                    raise RuntimeError("existing Hold batch/output_schema binding cannot change on resume; use a new request")
+                input_binding = dict(saved_binding)
+            max_turns = _positive_int(previous.get("max_turns")) or request.max_turns
+            total = existing_total + 1
+            if "lane_item_count" in input_binding:
+                lane_batch_ids(input_binding, total)
+                size = lane_batch_size(input_binding)
+                max_turns = (len(input_binding["candidate_ids"]) + size - 1) // size - existing_total
+        return {"input_binding": input_binding, "max_turns": max_turns,
+                "initial_turn_count": 1, "initial_total_turn_count": total}, evidence
+
+    def _resume_readback(self, request_id: str, hold_id: str) -> TaskProvisionReceipt:
+        """Exact replay only observes the existing lifecycle; it never queues work."""
+        try:
+            data = self.hold_status(hold_id)
+        except RuntimeError:
+            data = {}
+        if data.get("request_id") != request_id:
+            return TaskProvisionReceipt(request_id=request_id, status="requires_readback", observed_at=observed_now(),
+                hold_id=hold_id, monitor_id=hold_id, reason="existing resume lifecycle identity is unverified")
+        fields = {key: data[key] for key in ("thread_id", "turn_id", "output", "reason", "error_code", "phase",
+                   "turn_count", "total_turn_count", "max_turns") if key in data}
+        if "output" not in fields and "final_message" in data:
+            fields["output"] = data["final_message"]
+        return TaskProvisionReceipt(request_id=request_id, status=data.get("status") or "requires_readback",
+            observed_at=_parse_observed_at(data.get("observed_at")) or observed_now(),
+            hold_id=hold_id, monitor_id=hold_id, **fields)
 
     def _paths(self, request_id: str) -> dict[str, Path]:
         safe_id = _safe_id(request_id)
@@ -897,11 +919,98 @@ def refresh_close_report(root: Path, evidence: dict[str, Any], *, action=None, f
         return report
 
 
+def _state_reference(root: Path, state: Path) -> str:
+    def normalized(path):
+        value = os.path.normcase(str(path.resolve()))
+        # Windows final-path APIs may return the equivalent extended prefix.
+        return value[4:] if value.startswith("\\\\?\\") else value
+    relative = Path(os.path.relpath(normalized(root), normalized(state)))
+    if len(relative.parts) != 2 or relative.parts[0] not in {"task-holds", "task-monitors", "loops"}:
+        raise RuntimeError("dispatch root is outside this state registry")
+    return relative.as_posix()
+
+
+def _resume_snapshot(paths):
+    values = {name: path.read_bytes() if path.exists() else None
+              for name, path in paths.items() if name in {"request", "ack", "result"}}
+    claim = paths["request"].parent / ".user-host-claim"
+    values["claimed"] = claim.exists()
+    owner = claim / "owner.json"
+    values["owner"] = owner.read_bytes() if owner.exists() else None
+    return values
+
+
+def _snapshot_json(snapshot, name):
+    raw = snapshot[name]
+    if raw is None:
+        return None
+    value = json.loads(raw)
+    if not isinstance(value, dict):
+        raise RuntimeError("invalid persisted Hold record")
+    return value
+
+
+def _legacy_resume_declaration(saved):
+    defaults = {"model": None, "reasoning_effort": None, "max_turns": 1, "auto_continue": False,
+        "continue_prompt": TaskMonitorResumeRequest.__dataclass_fields__["continue_prompt"].default,
+        "notifications": {}, "input_binding": {}}
+    keys = ("mode", "request_id", "hold_id", "thread_id", "source_ref", "prompt", *defaults)
+    declaration = {key: saved.get(key, defaults.get(key)) for key in keys}
+    declaration["hold_id"] = saved.get("hold_id") or saved.get("monitor_id")
+    # The v1 create producer always persists project/project_path/title. Recovery
+    # changes execution mode only. Recognize the complete v1 resume shape, never
+    # infer resume intent from a sparse/ambiguous recover record.
+    if (saved.get("mode") == "recover" and isinstance(saved.get("turn_id"), str) and saved["turn_id"]
+            and all(key in saved for key in ("request_id", "thread_id", "source_ref", "prompt", *defaults,
+                "initial_turn_count", "initial_total_turn_count"))
+            and not any(key in saved for key in ("project", "project_path", "title"))):
+        declaration["mode"] = "resume"
+    return declaration
+
+
+def _file_identity(path):
+    stat = path.stat()
+    return str(path.resolve(strict=True)), stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns
+
+
+def _output_evidence_identity(request, turn_number):
+    """Pin the verifier's files outside locks; final checks use bounded stat calls."""
+    binding = request.get("input_binding") or {}
+    contract = binding.get("result_verification") or {}
+    boundary_path = Path(binding["output_boundary"]).absolute()
+    boundary = boundary_path.resolve(strict=True)
+    identities = {}
+    def path_for(value, *, relative_to_boundary=True):
+        path = Path(value)
+        if not path.is_absolute() and relative_to_boundary:
+            path = boundary_path / path
+        path = path.absolute()
+        if not path.resolve(strict=True).is_relative_to(boundary):
+            raise RuntimeError("output evidence is outside the allowed boundary")
+        return path
+    for candidate in lane_batch_ids(binding, turn_number):
+        receipt = path_for(contract["receipt_paths"][str(candidate)])
+        identities[str(receipt)] = _file_identity(receipt)
+        value = json.loads(receipt.read_text(encoding="utf-8-sig"))
+        output = path_for(value["output_path"])
+        identities[str(output)] = _file_identity(output)
+        if final_answer_mode(binding):
+            raw = path_for(value["raw_path"], relative_to_boundary=False)
+            identities[str(raw)] = _file_identity(raw)
+    return identities
+
+
 def _write_json(path: Path, value: dict[str, Any]) -> None:
-    # Reuse the existing bounded Windows atomic replacement behavior; a close
-    # request races with the owner's control polling, not just another writer.
     from adapters.codex_app_server.jarvis_task_hold_host import _write_json as atomic_write
-    atomic_write(path, value)
+    stop_update = path.name == "request.json" and value.get("stop_requested") is True
+    with _hold_guard(path.parent, value) if stop_update else nullcontext():
+        if stop_update:
+            current = json.loads(path.read_text(encoding="utf-8"))
+            expected = {key: item for key, item in value.items() if key != "stop_requested"}
+            actual = {key: item for key, item in current.items() if key != "stop_requested"}
+            if actual != expected:
+                raise RuntimeError("stop request generation changed; original stop was not applied")
+        atomic_write(path, value)
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:

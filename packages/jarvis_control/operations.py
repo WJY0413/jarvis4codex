@@ -17,7 +17,7 @@ from typing import Any
 from jarvis_runtime.coo_dispatcher_store import ProcessLock
 
 CONTRACT = "jarvis-controller-contract/v1"
-BUILD = "Jarvis dot 0.2.5+dot.5-candidate"
+BUILD = "Jarvis 0.2.6 Linux (dot.1)"
 ACTIVE = {"active", "running", "inprogress", "in_progress", "pending", "unknown"}
 
 

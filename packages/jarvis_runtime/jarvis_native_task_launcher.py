@@ -78,6 +78,17 @@ class NativeTaskError(RuntimeError):
     """Raised when native task creation or routing violates the control contract."""
 
 
+class _TerminalReadbackControlError(Exception):
+    """A control callback failed, rather than a read-only native probe."""
+
+    def __init__(self, error: Exception):
+        self.error = error
+
+
+class OwnerExactTerminalReadback(dict):
+    """In-process evidence, never manufactured by a native JSON notification."""
+
+
 class NativeTaskCreationError(NativeTaskError):
     def __init__(self, message: str, *, thread_id: str | None = None, turn_id: str | None = None,
                  terminal_status: str | None = None):
@@ -901,6 +912,9 @@ class AppServerClient:
         self.runtime_context: dict[str, Any] = {}
         self._instance_lock_fd = None
         self.before_turn_dispatch = None  # Optional owner-installed cancellation/commit gate.
+        self._terminal_probe_lock = threading.Lock()
+        self._terminal_probe_pending_id: int | None = None
+        self._terminal_probe_expired = False
 
     def _runtime_thread_params(self, model: str | None) -> dict[str, Any]:
         model = model or getattr(self.config, "default_model", None)
@@ -984,14 +998,16 @@ class AppServerClient:
         if no_environments:
             self.runtime_context["environments_verified"] = True
 
-    def start(self) -> dict[str, Any]:
+    def start(self, *, deadline: float | None = None) -> dict[str, Any]:
         try:
-            return self._start_impl()
+            if deadline is not None and time.monotonic() >= deadline:
+                raise NativeTaskError("app-server initialization readback deadline exhausted before dispatch")
+            return self._start_impl(deadline=deadline)
         except BaseException:
             self.close()
             raise
 
-    def _start_impl(self) -> dict[str, Any]:
+    def _start_impl(self, *, deadline: float | None = None) -> dict[str, Any]:
         if self.process and self.process.poll() is None:
             return self.initialize_result or {}
         try:
@@ -1039,6 +1055,7 @@ class AppServerClient:
                     },
                     "capabilities": {"experimentalApi": True},
                 },
+                deadline=deadline,
             )
         except NativeTaskError as exc:
             self.close()
@@ -1070,16 +1087,23 @@ class AppServerClient:
         assert self.process is not None and self.process.stdout is not None
         try:
             for raw in self.process.stdout:
+                item = None
                 try:
                     item = json.loads(raw)
+                    if not isinstance(item, dict):
+                        continue
+                    if "id" in item:
+                        self._queue_response(item)
+                    else:
+                        self.notifications.put(item)
                 except json.JSONDecodeError:
                     continue
-                if not isinstance(item, dict):
-                    continue
-                if "id" in item:
-                    self.response_queue.put(item)
-                else:
-                    self.notifications.put(item)
+                finally:
+                    # A reader may block until the next notification for minutes.
+                    # The receiving queue owns the message; do not also retain the
+                    # last decoded response and raw JSON in this thread's frame.
+                    item = None
+                    raw = None
         finally:
             # FIFO preserves terminal evidence already read before EOF. A closed
             # transport is not evidence that the remote execution is terminal.
@@ -1109,15 +1133,53 @@ class AppServerClient:
             value["params"] = params
         self._write(value)
 
-    def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+    def _queue_response(self, item: dict[str, Any]) -> None:
+        """Drop only the one expired Hold-probe response; preserve other RPCs.
+
+        A timed-out probe cannot dispatch another RPC until this exact response
+        arrives. No abandoned-ID collection or late large item page is retained.
+        The reader and timeout cleanup use the same lock to cover the enqueue race.
+        """
+        lock = getattr(self, "_terminal_probe_lock", None)
+        if lock is None:
+            self.response_queue.put(item)
+            return
+        with lock:
+            if (self._terminal_probe_expired
+                    and item.get("id") == self._terminal_probe_pending_id):
+                self._terminal_probe_pending_id = None
+                self._terminal_probe_expired = False
+                return
+            self.response_queue.put(item)
+
+    def request(
+        self, method: str, params: dict[str, Any], *, deadline: float | None = None,
+        _terminal_probe: bool = False,
+    ) -> dict[str, Any]:
+        request_deadline = time.monotonic() + self.config.request_timeout_seconds
+        deadline = min(request_deadline, deadline) if deadline is not None else request_deadline
+        if time.monotonic() >= deadline:
+            raise NativeTaskError(f"app-server {method} readback deadline exhausted before dispatch")
         self._request_id += 1
         request_id = self._request_id
-        self._write({"id": request_id, "method": method, "params": params})
-        deadline = time.monotonic() + self.config.request_timeout_seconds
+        if _terminal_probe:
+            # Hold calls these sequentially, with control callbacks between RPCs.
+            # Never accumulate unanswered probes, even if the server is stalled.
+            if not hasattr(self, "_terminal_probe_lock"):
+                self._terminal_probe_lock = threading.Lock()
+                self._terminal_probe_pending_id = None
+                self._terminal_probe_expired = False
+            with self._terminal_probe_lock:
+                if self._terminal_probe_pending_id is not None:
+                    raise NativeTaskError("Hold terminal readback has one unanswered native RPC")
+                self._terminal_probe_pending_id = request_id
+                self._terminal_probe_expired = False
         deferred: list[dict[str, Any]] = []
+        matched = False
         try:
+            self._write({"id": request_id, "method": method, "params": params})
             while time.monotonic() < deadline:
-                remaining = max(deadline - time.monotonic(), 0.05)
+                remaining = max(deadline - time.monotonic(), 0.0)
                 try:
                     item = self.response_queue.get(timeout=remaining)
                 except queue.Empty:
@@ -1125,6 +1187,11 @@ class AppServerClient:
                 if item.get("id") != request_id:
                     deferred.append(item)
                     continue
+                matched = True
+                if _terminal_probe:
+                    with self._terminal_probe_lock:
+                        self._terminal_probe_pending_id = None
+                        self._terminal_probe_expired = False
                 if "error" in item:
                     raise NativeTaskError(
                         f"app-server {method} failed: "
@@ -1133,8 +1200,26 @@ class AppServerClient:
                 result = item.get("result")
                 return result if isinstance(result, dict) else {"result": result}
         finally:
+            if _terminal_probe and not matched:
+                with self._terminal_probe_lock:
+                    self._terminal_probe_expired = True
+                    # A reply may have been queued just before expiry. Discard
+                    # only its exact ID, preserving all unrelated responses.
+                    retained = []
+                    for _ in range(self.response_queue.qsize()):
+                        try:
+                            queued = self.response_queue.get_nowait()
+                        except queue.Empty:
+                            break
+                        if queued.get("id") == request_id:
+                            self._terminal_probe_pending_id = None
+                            self._terminal_probe_expired = False
+                        else:
+                            retained.append(queued)
+                    for queued in retained:
+                        self.response_queue.put(queued)
             for item in deferred:
-                self.response_queue.put(item)
+                self._queue_response(item)
         tail = "\n".join(self.stderr_lines[-10:])
         raise NativeTaskError(f"app-server {method} timed out; stderr={tail}")
 
@@ -1249,12 +1334,13 @@ class AppServerClient:
         """Reattach one durable thread in this App Server before starting its turn."""
         self.start()
         _report_phase(on_phase, "thread_resuming", thread_id=thread_id)
-        params = {"threadId": thread_id, **self._runtime_thread_params(model)}
+        params = {"threadId": thread_id, "excludeTurns": True, **self._runtime_thread_params(model)}
         self.runtime_context = {}
         resumed = self.request("thread/resume", params)
         self._verify_runtime_context(
             resumed, operation="thread/resume", thread_id=thread_id, model=model,
         )
+        del resumed
         _report_phase(on_phase, "thread_resumed", thread_id=thread_id)
         return self.start_turn_async(
             thread_id,
@@ -1404,24 +1490,209 @@ class AppServerClient:
             "reasoning_effort": selected_effort,
         }
 
-    def wait_for_turn_readback(self, thread_id: str, turn_id: str, *, require_final_answer: bool = False) -> str:
-        """Wait until the exact completed turn is materialized in thread/read.
+    def _read_final_message_pagewise(
+        self, thread_id: str, turn_id: str, *, require_final_answer: bool,
+        deadline: float,
+    ) -> str:
+        """Read only the exact turn, newest items first, without hydrating history.
 
-        App Server can deliver ``turn/completed`` before the corresponding
-        messages are visible in ``thread/read``.  A blank immediate readback is
-        therefore not completion proof and must never be treated as a final
-        answer by a bridge or monitor.
+        The supported alpha.7 paginated endpoint preserves turn identity on every
+        entry. There is deliberately no full-history fallback on protocol errors.
+        """
+        cursor = None
+        seen_cursors: set[str] = set()
+        newest_message: str | None = None
+        while True:
+            if time.monotonic() >= deadline:
+                return ""
+            params: dict[str, Any] = {
+                "threadId": thread_id, "turnId": turn_id,
+                "sortDirection": "desc", "limit": 50,
+            }
+            if cursor is not None:
+                params["cursor"] = cursor
+            page = self.request("thread/items/list", params, deadline=deadline)
+            entries = page.get("data")
+            if not isinstance(entries, list):
+                raise NativeTaskError("Exact-turn item readback is missing data")
+            for entry in entries:
+                if not isinstance(entry, dict) or entry.get("turnId") != turn_id:
+                    raise NativeTaskError("Exact-turn item readback identity mismatch")
+                item = entry.get("item")
+                if not isinstance(item, dict) or item.get("type") != "agentMessage":
+                    continue
+                text = str(item.get("text") or "")
+                if newest_message is None:
+                    newest_message = text
+                if item.get("phase") == "final_answer":
+                    return text if require_final_answer else text.strip()
+            next_cursor = page.get("nextCursor")
+            # Release potentially large tool-result pages before waiting on I/O.
+            del page, entries
+            item = entry = None
+            if next_cursor is None:
+                return "" if require_final_answer else (newest_message or "").strip()
+            if not isinstance(next_cursor, str) or not next_cursor or next_cursor in seen_cursors:
+                raise NativeTaskError("Exact-turn item readback has an invalid/repeated cursor")
+            seen_cursors.add(next_cursor)
+            cursor = next_cursor
+            if time.monotonic() >= deadline:
+                return ""  # An incomplete scan never licenses commentary fallback.
+
+    def read_exact_turn(
+        self, thread_id: str, turn_id: str, *, deadline: float,
+        _terminal_only: bool = False,
+        _control_poll: Callable[[], None] | None = None,
+        _terminal_probe: bool = False,
+    ) -> dict[str, Any]:
+        """Fresh native metadata and an explicit final-only projection of one turn.
+
+        Exhaust every item page before returning counts or scan completeness. Tool
+        payloads are released pagewise; full evidence stays available through the
+        native paginated endpoint. No SQL, latest-turn or full-history fallback.
+        """
+        if not isinstance(thread_id, str) or not thread_id.strip():
+            raise NativeTaskError("Exact-turn read requires a non-empty thread_id")
+        if not isinstance(turn_id, str) or not turn_id.strip():
+            raise NativeTaskError("Exact-turn read requires a non-empty turn_id")
+
+        def check_deadline(*, poll: bool = True) -> None:
+            if poll and _control_poll is not None:
+                _control_poll()
+            if time.monotonic() >= deadline:
+                raise NativeTaskError("Exact-turn readback deadline exhausted; scan is incomplete")
+
+        def read_page(method: str, params: dict[str, Any]) -> dict[str, Any]:
+            options = {"_terminal_probe": True} if _terminal_probe else {}
+            return self.request(method, params, deadline=deadline, **options)
+
+        def next_page(page: dict[str, Any], seen: set[str]) -> str | None:
+            cursor = page.get("nextCursor")
+            if cursor is None:
+                return None
+            if not isinstance(cursor, str) or not cursor or cursor in seen:
+                raise NativeTaskError("Exact-turn readback has an invalid/repeated cursor")
+            seen.add(cursor)
+            return cursor
+
+        check_deadline()
+        metadata = read_page(
+            "thread/read", {"threadId": thread_id, "includeTurns": False},
+        )
+        check_deadline(poll=False)
+        thread = metadata.get("thread")
+        if not isinstance(thread, dict) or thread.get("id") != thread_id:
+            raise NativeTaskError("Exact-thread metadata readback identity mismatch")
+        thread_status = thread.get("status")
+        del metadata, thread
+
+        cursor = None
+        seen_cursors: set[str] = set()
+        selected = None
+        while selected is None:
+            check_deadline()
+            params: dict[str, Any] = {
+                "threadId": thread_id, "itemsView": "notLoaded",
+                "sortDirection": "desc", "limit": 50,
+            }
+            if cursor is not None:
+                params["cursor"] = cursor
+            page = read_page("thread/turns/list", params)
+            check_deadline(poll=False)
+            turns = page.get("data")
+            if not isinstance(turns, list):
+                raise NativeTaskError("Exact-turn metadata readback is missing data")
+            for turn in turns:
+                if (not isinstance(turn, dict) or not isinstance(turn.get("id"), str)
+                        or not turn["id"] or turn.get("status") not in
+                        {"completed", "interrupted", "failed", "inProgress"}
+                        or turn.get("itemsView") != "notLoaded" or turn.get("items") != []):
+                    raise NativeTaskError("Exact-turn metadata readback has an invalid/notLoaded shape")
+                error = turn.get("error")
+                if error is not None and (not isinstance(error, dict)
+                        or not isinstance(error.get("message"), str) or turn["status"] != "failed"):
+                    raise NativeTaskError("Exact-turn metadata readback has an invalid/conflicting error")
+                if turn["id"] == turn_id:
+                    if selected is not None:
+                        raise NativeTaskError("Exact-turn metadata readback has duplicate target identity")
+                    selected = {"turn_id": turn_id, "status": turn["status"],
+                                "error": str(turn["error"]) if turn.get("error") is not None else None,
+                                "native_error": turn.get("error")}
+            cursor = next_page(page, seen_cursors)
+            del page, turns
+            turn = error = None
+            if selected is None and cursor is None:
+                raise NativeTaskError("Requested exact turn was not found in native readback")
+
+        cursor = None
+        seen_cursors.clear()
+        if _terminal_only and selected["status"] == "inProgress":
+            return {"thread_id": thread_id, "status": thread_status, "turns": [selected],
+                    "read_source": "native_exact_turn", "turn_id": turn_id,
+                    "turns_complete": False, "turns_projection": "exact_turn"}
+        final = None
+        item_count = web_search_count = 0
+        while True:
+            check_deadline()
+            params = {"threadId": thread_id, "turnId": turn_id,
+                      "sortDirection": "desc", "limit": 50}
+            if cursor is not None:
+                params["cursor"] = cursor
+            page = read_page("thread/items/list", params)
+            check_deadline(poll=False)
+            entries = page.get("data")
+            if not isinstance(entries, list):
+                raise NativeTaskError("Exact-turn item readback is missing data")
+            for entry in entries:
+                if not isinstance(entry, dict) or entry.get("turnId") != turn_id:
+                    raise NativeTaskError("Exact-turn item readback identity mismatch")
+                item = entry.get("item")
+                if (not isinstance(item, dict) or not isinstance(item.get("id"), str)
+                        or not item["id"] or not isinstance(item.get("type"), str) or not item["type"]):
+                    raise NativeTaskError("Exact-turn item readback has an invalid item shape")
+                item_count += 1
+                web_search_count += item["type"] == "webSearch"
+                if item["type"] == "agentMessage" and item.get("phase") == "final_answer":
+                    if not isinstance(item.get("text"), str):
+                        raise NativeTaskError("Exact-turn final answer has an invalid text shape")
+                    if final is None:
+                        final = {key: item[key] for key in ("id", "type", "phase", "text") if key in item}
+            cursor = next_page(page, seen_cursors)
+            # Do not pin a large tool page while issuing the next native request.
+            del page, entries
+            item = entry = None
+            if cursor is None:
+                break
+        check_deadline()
+        selected.update(
+            items=[final] if final is not None else [],
+            items_projection="final_answer", items_complete=False,
+            items_scan_complete=True, item_count=item_count, web_search_count=web_search_count,
+            final_answer_present=final is not None,
+            final_answer_nonempty=final is not None and bool(final["text"].strip()),
+        )
+        return {"thread_id": thread_id, "status": thread_status, "turns": [selected],
+                "read_source": "native_exact_turn", "turn_id": turn_id,
+                "turns_complete": False, "turns_projection": "exact_turn"}
+
+    def wait_for_turn_readback(self, thread_id: str, turn_id: str, *, require_final_answer: bool = False) -> str:
+        """Wait for the exact completed turn's final answer to be materialized.
+
+        Read one bounded item page at a time. Reusing a durable thread must not
+        deserialize every prior turn at each new Hold completion.
         """
         deadline = time.monotonic() + self.config.turn_readback_timeout_seconds
+        metadata = self.request(
+            "thread/read", {"threadId": thread_id, "includeTurns": False}, deadline=deadline,
+        )
+        thread = metadata.get("thread")
+        if not isinstance(thread, dict) or thread.get("id") != thread_id:
+            raise NativeTaskError("Exact-thread metadata readback identity mismatch")
+        del metadata, thread
         while True:
-            read_result = self.request(
-                "thread/read",
-                {"threadId": thread_id, "includeTurns": True},
-            )
-            final_message = self.final_message_for_turn(
-                read_result.get("thread"),
-                turn_id,
-                require_final_answer=require_final_answer,
+            final_message = self._read_final_message_pagewise(
+                thread_id, turn_id, require_final_answer=require_final_answer,
+                deadline=deadline,
             )
             if final_message:
                 return final_message
@@ -1477,8 +1748,9 @@ class AppServerClient:
             ):
                 selected_model = self.select_model(model or request.get("model"))
                 self.runtime_context = {}
-                resumed = self.request("thread/resume", {"threadId": thread_id, **self._runtime_thread_params(selected_model)})
+                resumed = self.request("thread/resume", {"threadId": thread_id, "excludeTurns": True, **self._runtime_thread_params(selected_model)})
                 self._verify_runtime_context(resumed, operation="thread/resume", thread_id=thread_id, model=selected_model)
+                del resumed
                 return self._start_turn_with_model(
                     thread_id,
                     append_lane_binding(request["prompt"], request.get("input_binding")),
@@ -1502,10 +1774,28 @@ class AppServerClient:
         *,
         wait_forever: bool = False,
         control_poll: Callable[[], None] | None = None,
+        terminal_readback: bool = False,
     ) -> dict[str, Any]:
         deadline = None if wait_forever else (
             time.monotonic() + self.config.turn_completion_timeout_seconds
         )
+        # This capability is enabled only by Hold, on its actual unrestricted
+        # AppServerClient. Restricted-role/unknown subclasses do not inherit it.
+        enabled = terminal_readback and type(self) is AppServerClient
+        self._held_terminal_readback_diagnostic = {
+            "state": "waiting" if enabled else "disabled",
+            "reason": "Hold opt-in" if enabled else (
+                "unsupported client role" if terminal_readback else "not enabled"),
+        }
+        next_probe = time.monotonic() + 30.0
+
+        def checked_control_poll() -> None:
+            if control_poll is not None:
+                try:
+                    control_poll()
+                except Exception as exc:
+                    raise _TerminalReadbackControlError(exc) from exc
+
         while deadline is None or time.monotonic() < deadline:
             if control_poll is not None:
                 control_poll()
@@ -1516,28 +1806,64 @@ class AppServerClient:
             )
             if control_poll is not None:
                 remaining = min(remaining, 0.25)
+            if enabled:
+                remaining = min(remaining, max(next_probe - time.monotonic(), 0.0))
             try:
                 item = self.notifications.get(timeout=remaining)
             except queue.Empty:
-                continue
+                item = {}  # Still check due probes when the queue is empty.
             if item is None:
                 raise NativeTaskCreationError(
                     "App Server disconnected before exact turn/completed; execution terminal is unknown",
                     thread_id=thread_id,
                 )
-            if item.get("method") != "turn/completed":
-                continue
-            params = item.get("params")
-            if not isinstance(params, dict):
-                continue
-            turn = params.get("turn")
-            if not isinstance(turn, dict):
-                continue
-            if (
-                str(params.get("threadId") or "") == thread_id
-                and str(turn.get("id") or "") == turn_id
-            ):
-                return turn
+            if item.get("method") == "turn/completed":
+                params = item.get("params")
+                turn = params.get("turn") if isinstance(params, dict) else None
+                if (isinstance(turn, dict) and params.get("threadId") == thread_id
+                        and turn.get("id") == turn_id):
+                    return turn
+            # Unrelated notification storms cannot starve the monotonic probe.
+            if enabled and time.monotonic() >= next_probe:
+                # Limit from the *end* as well, including failed/partial probes.
+                probe_deadline = time.monotonic() + min(self.config.turn_readback_timeout_seconds, 5.0)
+                if deadline is not None:
+                    probe_deadline = min(probe_deadline, deadline)
+                try:
+                    data = self.read_exact_turn(
+                        thread_id, turn_id, deadline=probe_deadline,
+                        _terminal_only=True, _control_poll=checked_control_poll,
+                        _terminal_probe=True,
+                    )
+                    selected = data["turns"][0]
+                    if (selected["status"] in {"completed", "failed", "interrupted"}
+                            and selected.get("items_scan_complete") is True
+                            and (selected["status"] != "completed"
+                                 or selected.get("final_answer_nonempty") is True)):
+                        # The complete final-only projection is consumed once by
+                        # Hold. Do not begin another readback with a fresh budget.
+                        final = selected["items"][0]["text"] if selected["items"] else ""
+                        checked_control_poll()
+                        if time.monotonic() >= probe_deadline:
+                            raise NativeTaskError("Hold terminal readback deadline exhausted after control poll")
+                        self._held_terminal_readback_diagnostic = {"state": "terminal", "reason": "exact native readback"}
+                        return OwnerExactTerminalReadback({"id": turn_id, "status": selected["status"],
+                                "error": selected["native_error"],
+                                "_owner_terminal_evidence": "owner_exact_terminal_readback",
+                                "_owner_final_message": final,
+                                "_owner_thread_id": thread_id})
+                    self._held_terminal_readback_diagnostic = {"state": "holding", "reason": "running or final unavailable"}
+                except _TerminalReadbackControlError as exc:
+                    raise exc.error
+                except Exception as exc:
+                    # Identity, protocol, partial scans and RPC errors license
+                    # neither owner results nor non-controlled Host cleanup.
+                    self._held_terminal_readback_diagnostic = {"state": "holding", "reason": str(exc)[:512]}
+                finally:
+                    # Keep only the fixed-size diagnostic while holding. Even
+                    # a huge blank final projection is not cached across polls.
+                    data = selected = final = None
+                    next_probe = time.monotonic() + 30.0
         raise NativeTaskCreationError(
             "timed out waiting for turn/completed",
             thread_id=thread_id,

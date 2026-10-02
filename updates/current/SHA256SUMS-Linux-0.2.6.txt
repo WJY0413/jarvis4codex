@@ -1,0 +1,3 @@
+9401a4299d91a3a3883ee128f47070a17fd1a0b92016b59ae6bf86414e6e89d4  Jarvis-0.2.6-Linux-dot.1-source.zip
+1ad568392618255cf26610a766fa39c6126fe23781bd01972bbb725c5ab6593b  jarvis_control_plane-0.2.6+dot.1-py3-none-any.whl
+2205f9f56a3fd687eb748d67c3ec074a030018a910389cc5300535e130449c36  Jarvis-0.2.6-Linux-dot.1-manifest.json

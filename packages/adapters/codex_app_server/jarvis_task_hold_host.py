@@ -391,7 +391,8 @@ def hold_task(
                 _validate_monitor_command(decision, hold_id=hold_id, turn_id=turn_id)
                 if decision.action == "CONTINUE" and stop_requested():
                     decision = turn_monitor._stop(monitor_request, decision.command_id, "cancelled",
-                                                  decision.final_message, "stop_requested")
+                                                  decision.final_message, "stop_requested",
+                                                  terminal_evidence=getattr(decision, "terminal_evidence", "owner_turn_completed"))
                 _append_monitor_events(events_path, decision)
                 final_message = decision.final_message
                 terminal_status = decision.result_status
@@ -499,7 +500,7 @@ def hold_task(
             "scheduler_failed_items": scheduler_failed_items,
             "terminal_confirmed": terminal_confirmed,
             "host_stop": interrupt_at is not None,
-            "terminal_evidence": "owner_turn_completed",
+            "terminal_evidence": getattr(decision, "terminal_evidence", "owner_turn_completed"),
             "observed_at": _now(),
             **runtime_fields(),
         })

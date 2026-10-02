@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable, Protocol
 
+from jarvis_runtime.jarvis_native_task_launcher import OwnerExactTerminalReadback
+
 
 class HeldTurnClient(Protocol):
     def wait_for_turn_terminal(
@@ -64,6 +66,7 @@ class HoldTurnDecision:
     continue_prompt: str | None
     notification_events: tuple[NotificationEvent, ...]
     error: Any = None
+    terminal_evidence: str = "owner_turn_completed"
 
 
 class HoldTurnMonitor:
@@ -71,39 +74,49 @@ class HoldTurnMonitor:
 
     def observe(self, client: HeldTurnClient, request: HoldTurnRequest) -> HoldTurnDecision:
         terminal = client.wait_for_turn_terminal(
-            request.thread_id, request.turn_id, wait_forever=True,
+            request.thread_id, request.turn_id, wait_forever=True, terminal_readback=True,
             **({"control_poll": request.control_poll} if request.control_poll is not None else {}),
         )
         terminal_status = str(terminal.get("status") or "unknown")
+        readback = (isinstance(terminal, OwnerExactTerminalReadback)
+                    and terminal.get("_owner_thread_id") == request.thread_id
+                    and terminal.get("id") == request.turn_id)
+        terminal_evidence = "owner_exact_terminal_readback" if readback else "owner_turn_completed"
+
+        def stop(*args: Any, **kwargs: Any) -> HoldTurnDecision:
+            return self._stop(*args, terminal_evidence=terminal_evidence, **kwargs)
+
         final_message = ""
         if terminal_status == "completed":
-            final_message = str(
+            final_message = terminal["_owner_final_message"] if readback else str(
                 client.wait_for_turn_readback(request.thread_id, request.turn_id,
                     **({"require_final_answer": True} if request.receive_final_answer else {})) or ""
             )
+            if readback and request.receive_final_answer is None:
+                final_message = final_message.strip()
         command_id = f"monitor:{request.hold_id}:{request.turn_id}:{request.turn_count}"
         if terminal_status != "completed":
             error = terminal.get("error")
             detail = error.get("message") if isinstance(error, dict) else error if isinstance(error, str) else None
-            return self._stop(request, command_id, terminal_status, final_message,
+            return stop(request, command_id, terminal_status, final_message,
                               str(detail or "non_completed_terminal"), error=error)
         verification = {}
         if request.receive_final_answer is not None and not final_message:
-            return self._stop(request, command_id, "blocked", final_message, "final_answer_unavailable")
+            return stop(request, command_id, "blocked", final_message, "final_answer_unavailable")
         if request.receive_final_answer is not None or request.verify_output is not None:
             verification = (request.receive_final_answer(final_message) if request.receive_final_answer
                             else request.verify_output())
             if verification.get("status") not in {"verified", "review", "legacy_unverified", "not_required"}:
-                return self._stop(request, command_id, "blocked", final_message,
+                return stop(request, command_id, "blocked", final_message,
                                   str(verification.get("reason") or "candidate_output_unverified"))
         if request.stop_requested is not None and request.stop_requested():
-            return self._stop(request, command_id, "cancelled", final_message, "stop_requested")
+            return stop(request, command_id, "cancelled", final_message, "stop_requested")
         if _worker_reported_blocked(final_message, explicit_only=(request.receive_final_answer is not None or verification.get("status") == "review")):
-            return self._stop(request, command_id, "blocked", final_message, "worker_reported_blocked")
+            return stop(request, command_id, "blocked", final_message, "worker_reported_blocked")
         if request.turn_count >= request.max_turns:
-            return self._stop(request, command_id, "turn_limit_reached", final_message, "turn_budget_consumed")
+            return stop(request, command_id, "turn_limit_reached", final_message, "turn_budget_consumed")
         if not request.continuation_enabled:
-            return self._stop(request, command_id, "completed", final_message, "continuation_disabled")
+            return stop(request, command_id, "completed", final_message, "continuation_disabled")
         return HoldTurnDecision(
             action="CONTINUE",
             command_id=command_id,
@@ -114,6 +127,7 @@ class HoldTurnMonitor:
             reason="completed_under_budget",
             continue_prompt=request.continue_prompt,
             notification_events=self._milestone_events(request, "completed"),
+            terminal_evidence=terminal_evidence,
         )
 
     def _stop(
@@ -124,6 +138,7 @@ class HoldTurnMonitor:
         final_message: str,
         reason: str,
         error: Any = None,
+        terminal_evidence: str = "owner_turn_completed",
     ) -> HoldTurnDecision:
         events = list(self._milestone_events(request, result_status))
         if request.notification_policy.terminal:
@@ -148,6 +163,7 @@ class HoldTurnMonitor:
             continue_prompt=None,
             notification_events=tuple(events),
             error=error,
+            terminal_evidence=terminal_evidence,
         )
 
     @staticmethod
