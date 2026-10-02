@@ -1,0 +1,9 @@
+Draft release note — not yet published
+
+Three focused reliability fixes have passed code review and targeted offline validation:
+
+- Isolate terminal-monitor baselines by monitor, observed thread, and receipt route. Legacy state establishes a fresh baseline before triggering a continuation.
+- Determine notification completion from persisted output results so a later successful delivery cannot conceal an earlier failure.
+- Serialize local heartbeat execution for each database, preventing overlapping schedulers from executing and recording the same bounded run twice.
+
+The patch changes three shared implementation files and four existing test files. The three original failure scenarios now pass, together with 20 selected contract tests on Windows. Application to the Linux comparison source also passed. Native Linux lock validation and the existing release acceptance gate remain pending; no public release is implied.

@@ -1,0 +1,46 @@
+{
+  "schema": "jarvis-026-reviewed-three-fix-handoff/v1",
+  "target_release": "0.2.6",
+  "patch_sha256": "32aef4e13ca4f12d2fdd07cea34e3ca2d8df205d1c3155e15dc7deec50fa20c7",
+  "review_result": "PASS",
+  "original_reproductions_fixed": 3,
+  "selected_independent_contract_tests_passed": 20,
+  "windows_baseline_file_count": 93,
+  "windows_candidate_file_count": 93,
+  "aggregate_algorithm": "SHA256 UTF-8 sorted relative path TAB sha256 LF records",
+  "windows_baseline_aggregate_sha256": "5d73e4a0d720c041533fa7e53ceaba13b919d48d97e9f2de2cfc52e9cd19e093",
+  "windows_candidate_aggregate_sha256": "16f82fd83378080db0f07998469e1a590d7895016b2816a38b3f6e0c811e8d76",
+  "changed_files": {
+    "packages/jarvis_codex_bridge/monitor.py": {
+      "before": "ec94cf6a9c0e82287488125cba7077edf5edad81787737d9a44ba63314156853",
+      "after": "0bac5bd3c8dd6102df4c75bcf2917e9c1aecbe48e01ed1ce478ca93632827fec"
+    },
+    "packages/jarvis_monitor/service.py": {
+      "before": "e24612d183171df4217b8081eeb6ce6a5792227478e05068d84b0c903ce1fcdf",
+      "after": "3a93794b65ca5e5938cafdf41d09f4067a2fc86e689c60f8975d5f15df9eb1c6"
+    },
+    "packages/jarvis_runtime/jarvis_local_heartbeat.py": {
+      "before": "8d898da8a39311491cd7d90f92ea18f7f0678dfac4dcd0af73e6b03a4e3cf3d1",
+      "after": "bae00826402fe47bc0d9ed1ad54f2256b697020b08d7812313685194b843c92e"
+    },
+    "tests/adapter_contract/test_mcp_wiring.py": {
+      "before": "41ba4e983e44886ef2046177157135e81ae3e97ba23b0a7f47b56a53cb2ad6f7",
+      "after": "a9f906674f9ce47b5fb01ef7451092f5c5c6a89fae0f92a13839e9f7a65d996b"
+    },
+    "tests/contract/test_codex_bridge.py": {
+      "before": "6fe663b64d0d6d91e0df31eddb364e9916dd6cf57a598802babd18da1c9402a9",
+      "after": "7d21c889b05b62a3f1c645e053d60e21486682da3b7375c18d9296dda9d0d942"
+    },
+    "tests/jarvis_runtime/test_jarvis_local_heartbeat.py": {
+      "before": "d18d951e6c7ce7c5692d9456af1b9fc367bb5058a1c604a69e82c0553c59657e",
+      "after": "212ec1e2428ed2386f3912d06cb75a92f91747f6fb6eaf51fed059f45323f2b8"
+    },
+    "tests/monitor/test_monitor_service.py": {
+      "before": "df3f57368d2bd79cbf0a5bd815904ce9c3983fc57220142d1c7ae261869cd1fb",
+      "after": "32da53446183aec5823bc1cdf6393d2ce4c6fd7042c4eee34a5bd6841f4c902a"
+    }
+  },
+  "linux_policy": "Seven-file patch application and three shared implementation AST comparisons passed on the reviewed Linux comparison source. Preserve platform test-fixture differences; final Linux native lock and original acceptance verification remain the Linux owner responsibility.",
+  "release_gate": "Final original acceptance of merged reviewed 0.2.6 source is still required per platform; this handoff is not a release or deployment.",
+  "excluded": "Private review logs, local paths, customer data, runtime state, credentials and operational configuration."
+}
