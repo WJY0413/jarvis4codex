@@ -1,0 +1,26 @@
+from typing import Protocol
+
+from jarvis_contracts import ExecutionReceipt, TargetRef
+
+
+class HarnessAdapter(Protocol):
+    """A stable boundary around a concrete agent harness."""
+
+    name: str
+
+    def health(self) -> dict[str, object]: ...
+
+    def preflight(self, target: TargetRef) -> None: ...
+
+    def trigger(self, target: TargetRef, envelope_ref: str) -> ExecutionReceipt: ...
+
+    def read_run(self, execution_id: str) -> ExecutionReceipt: ...
+
+
+class MonitorAdapter(Protocol):
+    """Versioned SDK seam for Monitor thread reads and output delivery."""
+
+    def read_thread(self, thread_id: str) -> dict[str, object]: ...
+    def resume_thread(self, thread_id: str, user_message_text: str, *, client_user_message_id: str, source_event_key: str, model: str | None, reasoning_effort: str | None) -> dict[str, object]: ...
+    def enqueue_bot_notification(self, *, monitor_id: str, observed_thread_id: str, notification_text: str, source_event_key: str) -> dict[str, object]: ...
+    def read_bot_delivery(self, outbox_id: str) -> dict[str, object]: ...

@@ -1,0 +1,444 @@
+{
+  "schema": "jarvis-canonical-coverage/v1",
+  "target_version": "0.3.0",
+  "blocks": {
+    "B01": "功能与接口",
+    "B02": "交付正确性",
+    "B03": "生命周期与退出",
+    "B04": "资源使用与回收",
+    "B05": "并发与隔离",
+    "B06": "故障与恢复",
+    "B07": "持久化与版本兼容",
+    "B08": "安全与可追溯"
+  },
+  "suite_files": [
+    "test_suite_entry_e2e.py",
+    "test_suite_protocol_e2e.py"
+  ],
+  "file_blocks": {
+    "adapter_contract/test_feishu_outbox_notification.py": [
+      "B02",
+      "B03",
+      "B05",
+      "B08"
+    ],
+    "adapter_contract/test_hold_host_recovery.py": [
+      "B03",
+      "B04",
+      "B05",
+      "B06",
+      "B08"
+    ],
+    "adapter_contract/test_hold_receipt_write.py": [
+      "B03",
+      "B04",
+      "B06"
+    ],
+    "adapter_contract/test_mcp_wiring.py": [
+      "B01",
+      "B02",
+      "B03",
+      "B05",
+      "B06",
+      "B07",
+      "B08"
+    ],
+    "adapter_contract/test_model_web_acceptance.py": [
+      "B01",
+      "B08"
+    ],
+    "adapter_contract/test_monitor_adapter.py": [
+      "B02",
+      "B03",
+      "B05",
+      "B06",
+      "B07",
+      "B08"
+    ],
+    "adapter_contract/test_task_provisioning_adapter.py": [
+      "B01",
+      "B02",
+      "B06",
+      "B07",
+      "B08"
+    ],
+    "contract/test_codex_bridge.py": [
+      "B02",
+      "B03",
+      "B05",
+      "B08"
+    ],
+    "contract/test_engine_boundary.py": [
+      "B06",
+      "B07",
+      "B08"
+    ],
+    "contract/test_existing_thread_loop_adoption.py": [
+      "B01"
+    ],
+    "contract/test_jarvis_loop.py": [
+      "B02",
+      "B03",
+      "B06",
+      "B07",
+      "B08"
+    ],
+    "contract/test_jarvis_mcp.py": [
+      "B01",
+      "B02",
+      "B03",
+      "B05",
+      "B06",
+      "B08"
+    ],
+    "jarvis_runtime/test_coo_dispatcher_store.py": [
+      "B06",
+      "B07",
+      "B08"
+    ],
+    "jarvis_runtime/test_jarvis_heartbeat_service.py": [
+      "B02",
+      "B03",
+      "B05",
+      "B06",
+      "B07",
+      "B08"
+    ],
+    "jarvis_runtime/test_jarvis_local_heartbeat.py": [
+      "B02",
+      "B03",
+      "B05",
+      "B07",
+      "B08"
+    ],
+    "jarvis_runtime/test_jarvis_native_task_launcher.py": [
+      "B01",
+      "B04",
+      "B06",
+      "B07",
+      "B08"
+    ],
+    "jarvis_runtime/test_jarvis_task_hold_host.py": [
+      "B01",
+      "B02",
+      "B03",
+      "B04",
+      "B06",
+      "B07",
+      "B08"
+    ],
+    "monitor/test_hold_turn_monitor.py": [
+      "B02",
+      "B03",
+      "B05",
+      "B08"
+    ],
+    "monitor/test_monitor_service.py": [
+      "B02",
+      "B03",
+      "B05",
+      "B08"
+    ],
+    "test_027_registry_versions.py": [
+      "B01",
+      "B02",
+      "B04",
+      "B06",
+      "B07",
+      "B08"
+    ],
+    "test_capacity99.py": [
+      "B04",
+      "B05"
+    ],
+    "test_cloud_coldstart.py": [
+      "B01",
+      "B02",
+      "B04",
+      "B06",
+      "B07",
+      "B08"
+    ],
+    "test_distribution_identity.py": [
+      "B04",
+      "B06",
+      "B07",
+      "B08"
+    ],
+    "test_file_task_paged_readback_guard.py": [
+      "B06",
+      "B07",
+      "B08"
+    ],
+    "test_first_create_nondispatch.py": [
+      "B03",
+      "B04",
+      "B06",
+      "B07",
+      "B08"
+    ],
+    "test_host_memory_bounded_readback.py": [
+      "B04",
+      "B05"
+    ],
+    "test_hot_capacity.py": [
+      "B03",
+      "B04",
+      "B05",
+      "B06"
+    ],
+    "test_integrated_boundaries.py": [
+      "B03",
+      "B04",
+      "B05",
+      "B06",
+      "B07"
+    ],
+    "test_latest_thread_activity.py": [
+      "B01",
+      "B02",
+      "B03",
+      "B05",
+      "B08"
+    ],
+    "test_legacy_cloud_contracts.py": [
+      "B01",
+      "B08"
+    ],
+    "test_linux_pid_errno.py": [
+      "B03",
+      "B04",
+      "B06"
+    ],
+    "test_load_latest_activity.py": [
+      "B01"
+    ],
+    "test_loop_schema_registry.py": [
+      "B01",
+      "B02",
+      "B07",
+      "B08"
+    ],
+    "test_management_cancellation.py": [
+      "B03",
+      "B06",
+      "B07",
+      "B08"
+    ],
+    "test_original_hold_succession.py": [
+      "B03",
+      "B06",
+      "B07",
+      "B08"
+    ],
+    "test_owner_terminal_readback_fallback.py": [
+      "B03",
+      "B06",
+      "B08"
+    ],
+    "test_public_exact_turn_read.py": [
+      "B01",
+      "B02",
+      "B03",
+      "B04",
+      "B05",
+      "B06",
+      "B08"
+    ],
+    "test_scheduler_history_count.py": [
+      "B02",
+      "B04",
+      "B05",
+      "B06",
+      "B07",
+      "B08"
+    ],
+    "test_secure_inbox_capability_fake.py": [
+      "B01",
+      "B08"
+    ],
+    "test_windows_secure_inbox_gate.py": [
+      "B04",
+      "B06",
+      "B07",
+      "B08"
+    ],
+    "test_suite_entry_e2e.py": [
+      "B01",
+      "B02",
+      "B03",
+      "B04",
+      "B06",
+      "B08"
+    ],
+    "test_suite_protocol_e2e.py": [
+      "B01",
+      "B02",
+      "B03",
+      "B04",
+      "B05",
+      "B07",
+      "B08"
+    ],
+    "suite_fixtures.py": [
+      "B01",
+      "B02",
+      "B03",
+      "B04",
+      "B05",
+      "B06",
+      "B07",
+      "B08"
+    ]
+  },
+  "evidence_levels": {
+    "source": "protocol_isolated",
+    "legacy": "protocol_isolated",
+    "suite": "protocol_isolated",
+    "fixture": "simulated"
+  },
+  "profiles": {
+    "core": [
+      "source::test_027_registry_versions.CurrentRegistryVersions.test_exact_seventeen_tools_preserve_slice4_public_schema",
+      "source::test_public_exact_turn_read.ExactTurnReadTests.test_public_create_skill_exact_read_requires_task_id_even_with_thread_id",
+      "source::test_loop_schema_registry.LoopSchemaRegistryE2E.test_create_upload_replay_conflict_and_legacy_state_preservation",
+      "source::test_loop_schema_registry.LoopSchemaRegistryE2E.test_selected_snapshot_reaches_hold_and_result_check_without_business_approval",
+      "legacy::test_feishu_outbox_notification.FeishuOutboxNotificationContractTest.test_notification_requires_exact_delivered_readback",
+      "source::test_management_cancellation.ManagementCancellation.test_unknown_owner_closes_management_without_fabricating_terminal",
+      "source::test_management_cancellation.ManagementCancellation.test_queued_holder_checks_cancellation_before_creating_a_client",
+      "legacy::test_jarvis_loop.JarvisLoopContractTest.test_rotation_requires_released_success_and_respects_manual_stop_and_expiry",
+      "source::test_hold_host_recovery.HoldHostRecoveryAdapterContractTest.test_shared_scan_skips_history_preserves_twenty_workers_and_sees_requeue",
+      "source::test_cloud_coldstart.CloudColdstartTest.test_unresponsive_test_process_times_out_and_is_reaped",
+      "source::test_capacity99.Capacity99.test_mcp_schema_and_facade_agree",
+      "source::test_hot_capacity.HotCapacityTests.test_absolute_target_replay_never_adds_fifteen_again",
+      "source::test_jarvis_local_heartbeat.LocalHeartbeatTest.test_shared_db_owner_blocks_another_process_until_record_completes",
+      "source::test_hold_host_recovery.HoldHostRecoveryAdapterContractTest.test_request_or_ack_write_failure_keeps_claim_and_recovery_can_retry",
+      "source::test_original_hold_succession.OriginalHoldSuccessionTests.test_missing_original_backend_is_structured_and_has_no_new_call_or_claim",
+      "source::test_task_provisioning_adapter.TaskProvisioningAdapterContractTest.test_batch_history_migrates_old_rows_once_and_reads_legacy_without_writes",
+      "legacy::test_engine_boundary.EngineBoundaryTest.test_engine_uses_only_harness_contract"
+    ],
+    "entry": [
+      "suite::test_suite_entry_e2e.SuiteEntryE2E.test_nested_discovery_and_eight_block_filter",
+      "suite::test_suite_entry_e2e.SuiteEntryE2E.test_exact_loaded_source_and_passing_fixture",
+      "suite::test_suite_entry_e2e.SuiteEntryE2E.test_wrong_version_or_hash_rejects_with_report",
+      "suite::test_suite_entry_e2e.SuiteEntryE2E.test_method_and_subtest_statistics_preserve_failure",
+      "suite::test_suite_entry_e2e.SuiteEntryE2E.test_missing_evidence_is_not_run_and_incomplete",
+      "suite::test_suite_entry_e2e.SuiteEntryE2E.test_deadline_reaps_owned_descendant_and_saves_report",
+      "suite::test_suite_entry_e2e.SuiteEntryE2E.test_cancel_reaps_owned_descendant_and_saves_report"
+    ],
+    "protocol": [
+      "suite::test_suite_protocol_e2e.SharedHttpE2E.test_concurrent_clients_schema_isolation_replay_conflict_and_reconnect",
+      "suite::test_suite_protocol_e2e.SharedHttpE2E.test_unknown_close_is_durable_and_never_confirms_release",
+      "suite::test_suite_protocol_e2e.SharedHttpE2E.test_readonly_clients_resource_repeat_and_service_exit"
+    ],
+    "resources": [
+      "suite::test_suite_protocol_e2e.SharedHttpE2E.test_readonly_clients_resource_repeat_and_service_exit",
+      "source::test_cloud_coldstart.CloudColdstartTest.test_unresponsive_test_process_times_out_and_is_reaped",
+      "source::test_scheduler_history_count.SchedulerHistoryCountTests.test_count_streams_one_needed_column_without_payload_or_fetchall",
+      "source::test_public_exact_turn_read.ExactTurnReadTests.test_large_tool_pages_released_before_next_rpc_and_not_returned"
+    ]
+  },
+  "gaps": [
+    {
+      "id": "MODEL_SCHEMA_TERMINAL",
+      "blocks": [
+        "B01",
+        "B02",
+        "B03"
+      ],
+      "reason": "No finite authorized real-model synthetic manifest/Home/model readback; normal and recovery chains separate",
+      "product_not_implemented": false
+    },
+    {
+      "id": "AUTHORITATIVE_RECOVERY",
+      "blocks": [
+        "B03",
+        "B06"
+      ],
+      "reason": "Actual original-generation backend and finite authorized recovery manifest absent",
+      "product_not_implemented": false
+    },
+    {
+      "id": "CAPACITY99_LIVE",
+      "blocks": [
+        "B04",
+        "B05"
+      ],
+      "reason": "99 is design ceiling; live99 or20+30 budget/workload not authorized or measured",
+      "product_not_implemented": false
+    },
+    {
+      "id": "RESOURCE_ACCEPTANCE",
+      "blocks": [
+        "B04"
+      ],
+      "reason": "Whole-tree measurements have no agreed/empirical acceptance threshold; measurements only",
+      "product_not_implemented": false
+    },
+    {
+      "id": "GLOBAL_MEMORY_ADMISSION",
+      "blocks": [
+        "B04"
+      ],
+      "reason": "Configurable live whole-machine new-action admission is implemented; independent QA and real workload-pressure acceptance remain unexecuted. No continuously enforced hard limit is promised",
+      "product_not_implemented": false
+    },
+    {
+      "id": "LOOP_PAUSE_RESUME",
+      "blocks": [
+        "B03"
+      ],
+      "reason": "Public Loop pause/resume API is not implemented",
+      "product_not_implemented": true
+    },
+    {
+      "id": "SHARED_LISTENER_RECOVERY",
+      "blocks": [
+        "B05",
+        "B06"
+      ],
+      "reason": "Client reconnect is covered; native listener fault/bounded rebuild behavior not yet E2E executed",
+      "product_not_implemented": false
+    },
+    {
+      "id": "OPTIONAL_LOCAL_INTEGRATIONS",
+      "blocks": [
+        "B01",
+        "B02"
+      ],
+      "reason": "Private routing/visible dispatcher/durable executor/metrics dependencies are not bundled",
+      "product_not_implemented": false
+    }
+  ],
+  "inheritance": "All source/legacy contracts remain in the canonical tests directory. Rev9 migrates explicit version/public-contract fixtures and reproduced defects while preserving security/lifecycle assertions; requirement-bound memory cases were recorded red before implementation. baseline_refs and detail_design_ref are external historical provenance, not runtime dependencies. Historical receipts do not become new execution scores.",
+  "known_original_failures": [
+    "Host healthy-seat timing race",
+    "Windows strict stdio coldstart",
+    "Linux fixture/sysconf/secure-open mismatch on Windows"
+  ],
+  "case_contract": {
+    "normal": "Each discovered test keeps actual selector, file, block, basis, evidence class and cleanup under owned run",
+    "live": "not_run or not_implemented; no implicit model/notification/production action"
+  },
+  "baseline_refs": [
+    "updates/current/JARVIS_CANONICAL_BASELINE_REV7_WINDOWS_20261008.json",
+    "updates/current/JARVIS_CANONICAL_BASELINE_ROOT_OMITTED_20261008.json"
+  ],
+  "detail_design_ref": "updates/current/JARVIS_SKILL_EIGHT_BLOCK_ADAPTATION_20261008.json",
+  "bundled_legacy_files": [
+    "adapter_contract/test_feishu_outbox_notification.py",
+    "adapter_contract/test_hold_receipt_write.py",
+    "adapter_contract/test_mcp_wiring.py",
+    "adapter_contract/test_model_web_acceptance.py",
+    "adapter_contract/test_monitor_adapter.py",
+    "contract/test_codex_bridge.py",
+    "contract/test_engine_boundary.py",
+    "contract/test_existing_thread_loop_adoption.py",
+    "contract/test_jarvis_loop.py",
+    "contract/test_jarvis_mcp.py",
+    "jarvis_runtime/test_coo_dispatcher_store.py",
+    "jarvis_runtime/test_jarvis_heartbeat_service.py",
+    "jarvis_runtime/test_jarvis_native_task_launcher.py",
+    "monitor/test_hold_turn_monitor.py"
+  ]
+}

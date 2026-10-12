@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jarvis-control-plane"
+version = "0.3.0"
+description = "Harness-neutral control plane for governed agent heartbeats and monitoring"
+requires-python = ">=3.11"
+dependencies = [
+    "mcp[cli]>=2,<3",
+    "jsonschema>=4.20,<5",
+    "referencing>=0.30,<1",
+]
+
+[tool.setuptools]
+package-dir = {"" = "packages"}
+
+[tool.setuptools.packages.find]
+where = ["packages"]
+
+[tool.pytest.ini_options]
+pythonpath = ["packages"]
+testpaths = ["tests"]

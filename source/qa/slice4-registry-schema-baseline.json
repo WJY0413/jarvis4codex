@@ -1,0 +1,1240 @@
+{
+  "jarvis_callback": {
+    "properties": {
+      "request_id": {
+        "title": "Request Id",
+        "type": "string"
+      },
+      "run_id": {
+        "title": "Run Id",
+        "type": "string"
+      },
+      "source_ref": {
+        "title": "Source Ref",
+        "type": "string"
+      },
+      "source_thread_id": {
+        "title": "Source Thread Id",
+        "type": "string"
+      },
+      "source_turn_id": {
+        "title": "Source Turn Id",
+        "type": "string"
+      },
+      "target_input": {
+        "title": "Target Input",
+        "type": "string"
+      },
+      "target_thread_id": {
+        "title": "Target Thread Id",
+        "type": "string"
+      }
+    },
+    "required": [
+      "request_id",
+      "run_id",
+      "source_thread_id",
+      "source_turn_id",
+      "target_thread_id",
+      "target_input",
+      "source_ref"
+    ],
+    "title": "jarvis_callbackArguments",
+    "type": "object"
+  },
+  "jarvis_capacity": {
+    "properties": {
+      "inputs": {
+        "items": {
+          "type": "string"
+        },
+        "maxItems": 99,
+        "minItems": 1,
+        "title": "Inputs",
+        "type": "array"
+      },
+      "project": {
+        "title": "Project",
+        "type": "string"
+      },
+      "request_id": {
+        "title": "Request Id",
+        "type": "string"
+      },
+      "run_id": {
+        "title": "Run Id",
+        "type": "string"
+      }
+    },
+    "required": [
+      "request_id",
+      "run_id",
+      "project",
+      "inputs"
+    ],
+    "title": "jarvis_capacityArguments",
+    "type": "object"
+  },
+  "jarvis_close": {
+    "properties": {
+      "hold_id": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Hold Id"
+      },
+      "loop_id": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Loop Id"
+      },
+      "request_id": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Request Id"
+      }
+    },
+    "title": "jarvis_closeArguments",
+    "type": "object"
+  },
+  "jarvis_contract_check": {
+    "properties": {
+      "contract_id": {
+        "title": "Contract Id",
+        "type": "string"
+      },
+      "expected_code_sha256": {
+        "title": "Expected Code Sha256",
+        "type": "string"
+      },
+      "expected_config_sha256": {
+        "title": "Expected Config Sha256",
+        "type": "string"
+      },
+      "request_id": {
+        "title": "Request Id",
+        "type": "string"
+      }
+    },
+    "required": [
+      "request_id",
+      "contract_id",
+      "expected_code_sha256",
+      "expected_config_sha256"
+    ],
+    "title": "jarvis_contract_checkArguments",
+    "type": "object"
+  },
+  "jarvis_create": {
+    "properties": {
+      "auto_continue": {
+        "default": false,
+        "title": "Auto Continue",
+        "type": "boolean"
+      },
+      "continue_prompt": {
+        "default": "\u7ee7\u7eed",
+        "title": "Continue Prompt",
+        "type": "string"
+      },
+      "hold_id": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Hold Id"
+      },
+      "max_turns": {
+        "default": 1,
+        "title": "Max Turns",
+        "type": "integer"
+      },
+      "model": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Model"
+      },
+      "notifications": {
+        "anyOf": [
+          {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Notifications"
+      },
+      "project": {
+        "title": "Project",
+        "type": "string"
+      },
+      "prompt": {
+        "title": "Prompt",
+        "type": "string"
+      },
+      "reasoning_effort": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Reasoning Effort"
+      },
+      "request_id": {
+        "title": "Request Id",
+        "type": "string"
+      },
+      "role": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Role"
+      },
+      "run_id": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Run Id"
+      },
+      "source_ref": {
+        "default": "mcp:jarvis_create",
+        "title": "Source Ref",
+        "type": "string"
+      },
+      "test_only": {
+        "default": false,
+        "title": "Test Only",
+        "type": "boolean"
+      },
+      "title": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Title"
+      }
+    },
+    "required": [
+      "project",
+      "prompt",
+      "request_id"
+    ],
+    "title": "jarvis_createArguments",
+    "type": "object"
+  },
+  "jarvis_dispatch": {
+    "properties": {
+      "action": {
+        "enum": [
+          "start",
+          "read",
+          "release",
+          "stop",
+          "recover"
+        ],
+        "title": "Action",
+        "type": "string"
+      },
+      "prompt": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Prompt"
+      },
+      "request_id": {
+        "title": "Request Id",
+        "type": "string"
+      },
+      "run_id": {
+        "title": "Run Id",
+        "type": "string"
+      },
+      "source_ref": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Source Ref"
+      },
+      "target_thread_id": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Target Thread Id"
+      }
+    },
+    "required": [
+      "action",
+      "request_id",
+      "run_id"
+    ],
+    "title": "jarvis_dispatchArguments",
+    "type": "object"
+  },
+  "jarvis_heartbeat": {
+    "properties": {
+      "action": {
+        "enum": [
+          "create",
+          "update",
+          "cancel",
+          "health"
+        ],
+        "title": "Action",
+        "type": "string"
+      },
+      "heartbeat_id": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Heartbeat Id"
+      },
+      "options": {
+        "anyOf": [
+          {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Options"
+      },
+      "request_id": {
+        "title": "Request Id",
+        "type": "string"
+      },
+      "source_ref": {
+        "default": "mcp:jarvis_heartbeat",
+        "title": "Source Ref",
+        "type": "string"
+      }
+    },
+    "required": [
+      "action",
+      "request_id"
+    ],
+    "title": "jarvis_heartbeatArguments",
+    "type": "object"
+  },
+  "jarvis_hold": {
+    "properties": {
+      "auto_continue": {
+        "default": false,
+        "title": "Auto Continue",
+        "type": "boolean"
+      },
+      "continue_prompt": {
+        "default": "\u7ee7\u7eed",
+        "title": "Continue Prompt",
+        "type": "string"
+      },
+      "hold_id": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Hold Id"
+      },
+      "max_turns": {
+        "default": 1,
+        "title": "Max Turns",
+        "type": "integer"
+      },
+      "model": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Model"
+      },
+      "notifications": {
+        "anyOf": [
+          {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Notifications"
+      },
+      "project": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Project"
+      },
+      "prompt": {
+        "title": "Prompt",
+        "type": "string"
+      },
+      "reasoning_effort": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Reasoning Effort"
+      },
+      "request_id": {
+        "title": "Request Id",
+        "type": "string"
+      },
+      "source_ref": {
+        "default": "mcp:jarvis_hold",
+        "title": "Source Ref",
+        "type": "string"
+      },
+      "task_id": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Task Id"
+      },
+      "title": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Title"
+      }
+    },
+    "required": [
+      "request_id",
+      "prompt"
+    ],
+    "title": "jarvis_holdArguments",
+    "type": "object"
+  },
+  "jarvis_loop": {
+    "properties": {
+      "action": {
+        "default": "start",
+        "enum": [
+          "preflight",
+          "start",
+          "status",
+          "stop"
+        ],
+        "title": "Action",
+        "type": "string"
+      },
+      "auto_continue": {
+        "anyOf": [
+          {
+            "type": "boolean"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Auto Continue"
+      },
+      "business_skill": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "description": "Optional business Skill to inject into the Worker prompt.",
+        "title": "Business Skill"
+      },
+      "continue_prompt": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "description": "Optional continuation task prompt. New threads use prompt; omitted continuation reuses prompt.",
+        "title": "Continue Prompt"
+      },
+      "controller_skill": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "description": "Optional controller Skill to inject into the Worker prompt.",
+        "title": "Controller Skill"
+      },
+      "expires_at": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Expires At"
+      },
+      "interval_seconds": {
+        "anyOf": [
+          {
+            "type": "integer"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Interval Seconds"
+      },
+      "loop_id": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Loop Id"
+      },
+      "max_rounds": {
+        "anyOf": [
+          {
+            "type": "integer"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Max Rounds"
+      },
+      "max_turns": {
+        "anyOf": [
+          {
+            "type": "integer"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Max Turns"
+      },
+      "model": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Model"
+      },
+      "notifications": {
+        "anyOf": [
+          {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          {
+            "type": "boolean"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Notifications"
+      },
+      "project": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Project"
+      },
+      "prompt": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "description": "Required when action=start.",
+        "title": "Prompt"
+      },
+      "reasoning_effort": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Reasoning Effort"
+      },
+      "request_id": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Request Id"
+      },
+      "target_thread_count": {
+        "anyOf": [
+          {
+            "maximum": 99,
+            "minimum": 1,
+            "type": "integer"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Target Thread Count"
+      },
+      "threads": {
+        "anyOf": [
+          {
+            "items": {
+              "properties": {
+                "lane": {
+                  "properties": {
+                    "batch_size": {
+                      "default": 1,
+                      "minimum": 1,
+                      "type": "integer"
+                    },
+                    "result_verification": {
+                      "properties": {
+                        "mode": {
+                          "default": "file_receipt",
+                          "enum": [
+                            "file_receipt",
+                            "final_answer_json"
+                          ],
+                          "type": "string"
+                        },
+                        "output_schema": {
+                          "type": [
+                            "object",
+                            "boolean"
+                          ]
+                        }
+                      },
+                      "type": "object"
+                    }
+                  },
+                  "type": "object"
+                }
+              },
+              "type": "object"
+            },
+            "type": "array"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "description": "Optional finite-item lanes; omit lanes for open-ended tasks. batch_size defaults to 1. result_verification.mode defaults to file_receipt; final_answer_json requires batch_size=1, separate receipt_paths and terminal_statuses=['received']; Holder saves the exact final answer and payload with review_needed=true, never business QA approval. output_schema uses Draft 2020-12 with document-local refs and no $id; in final_answer_json mode mismatches are recorded for review, not rejected.",
+        "title": "Threads"
+      },
+      "title": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Title"
+      },
+      "turns_per_thread": {
+        "anyOf": [
+          {
+            "type": "integer"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "description": "Optional positive turn quota per thread, including its first turn. Rotate to a new thread in the same seat; max_rounds remains the total per seat.",
+        "title": "Turns Per Thread"
+      }
+    },
+    "title": "jarvis_loopArguments",
+    "type": "object"
+  },
+  "jarvis_monitor": {
+    "properties": {
+      "action": {
+        "enum": [
+          "observe",
+          "terminal_resume",
+          "status",
+          "deliver_hold_notifications"
+        ],
+        "title": "Action",
+        "type": "string"
+      },
+      "hold_id": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Hold Id"
+      },
+      "model": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Model"
+      },
+      "monitor_id": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Monitor Id"
+      },
+      "observed_task_id": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Observed Task Id"
+      },
+      "prompt": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Prompt"
+      },
+      "reasoning_effort": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Reasoning Effort"
+      },
+      "receipt_task_id": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Receipt Task Id"
+      },
+      "request_id": {
+        "title": "Request Id",
+        "type": "string"
+      },
+      "resume_task_id": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Resume Task Id"
+      },
+      "source_ref": {
+        "default": "mcp:jarvis_monitor",
+        "title": "Source Ref",
+        "type": "string"
+      }
+    },
+    "required": [
+      "action",
+      "request_id"
+    ],
+    "title": "jarvis_monitorArguments",
+    "type": "object"
+  },
+  "jarvis_notify": {
+    "properties": {
+      "message": {
+        "title": "Message",
+        "type": "string"
+      },
+      "request_id": {
+        "default": "mcp:jarvis_notify",
+        "title": "Request Id",
+        "type": "string"
+      },
+      "source_ref": {
+        "default": "mcp:jarvis_notify",
+        "title": "Source Ref",
+        "type": "string"
+      }
+    },
+    "required": [
+      "message"
+    ],
+    "title": "jarvis_notifyArguments",
+    "type": "object"
+  },
+  "jarvis_read": {
+    "properties": {
+      "hold_id": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Hold Id"
+      },
+      "subject": {
+        "enum": [
+          "capabilities",
+          "thread",
+          "hold",
+          "history"
+        ],
+        "title": "Subject",
+        "type": "string"
+      },
+      "task_id": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Task Id"
+      },
+      "thread_id": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Thread Id"
+      },
+      "turn_id": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Turn Id"
+      }
+    },
+    "required": [
+      "subject"
+    ],
+    "title": "jarvis_readArguments",
+    "type": "object"
+  },
+  "jarvis_read_delivery": {
+    "properties": {
+      "message_id": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Message Id"
+      },
+      "request_id": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Request Id"
+      }
+    },
+    "title": "jarvis_read_deliveryArguments",
+    "type": "object"
+  },
+  "jarvis_receipt": {
+    "properties": {
+      "request_id": {
+        "title": "Request Id",
+        "type": "string"
+      }
+    },
+    "required": [
+      "request_id"
+    ],
+    "title": "jarvis_receiptArguments",
+    "type": "object"
+  },
+  "jarvis_relay": {
+    "properties": {
+      "request_id": {
+        "title": "Request Id",
+        "type": "string"
+      },
+      "run_id": {
+        "title": "Run Id",
+        "type": "string"
+      },
+      "source_ref": {
+        "title": "Source Ref",
+        "type": "string"
+      },
+      "source_thread_id": {
+        "title": "Source Thread Id",
+        "type": "string"
+      },
+      "source_turn_id": {
+        "title": "Source Turn Id",
+        "type": "string"
+      },
+      "target_thread_id": {
+        "title": "Target Thread Id",
+        "type": "string"
+      }
+    },
+    "required": [
+      "request_id",
+      "run_id",
+      "source_thread_id",
+      "source_turn_id",
+      "target_thread_id",
+      "source_ref"
+    ],
+    "title": "jarvis_relayArguments",
+    "type": "object"
+  },
+  "jarvis_resume": {
+    "properties": {
+      "auto_continue": {
+        "default": false,
+        "title": "Auto Continue",
+        "type": "boolean"
+      },
+      "continue_prompt": {
+        "default": "\u7ee7\u7eed",
+        "title": "Continue Prompt",
+        "type": "string"
+      },
+      "hold_id": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Hold Id"
+      },
+      "hold_with_monitor": {
+        "default": true,
+        "title": "Hold With Monitor",
+        "type": "boolean"
+      },
+      "max_turns": {
+        "default": 1,
+        "title": "Max Turns",
+        "type": "integer"
+      },
+      "model": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Model"
+      },
+      "monitor_id": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Monitor Id"
+      },
+      "notifications": {
+        "anyOf": [
+          {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Notifications"
+      },
+      "prompt": {
+        "title": "Prompt",
+        "type": "string"
+      },
+      "reasoning_effort": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Reasoning Effort"
+      },
+      "request_id": {
+        "title": "Request Id",
+        "type": "string"
+      },
+      "source_ref": {
+        "default": "mcp:jarvis_resume",
+        "title": "Source Ref",
+        "type": "string"
+      },
+      "task_id": {
+        "title": "Task Id",
+        "type": "string"
+      }
+    },
+    "required": [
+      "task_id",
+      "prompt",
+      "request_id"
+    ],
+    "title": "jarvis_resumeArguments",
+    "type": "object"
+  },
+  "jarvis_update": {
+    "properties": {
+      "action": {
+        "default": "check",
+        "enum": [
+          "check",
+          "apply"
+        ],
+        "title": "Action",
+        "type": "string"
+      },
+      "request_id": {
+        "default": "mcp:jarvis_update",
+        "title": "Request Id",
+        "type": "string"
+      }
+    },
+    "title": "jarvis_updateArguments",
+    "type": "object"
+  }
+}

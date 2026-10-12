@@ -1,0 +1,91 @@
+{
+  "schema": "jarvis-030-rev9-controller-verification/v1",
+  "version": "0.3.0",
+  "revision": "rev9",
+  "public_release": false,
+  "full_product_acceptance_complete": false,
+  "source": {
+    "product_python_files": 51,
+    "windows_sha256": "621c3db30dac2adcbcd71a05a72428350cc44f445cf6ca29792d6e2b51a6a226",
+    "linux_posix_sha256": "016a38db534153a5d674b89b112af5e846963da59cc4a4cf0cb0221f37b32b12"
+  },
+  "memory_admission": {
+    "parameter": "memory_admission_max_used_percent",
+    "default": 95,
+    "adjustable_numeric_range": "(0,100] finite; bool and string are invalid",
+    "sample": "fresh whole-machine physical total and available",
+    "reject": "used percent >= threshold or unknown/invalid sample/policy",
+    "read_close_cleanup": "remain allowed",
+    "healthy_tasks_killed": false,
+    "continuous_hard_limit_claimed": false
+  },
+  "windows_original_complete_run": {
+    "selected": 600,
+    "methods_run": 599,
+    "passed_methods": 586,
+    "failed_methods": 0,
+    "error_methods": 1,
+    "skipped_methods": 11,
+    "partial_methods": 1,
+    "not_run": 1,
+    "failure_records": 0,
+    "error_records": 1,
+    "subtest_skip_records": 4,
+    "preserved_unmodified": true,
+    "maintenance_receipt": "updates/current/JARVIS_030_WINDOWS_FINAL_REV9_20261009/receipt.json"
+  },
+  "windows_necessary_followup": {
+    "fixture_change": "one existing fixture adds native.config=self.config; safety assertions unchanged",
+    "methods_run": 22,
+    "passed_methods": 22,
+    "maintenance_receipt": "updates/current/JARVIS_DELIVERY_REV9_ADMISSION_FIX_20261009/final-original-succession-fixture/receipt.json"
+  },
+  "windows_latest_unique_method_evidence": {
+    "selected": 600,
+    "passed": 587,
+    "failed": 0,
+    "error": 0,
+    "skipped": 11,
+    "partial": 1,
+    "not_run": 1,
+    "attribution": "latest per-selector reconciliation, not a new single full run"
+  },
+  "linux_affected_evidence": {
+    "initial": "67 passed, 2 not started at 120-second deadline; original deadline receipt preserved",
+    "followup": "remaining 2 plus succession 22: 24 passed",
+    "distinct_passed_methods": 91,
+    "full_suite_claimed": false,
+    "maintenance_receipts": [
+      "updates/current/JARVIS_030_LINUX_AFFECTED_REV9_20261009/receipt.json",
+      "updates/current/JARVIS_030_LINUX_FOLLOWUP_REV9_20261009/receipt.json"
+    ]
+  },
+  "independent_qa": {
+    "canonical_methods_passed": 10,
+    "source_blockers_found": 0,
+    "maintenance_receipt": "updates/current/JARVIS_DELIVERY_REV9_INDEPENDENT_QA_20261009/source-axis/receipt.json",
+    "additional_probe": "synthetic diagnostic only; not a parallel suite"
+  },
+  "skills": {
+    "packaged": 17,
+    "creator_format_valid": 17,
+    "all_live_integrations_claimed": false,
+    "ordinary_create_idempotency_not_promised": true
+  },
+  "effects": {
+    "model_turns": 0,
+    "business_redispatch": false,
+    "production_027_changed": false,
+    "credentials_copied": false,
+    "codex_restarted": false,
+    "completed_runs_owned_cleanup_confirmed": true
+  },
+  "remaining": [
+    "bounded real product model-to-Schema-to-terminal-to-release-to-close on this source",
+    "supported authoritative original-generation recovery if claimed",
+    "20+30/99 live resource and cross-environment claim acceptance if claimed",
+    "optional dependencies and per-integration live evidence",
+    "separate TEST loaded-version receipt and production/publication authorization"
+  ],
+  "provenance_note": "Maintenance receipt paths are evidence indexes, not required bundle execution resources; original historical scores are not reassigned."
+}
