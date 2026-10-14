@@ -30,7 +30,7 @@ try:
 except ImportError:  # Windows can inspect the CLI, but cannot run this Linux-only workflow.
     fcntl = None
 
-BUILD = "Jarvis 0.3.0 Linux (candidate)"
+BUILD = "Jarvis 0.3.1 Linux (candidate)"
 TEXT_ITEMS = {"userMessage", "agentMessage", "reasoning", "contextCompaction"}
 
 

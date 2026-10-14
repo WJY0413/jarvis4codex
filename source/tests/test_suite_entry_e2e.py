@@ -67,7 +67,7 @@ class SuiteEntryE2E(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(receipt["counts"]["passed"], 1)
         self.assertTrue(receipt["source"]["loaded_identity_verified"])
-        self.assertEqual(receipt["source"]["loaded_version"], "0.3.0")
+        self.assertEqual(receipt["source"]["loaded_version"], "0.3.1")
         self.assertTrue(receipt["cleanup"]["confirmed"])
 
     def test_wrong_version_or_hash_rejects_with_report(self):

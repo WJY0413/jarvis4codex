@@ -1,24 +1,37 @@
 {
   "schema": "jarvis-test-distribution-check/v1",
-  "release_tag": "v0.3.0-rev10-test",
-  "status": "passed_selected_scope",
-  "distribution_methods_passed": 2,
-  "public_redaction_affected_existing_methods_passed": 28,
-  "source_windows_sha256": "2005b02ba488a14675661dc1df03397e8aaaa141244057e8bfaa5350d73763fd",
-  "source_version": "0.3.0",
+  "release_tag": "v0.3.1",
+  "source_version": "0.3.1",
+  "source_windows_sha256": "df06d24745126729990864b041cd8e70d24b9f455935fb7e2ae2a2a7f7337cef",
   "product_python_files": 52,
+  "rollup_baseline": "v0.3.0-rev10-test / 479e21d691cbbc2508b0ad8fc3e15a239b405c15",
+  "version_and_distribution_core": {
+    "passed": 3,
+    "failed": 0,
+    "error": 0,
+    "scope": "Existing metadata/MCP version, all three product BUILD labels, and installed-like source identity."
+  },
+  "affected_seven_method_comparison": {
+    "before": {
+      "passed": 6,
+      "error": 1
+    },
+    "after": {
+      "passed": 6,
+      "error": 1
+    },
+    "unchanged_error": "HTTP readonly fixture's inherited assertion: 19 tools != 17; not changed for this version-only release."
+  },
+  "test_order": "Existing affected cases ran before test edits. Fixed version expectations changed first; two existing registry/build methods then failed on unchanged 0.3.0 product metadata, before product metadata was updated.",
+  "new_test_methods": 0,
   "model_turns": 0,
   "production_accessed": false,
-  "services_restarted": false,
-  "scope": "Shipping layout, installed-like identity and scoped dispatcher/native-launcher fixtures only.",
+  "installed_runtime_modified": false,
+  "scope": "Version metadata and necessary version expectations only. No new business-logic, production, full-suite or live-model acceptance.",
   "selectors": [
-    "source::test_distribution_identity.DistributionIdentityE2E.test_unrelated_installed_dependency_does_not_change_product_identity",
-    "source::test_027_registry_versions.CurrentRegistryVersions.test_distribution_and_advertised_mcp_version_are_same_prerelease"
+    "source::test_027_registry_versions.CurrentRegistryVersions.test_distribution_and_advertised_mcp_version_are_same_prerelease",
+    "source::test_027_registry_versions.CurrentRegistryVersions.test_all_product_builds_use_the_same_candidate_version",
+    "source::test_distribution_identity.DistributionIdentityE2E.test_unrelated_installed_dependency_does_not_change_product_identity"
   ],
-  "public_redaction_modules": [
-    "tests.jarvis_runtime.test_coo_dispatcher_store",
-    "tests.jarvis_runtime.test_jarvis_native_task_launcher"
-  ],
-  "initial_rejected_invocations": "Historical default source hash was rejected; a separate module-only selector attempt was rejected before tests. The final invocation explicitly pinned the sanitized source identity and exact method selectors.",
-  "repeat": "See source/tests/README_SUITE.md for the exact bounded Windows command."
+  "repeat": "See source/tests/README_SUITE.md for the explicit bounded Windows command."
 }

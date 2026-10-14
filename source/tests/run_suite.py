@@ -19,7 +19,7 @@ import unittest
 from datetime import datetime, timezone
 
 HERE = Path(__file__).resolve().parent
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 CODE_SHA = "621c3db30dac2adcbcd71a05a72428350cc44f445cf6ca29792d6e2b51a6a226"
 PRODUCT_PACKAGES = ("adapters", "jarvis_codex_bridge", "jarvis_contracts", "jarvis_control",
                     "jarvis_engine", "jarvis_harness_sdk", "jarvis_mcp", "jarvis_monitor",

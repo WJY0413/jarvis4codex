@@ -1,25 +1,31 @@
-# Share report: Jarvis rev10 TEST
+# Share report: Jarvis 0.3.1 TEST
 
-This distribution makes the reviewed prediction/task, Windows result-lock and
-memory-admission changes available for source review without bundling a local
-installation or its state. It advances the TEST release line only. The previous
-TEST assets and the stable release are retained.
+Version 0.3.1 consolidates the reviewed 0.3.0 revision series through rev10.
+The source, canonical tests, schemas and 17 existing Skills come from that
+published public-safe baseline. Only product-version metadata, fixed version
+expectations, runner version metadata and public explanations change in this
+rollup. No unpublished working-tree features or local deployment settings enter
+the package.
 
-Start with `README.md`, inspect `source/packages/`, then use the canonical suite
-under `source/tests/` for explicitly selected checks. Skills are unchanged from
-rev9. `DISTRIBUTION_CHECK.json` is a bounded packaging check, not model acceptance.
+Start with `README.md`, inspect `source/packages/`, and use the explicitly pinned
+canonical checks in `source/tests/README_SUITE.md`. Package metadata, advertised
+MCP version and the three product build labels agree on 0.3.1. Existing schema
+and protocol identifiers keep their own versions.
 
-The public copy comes from the reviewed candidate, not the repository's dirty
-working tree. A historical private requirement-chat identifier in dispatcher
-metadata is blanked. A native-launcher fixture uses a clearly synthetic UUID.
-Those redactions do not change admission or dispatch behavior. Existing public
-author/operator wording and compatibility parsing are retained.
+The inherited release line covers managed Hold/Monitor/Loop lifecycle,
+evidence-backed and soft final-answer results, dispatch and close/cancellation,
+schema validation, native
+prediction/task continuation, Windows archive locking and the memory-admission
+switch. A version rollup is not new live-service acceptance: the README preserves
+the incomplete 25-result run, separate owner-terminal evidence gap, four
+cancellation fixture failures and stale 17-tool HTTP fixture assertion.
 
-No local launcher, credentials, runtime databases, raw logs, customer records or
-internal audit receipts are included. The product memory gate still defaults to
-enabled. Explicit per-machine opt-out remains possible and requires newly loaded
-code; this publication neither reloads nor restarts a resident process.
+The public copy retains rev10's blank historical requirement-chat metadata and
+synthetic native-launcher fixture UUID. Credentials, local launchers, state,
+raw logs, customer records and internal audit receipts are excluded. Product
+memory protection defaults to enabled; a workstation opt-out is not bundled.
 
-The known owner-terminal evidence gap and inherited cancellation fixture failures
-remain visible in the README. Review this as a prerelease, not as production or
-complete 5-by-5 acceptance. No license change is part of this publication.
+This publication is a TEST prerelease. It does not install, reload or restart a
+runtime, modify the main branch, overwrite older releases or promote a stable
+release. No license change is introduced. Reviewers should use the scoped
+receipts without treating them as production or complete live-model approval.

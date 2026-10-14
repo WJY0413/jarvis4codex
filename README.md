@@ -1,21 +1,35 @@
-# Jarvis 0.3.0 rev10 — TEST prerelease
+# Jarvis 0.3.1 — TEST prerelease
 
-Jarvis coordinates bounded Codex work through Hold, Monitor and Loop. This TEST
-snapshot adds native prediction/task continuation, a configurable physical-memory
-admission gate and the reviewed Windows result-archive locking repair to rev9.
-Package metadata remains `0.3.0`; the release tag is `v0.3.0-rev10-test`.
+Jarvis coordinates bounded Codex work through Hold, Monitor and Loop.
+Version 0.3.1 rolls up the reviewed 0.3.0 revision series through rev10 under one
+product version. It is not just a renamed asset: package metadata, MCP advertised
+version and product build labels all report `0.3.1`. The release tag is `v0.3.1`.
+
+## What is included
+
+This snapshot inherits the reviewed revision work: managed Hold/Monitor/Loop
+lifecycle and receipts; exact-turn result and terminal readback; soft final-answer
+JSON capture marked for review, not business approval; bounded dispatch/task
+continuation and close/cancellation handling; schema-backed result validation;
+and the canonical source/fixture distribution. It also includes the reviewed
+native prediction/task continuation, Windows result-archive sharing/binding-lock
+repair, and configurable physical-memory admission policy.
+
+This rollup does not add new business logic beyond rev10. Historical protocol
+and schema identifiers are unchanged. It preserves existing evidence limits
+rather than treating the new version number as completed production acceptance.
 
 ## Download and review
 
-Download `Jarvis-0.3.0-rev10-test.zip`, `FILE_MANIFEST.json` and `SHA256SUMS.txt`
+Download `Jarvis-0.3.1-test.zip`, `FILE_MANIFEST.json` and `SHA256SUMS.txt`
 from the release assets. Verify the ZIP checksum before extracting it into a new
 directory. The manifest records the exact bytes of every included file.
 
 ```powershell
-gh release download v0.3.0-rev10-test --repo WJY0413/jarvis4codex --dir jarvis-download
-Get-FileHash jarvis-download/Jarvis-0.3.0-rev10-test.zip -Algorithm SHA256
+gh release download v0.3.1 --repo WJY0413/jarvis4codex --dir jarvis-download
+Get-FileHash jarvis-download/Jarvis-0.3.1-test.zip -Algorithm SHA256
 # Compare with SHA256SUMS.txt before extraction.
-Expand-Archive jarvis-download/Jarvis-0.3.0-rev10-test.zip -DestinationPath jarvis-test-source
+Expand-Archive jarvis-download/Jarvis-0.3.1-test.zip -DestinationPath jarvis-test-source
 ```
 
 Source and canonical tests are under `source/`; 17 existing integration Skills
@@ -50,10 +64,17 @@ Updating files or JSON does not prove a resident Host loaded the new code.
 
 ## Verification and limits
 
-The reviewed memory switch passed 64 directly relevant isolated checks, including
-adapter and native-launcher contracts. The Windows result-archive repair passed
-its scoped independent review and regression checks. Four inherited cancellation
-fixture testcase failures remain recorded; this is not an all-tests-pass claim.
+The memory switch previously passed 64 directly relevant isolated checks,
+including adapter and native-launcher contracts. The Windows result-archive
+repair passed its scoped independent review and regression checks. This
+version-only rollup does not claim to repeat that business-logic acceptance.
+
+The directly affected version/distribution checks pass. A broader selected
+seven-method baseline and final comparison retain six passes and one inherited
+HTTP fixture error: its historical 17-tool assertion conflicts with the 19-tool
+prediction/task surface already in rev10. That assertion was not changed for
+this release. Four separate inherited cancellation fixture testcase failures
+also remain recorded. This is not an all-tests-pass claim.
 
 A preceding five-seat, five-turn live run produced 15 fully accepted results
 across three healthy seats. One further correct output lacked complete owner
@@ -62,12 +83,13 @@ active 95% threshold were correct policy behavior, not an overall Loop failure.
 The distinct owner-terminal anomaly remains unresolved. All 25 results were not
 accepted, and this release does not rerun or complete that acceptance.
 
-`DISTRIBUTION_CHECK.json` records only shipping-layout/source-identity checks.
-Use `source/tests/run_suite.py --help` for the canonical runner. Production
-readiness, full live-model acceptance and high-concurrency capacity are not
-certified by this prerelease. Publication does not activate a local service.
+`DISTRIBUTION_CHECK.json` records the scoped version/distribution result and its
+limits. See `source/tests/README_SUITE.md` for the explicit source pin and exact
+bounded command. Production readiness, full live-model acceptance and
+high-concurrency capacity are not certified. Publication does not activate a
+local service. Previous TEST releases and the latest stable release are retained.
 
 Credentials, local runtime state, raw operational receipts, logs, private chat
-identifiers and customer/contact data are excluded. Two source/fixture metadata
-values were sanitized; `SHARE_REPORT.md` identifies the boundaries. No new
-license grant is introduced; existing ownership and third-party terms apply.
+identifiers and customer/contact data are excluded. The prior public-copy
+redactions remain intact. No new license grant is introduced; existing ownership
+and third-party terms apply.

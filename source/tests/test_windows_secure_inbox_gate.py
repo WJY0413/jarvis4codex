@@ -37,7 +37,7 @@ class WindowsSecureInboxGateTests(unittest.TestCase):
                     env=env, capture_output=True, text=True, timeout=20,
                 )
                 self.assertEqual(version.returncode, 0, version.stderr)
-                self.assertIn("0.3.0", version.stdout)
+                self.assertIn("0.3.1", version.stdout)
                 refused = subprocess.run(
                     [sys.executable, "-B", "-m", module, "run", "--packet", "missing-packet.json"],
                     env=env, capture_output=True, text=True, timeout=20,

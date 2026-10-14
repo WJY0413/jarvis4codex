@@ -9,7 +9,7 @@ from jsonschema import Draft202012Validator
 from jarvis_mcp.server import JarvisMcpServer
 from jarvis_control import operations,file_task,contact_task
 
-VERSION='0.3.0'
+VERSION='0.3.1'
 ROOT=Path(__file__).resolve().parents[1]
 TOOLS={'jarvis_contract_check','jarvis_receipt','jarvis_callback','jarvis_relay','jarvis_read_delivery','jarvis_capacity','jarvis_dispatch',
        'jarvis_create','jarvis_hold','jarvis_loop','jarvis_close','jarvis_read','jarvis_resume','jarvis_monitor','jarvis_heartbeat','jarvis_update','jarvis_notify'}

@@ -81,7 +81,7 @@ class SharedHttpE2E(unittest.IsolatedAsyncioTestCase):
                     initialized = await session.initialize()
                     tools = await session.list_tools()
                     capabilities = decode(await session.call_tool("jarvis_read", {"subject": "capabilities"}))
-                    self.assertEqual(initialized.server_info.version, "0.3.0")
+                    self.assertEqual(initialized.server_info.version, "0.3.1")
                     self.assertEqual(len(tools.tools), 17)
                     self.assertEqual(capabilities["status"], "completed")
                     return {"version": initialized.server_info.version, "tools": len(tools.tools)}

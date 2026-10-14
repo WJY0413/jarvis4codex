@@ -1,8 +1,8 @@
-# Canonical test runner — rev10 TEST
+# Canonical test runner — 0.3.1 TEST
 
-This is the single bundled test suite. Product metadata is `0.3.0`.
+This is the single bundled test suite. Product metadata is `0.3.1`.
 The runner retains its historical rev9 default identity; always pass the explicit
-rev10 hash below. A rejected identity or selector means tests did not run.
+0.3.1 hash below. A rejected identity or selector means tests did not run.
 
 ## Repeat the bounded Windows distribution check
 
@@ -12,9 +12,9 @@ From the extracted directory containing `source/` and `skills/`, use Python
 
 ```powershell
 $testSource = (Resolve-Path 'source').Path
-$testRun = Join-Path $env:TEMP ('jarvis-rev10-dist-' + [guid]::NewGuid().ToString('N'))
+$testRun = Join-Path $env:TEMP ('jarvis-0.3.1-dist-' + [guid]::NewGuid().ToString('N'))
 $testPython = '<TEST_VENV>/Scripts/python.exe'
-& $testPython -B source/tests/run_suite.py --source $testSource --expected-version 0.3.0 --expected-code-sha256 2005b02ba488a14675661dc1df03397e8aaaa141244057e8bfaa5350d73763fd --receipt-dir $testRun --select source::test_distribution_identity.DistributionIdentityE2E.test_unrelated_installed_dependency_does_not_change_product_identity --select source::test_027_registry_versions.CurrentRegistryVersions.test_distribution_and_advertised_mcp_version_are_same_prerelease --deadline 45
+& $testPython -B source/tests/run_suite.py --source $testSource --expected-version 0.3.1 --expected-code-sha256 df06d24745126729990864b041cd8e70d24b9f455935fb7e2ae2a2a7f7337cef --receipt-dir $testRun --select source::test_distribution_identity.DistributionIdentityE2E.test_unrelated_installed_dependency_does_not_change_product_identity --select source::test_027_registry_versions.CurrentRegistryVersions.test_distribution_and_advertised_mcp_version_are_same_prerelease --select source::test_027_registry_versions.CurrentRegistryVersions.test_all_product_builds_use_the_same_candidate_version --deadline 45
 Get-Content (Join-Path $testRun 'report.md')
 ```
 
@@ -41,5 +41,6 @@ test's owned process tree, not other applications.
 
 See the package README for current limitations, including the unresolved live
 owner-terminal evidence gap and four inherited cancellation fixture testcase
-failures. Historical suite comments and fixtures are retained, not presented as
-new rev10 acceptance evidence. No test expectations were changed for publication.
+failures and the separate inherited HTTP fixture assertion of 17 tools against
+the existing 19-tool surface. Historical suite comments and fixtures are retained, not presented as
+new 0.3.1 acceptance evidence. No test expectations were changed for publication.
