@@ -43,4 +43,5 @@ See the package README for current limitations, including the unresolved live
 owner-terminal evidence gap and four inherited cancellation fixture testcase
 failures and the separate inherited HTTP fixture assertion of 17 tools against
 the existing 19-tool surface. Historical suite comments and fixtures are retained, not presented as
-new 0.3.1 acceptance evidence. No test expectations were changed for publication.
+new 0.3.1 acceptance evidence. Only fixed product-version expectations changed;
+historical schema/tool-count assertions were retained.
