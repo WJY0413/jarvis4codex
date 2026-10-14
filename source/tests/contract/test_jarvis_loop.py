@@ -35,6 +35,81 @@ class FakeRuntime:
 
 @host_config_fixture
 class JarvisLoopContractTest(unittest.TestCase):
+    def test_public_admission_rejects_bad_inputs_before_host_queue_or_schedule(self):
+        # Reproduced live defects: interval=1 below scheduler min=30; missing profile.
+        from unittest.mock import Mock
+        from jarvis_codex_bridge import JarvisCapabilityPort
+        from jarvis_local_heartbeat import JarvisControlHeartbeat
+        root = Path(self.temp.name)
+        launcher = root / "admission-launcher.json"
+        raw = {"version": 1, "profile": "TEST", "dispatcher_thread_id": "TEST-controller",
+               "expected_codex_home": str(root), "live_creation_enabled": True,
+               "allowed_projects": {"TEST": str(root)}}
+        launcher.write_text(json.dumps(raw), encoding="utf-8")
+        scheduler_config = root / "admission-scheduler.json"
+        scheduler_config.write_text(json.dumps({"db_path": str(root / "scheduler.sqlite"),
+                                               "min_interval_seconds": 30}), encoding="utf-8")
+        scheduler = JarvisControlHeartbeat(scheduler_config)
+        adapter = CodexAppServerTaskProvisioningAdapter(launcher, state_dir=root / "runtime")
+        adapter.ensure_hold_host_ready = Mock(side_effect=AssertionError("Host must not start"))
+        control = JarvisControl(JarvisCapabilityPort(object(), object(), scheduler), object(), adapter,
+                                loop_controller=self.controller)
+        control.hold = Mock(side_effect=AssertionError("Hold must not queue"))
+        options = dict(request_id="admission", project="TEST", prompt="TEST", title="TEST",
+                       target_thread_count=1, max_rounds=1, interval_seconds=30,
+                       expires_at="2099-01-01T00:00:00+00:00")
+        for action in ("preflight", "start"):
+            for case in ("interval", "profile"):
+                with self.subTest(action=action, case=case):
+                    launcher.write_text(json.dumps({**raw, "profile": "" if case == "profile" else "TEST"}), encoding="utf-8")
+                    result = control.loop(action=action, **{**options, "interval_seconds": 1 if case == "interval" else 30})
+                    self.assertEqual(result["status"], "invalid_request")
+                    self.assertIn("interval_seconds" if case == "interval" else "profile", result["reason"])
+                    if case == "interval":
+                        self.assertIn("30", result["reason"])
+                    adapter.ensure_hold_host_ready.assert_not_called()
+                    control.hold.assert_not_called()
+                    self.assertFalse((root / "runtime" / "task-holds").exists())
+                    self.assertFalse(self.controller._store.exists("loop-admission"))
+                    self.assertEqual(scheduler.store.list(), [])
+        print("LOOP_ADMISSION_REJECTION_RECEIPT", json.dumps({"cases": 4,
+              "host_starts": adapter.ensure_hold_host_ready.call_count,
+              "hold_queue": control.hold.call_count, "schedule_rows": len(scheduler.store.list()),
+              "model_calls": 0, "production_state_used": False}))
+
+    def test_full_preflight_does_not_authorize_a_later_invalid_start(self):
+        from unittest.mock import Mock
+        from jarvis_codex_bridge import JarvisCapabilityPort
+        from jarvis_local_heartbeat import JarvisControlHeartbeat
+        root = Path(self.temp.name)
+        launcher = root / "change-launcher.json"
+        raw = {"version": 1, "profile": "TEST", "dispatcher_thread_id": "TEST-controller",
+               "expected_codex_home": str(root), "live_creation_enabled": True,
+               "allowed_projects": {"TEST": str(root)}}
+        launcher.write_text(json.dumps(raw), encoding="utf-8")
+        scheduler_config = root / "change-scheduler.json"
+        scheduler_config.write_text(json.dumps({"db_path": str(root / "change.sqlite"),
+                                               "min_interval_seconds": 30}), encoding="utf-8")
+        scheduler = JarvisControlHeartbeat(scheduler_config)
+        adapter = CodexAppServerTaskProvisioningAdapter(launcher, state_dir=root / "runtime")
+        adapter.ensure_hold_host_ready = Mock(side_effect=AssertionError("Host must not start"))
+        control = JarvisControl(JarvisCapabilityPort(object(), object(), scheduler), object(), adapter,
+                                loop_controller=self.controller)
+        options = dict(request_id="changed", project="TEST", prompt="TEST", target_thread_count=1,
+                       max_rounds=1, expires_at="2099-01-01T00:00:00+00:00")
+        result = control.loop(action="preflight", **options)
+        self.assertEqual(result["status"], "completed")
+        self.assertTrue(result["data"]["request_validated"])
+        self.assertEqual(result["data"]["normalized_request"]["interval_seconds"], 1800)
+        adapter.ensure_hold_host_ready.assert_not_called()
+        self.assertEqual(scheduler.store.list(), [])
+        launcher.write_text(json.dumps({**raw, "profile": ""}), encoding="utf-8")
+        result = control.loop(action="start", **options)
+        self.assertEqual(result["status"], "invalid_request")
+        self.assertIn("profile", result["reason"])
+        adapter.ensure_hold_host_ready.assert_not_called()
+        self.assertFalse(self.controller._store.exists("loop-changed"))
+
     def test_thread_quota_rotates_each_seat_and_preserves_round_budget_after_reload(self):
         for quota in (1, 2):
             with self.subTest(quota=quota):
@@ -751,6 +826,9 @@ class JarvisLoopContractTest(unittest.TestCase):
             profile = "jarvis_test"
             expected_codex_home = "C:/test/codex-home"
 
+            def resolve_project(self, project):
+                return project, "C:/test/project"
+
         state_dir = Path(self.temp.name)
         (state_dir / "hold-host.json").write_text(json.dumps({
             "status": "holding",
@@ -764,6 +842,7 @@ class JarvisLoopContractTest(unittest.TestCase):
             state_dir / "launcher.json", state_dir=state_dir, config_loader=lambda _: Config()
         )
         control = JarvisControl(object(), object(), adapter, loop_controller=self.controller)
+        control.heartbeat = lambda **_: {"status": "validated", "data": {"limits": {}}}
         receipt = control.loop(
             action="start", request_id="dead-host", project="Jarvis4codex", title="Worker",
             prompt="hello", business_skill="bd-search-stage6-research", target_thread_count=1,
@@ -782,7 +861,7 @@ class JarvisLoopContractTest(unittest.TestCase):
 
             def invoke(self, request):
                 return SimpleNamespace(
-                    status="active", request_id=request.request_id, target_thread_id=None,
+                    status="validated" if request.capability == "heartbeat.validate" else "active", request_id=request.request_id, target_thread_id=None,
                     turn_id=None, reason=None, data={"heartbeat_id": request.arguments["heartbeat_id"]},
                 )
 
@@ -831,7 +910,7 @@ class JarvisLoopContractTest(unittest.TestCase):
 
             def invoke(self, request):
                 return SimpleNamespace(
-                    status="active", request_id=request.request_id, target_thread_id=None,
+                    status="validated" if request.capability == "heartbeat.validate" else "active", request_id=request.request_id, target_thread_id=None,
                     turn_id=None, reason=None, data={"heartbeat_id": request.arguments["heartbeat_id"]},
                 )
 
@@ -889,6 +968,7 @@ class JarvisLoopContractTest(unittest.TestCase):
         receipt = control.loop(action="preflight")
 
         self.assertEqual(receipt["status"], "completed")
+        self.assertFalse(receipt["data"]["request_validated"])
         self.assertTrue(receipt["readback"]["verified"])
         self.assertEqual(receipt["data"]["allowed_projects"], ["BD Search Worker", "Jarvis4codex"])
         self.assertEqual(

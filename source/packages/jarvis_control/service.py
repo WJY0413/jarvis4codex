@@ -131,6 +131,14 @@ class JarvisControl:
         """Use the existing Holder and Monitor ports as one bounded loop."""
         if self._loop_controller is None:
             return self.unsupported(tool="jarvis_loop", reason="no loop controller is configured")
+        if action == "preflight" and any(options.get(key) is not None for key in (
+                "prompt", "target_thread_count", "max_rounds", "threads", "interval_seconds", "expires_at")):
+            try:
+                data = self._validate_loop_admission(options)
+            except ValueError as exc:
+                return self._receipt("jarvis_loop", "invalid_request", request_id=options.get("request_id"), reason=str(exc))
+            return self._receipt("jarvis_loop", "completed", request_id=options.get("request_id"),
+                                 data=data, readback={"verified": True, "terminal": False})
         if action == "preflight":
             project_reader = getattr(self._provisioner, "preflight_projects", None)
             if not callable(project_reader):
@@ -164,10 +172,7 @@ class JarvisControl:
                                  data=data, readback={"verified": True, "terminal": False})
         if action == "start":
             try:
-                enabled = getattr(self._provisioner, "creation_enabled", None)
-                if callable(enabled) and not enabled():
-                    raise ValueError("live creation is disabled for this deployment")
-                self._loop_controller.validate_start(options)
+                self._validate_loop_admission(options)
             except ValueError as exc:
                 return self._receipt("jarvis_loop", "invalid_request", request_id=options.get("request_id"), reason=str(exc))
             requested_workers = options.get("target_thread_count")
@@ -198,6 +203,20 @@ class JarvisControl:
             reason=result.reason, data=result.data,
             readback={"verified": result.status not in {"invalid_request", "blocked"}, "terminal": result.status in {"completed", "stopped", "expired"}},
         )
+
+    def _validate_loop_admission(self, options: Mapping[str, Any]) -> dict[str, Any]:
+        """The same read-only check gates preflight and every public Loop start."""
+        request = self._loop_controller.validate_start(options)
+        heartbeat = self.heartbeat(action="validate", request_id=f"{request['request_id']}:preflight",
+            source_ref="jarvis_loop:preflight", options=self._loop_controller.heartbeat_options(request))
+        if heartbeat.get("status") != "validated":
+            raise ValueError(heartbeat.get("reason") or "scheduler did not validate the Loop request")
+        validate = getattr(self._provisioner, "validate_loop_start", None)
+        if not callable(validate):
+            raise ValueError("read-only Loop deployment validation is not configured")
+        deployment = validate(request)
+        return {"request_validated": True, "side_effects": False, "normalized_request": request,
+                "deployment": deployment, "scheduler_limits": (heartbeat.get("data") or {}).get("limits", {})}
 
     def stop_hold(self, hold_id: str) -> dict[str, Any]:
         """Internal Loop-to-provisioner boundary; no new public MCP action."""
@@ -384,6 +403,42 @@ class JarvisControl:
         receipt["tool"] = "jarvis_hold"
         return receipt
 
+    def predict(self, *, thread_id: str, request_id: str, source_turn_id: str | None = None) -> dict[str, Any]:
+        predictor = getattr(self._provisioner, "predict", None)
+        if not callable(predictor):
+            return self.unsupported(tool="jarvis_predict", reason="native prediction adapter unavailable")
+        try:
+            result = predictor(thread_id=thread_id, request_id=request_id, source_turn_id=source_turn_id)
+            return self._receipt("jarvis_predict", result["status"], request_id=request_id,
+                target_thread_id=thread_id, data=result, reason=result.get("reason"))
+        except Exception as exc:
+            return self._receipt("jarvis_predict", "failed", request_id=request_id, reason=str(exc))
+
+    def task(self, *, action: str = "start", task_id: str | None = None,
+             request_id: str | None = None, hold_id: str | None = None,
+             max_turns: int = 1, fixed_prompt: str = "", stop_mode: str = "turns",
+             completion_marker: str | None = None, model: str | None = None,
+             reasoning_effort: str | None = None) -> dict[str, Any]:
+        if action == "status" and hold_id:
+            return {**self.read(subject="hold", hold_id=hold_id), "tool":"jarvis_task"}
+        if action == "stop" and hold_id:
+            return {**self.jarvis_close(hold_id=hold_id, request_id=request_id), "tool":"jarvis_task"}
+        if (action != "start" or not task_id or not request_id or type(max_turns) is not int or max_turns < 1
+                or not isinstance(fixed_prompt, str)
+                or stop_mode not in {"turns", "project"} or (stop_mode == "project" and
+                    (not isinstance(completion_marker, str) or not completion_marker.strip() or "\n" in completion_marker))):
+            return self._receipt("jarvis_task", "invalid_request", request_id=request_id,
+                reason="start requires task_id, request_id, positive max_turns; project mode also requires completion_marker")
+        instruction = fixed_prompt
+        if stop_mode == "project":
+            instruction += ("\nWhen the requested project and its acceptance checks are complete, emit exactly this line in the final answer:\n" + completion_marker)
+        receipt = self.resume(request_id=request_id, task_id=task_id, prompt=instruction,
+            source_ref="jarvis_task", hold_id=hold_id, max_turns=max_turns, auto_continue=True,
+            prompt_mode="prediction_plus_fixed" if instruction.strip() else "prediction",
+            fixed_prompt=instruction, completion_marker=completion_marker if stop_mode == "project" else None,
+            model=model, reasoning_effort=reasoning_effort)
+        return {**receipt, "tool":"jarvis_task"}
+
     def resume(
         self,
         *,
@@ -401,10 +456,21 @@ class JarvisControl:
         continue_prompt: str = "继续",
         notifications: Mapping[str, Any] | None = None,
         input_binding: Mapping[str, Any] | None = None,
+        prompt_mode: str = "fixed",
+        fixed_prompt: str | None = None,
+        completion_marker: str | None = None,
     ) -> dict[str, Any]:
         # Kept only for wire compatibility. All public resume calls are now monitor-owned.
         del hold_with_monitor
         try:
+            if prompt_mode not in {"fixed", "prediction", "prediction_plus_fixed"}:
+                raise ValueError("invalid prompt_mode")
+            prediction_options = None
+            if prompt_mode != "fixed":
+                prediction_options = {"mode":prompt_mode, "fixed_prompt":fixed_prompt if fixed_prompt is not None else prompt}
+                if completion_marker is not None:
+                    prediction_options["completion_marker"] = completion_marker
+                prompt = prompt or "Native prediction continuation"
             enabled = getattr(self._provisioner, "creation_enabled", None)
             if callable(enabled) and not enabled():
                 raise ValueError("live creation is disabled for this deployment")
@@ -414,6 +480,7 @@ class JarvisControl:
                 reasoning_effort=reasoning_effort, auto_continue=auto_continue,
                 continue_prompt=continue_prompt, notifications=notifications,
                 input_binding=input_binding,
+                prediction_options=prediction_options,
             )
         except ValueError as exc:
             return self._receipt("jarvis_resume", "invalid_request", request_id=request_id, reason=str(exc))
@@ -467,7 +534,11 @@ class JarvisControl:
                     "jarvis_resume": {
                         "available": callable(getattr(self._provisioner, "resume_with_monitor", None)),
                         "requires_monitor": True,
+                        "prompt_modes": ["fixed", "prediction", "prediction_plus_fixed"],
                     },
+                    "jarvis_predict": {"available": callable(getattr(self._provisioner, "predict", None)), "native_only": True},
+                    "jarvis_task": {"available": callable(getattr(self._provisioner, "resume_with_monitor", None)),
+                                    "stop_modes": ["turns", "project"]},
                     "jarvis_monitor": {"available": True},
                     "jarvis_heartbeat": {
                         "available": self._capabilities.heartbeat_available,
@@ -774,6 +845,7 @@ class JarvisControl:
     ) -> dict[str, Any]:
         capability = {
             "create": "heartbeat.create",
+            "validate": "heartbeat.validate",
             "update": "heartbeat.update",
             "cancel": "heartbeat.cancel",
             "health": "heartbeat.health",

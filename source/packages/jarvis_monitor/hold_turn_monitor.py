@@ -40,6 +40,7 @@ class HoldTurnRequest:
     stop_requested: Callable[[], bool] | None = None
     control_poll: Callable[[], None] | None = None
     receive_final_answer: Callable[[str], dict[str, Any]] | None = None
+    completion_marker: str | None = None
 
 
 @dataclass(frozen=True)
@@ -113,6 +114,8 @@ class HoldTurnMonitor:
             return stop(request, command_id, "cancelled", final_message, "stop_requested")
         if _worker_reported_blocked(final_message, explicit_only=(request.receive_final_answer is not None or verification.get("status") == "review")):
             return stop(request, command_id, "blocked", final_message, "worker_reported_blocked")
+        if request.completion_marker and request.completion_marker in final_message.splitlines():
+            return stop(request, command_id, "completed", final_message, "project_completion_marker")
         if request.turn_count >= request.max_turns:
             return stop(request, command_id, "turn_limit_reached", final_message, "turn_budget_consumed")
         if not request.continuation_enabled:

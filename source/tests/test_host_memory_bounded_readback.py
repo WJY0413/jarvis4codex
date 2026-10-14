@@ -22,6 +22,75 @@ class PhysicalAdmissionTests(unittest.TestCase):
     def sample(self, available):
         return {'source': 'TEST-physical', 'total_bytes': 10000, 'available_bytes': available}
 
+    def test_explicit_disabled_policy_roundtrips_and_bypasses_queue_and_dispatch_sampling(self):
+        # Requirement: an actual off switch, not a raised memory threshold.
+        from adapters.codex_app_server import task_provisioning_adapter as adapter
+        from jarvis_control import TaskProvisionRequest
+        from jarvis_runtime.jarvis_native_task_launcher import NativeTaskLauncherConfig
+        for threshold in (95, 'unused-while-disabled'):
+            with self.subTest(threshold=threshold), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                path = root / 'launcher.json'
+                path.write_text(json.dumps({'dispatcher_thread_id': 'TEST',
+                    'allowed_projects': {'TEST': temp}, 'memory_admission_enabled': False,
+                    'memory_admission_max_used_percent': threshold}), encoding='utf-8')
+                config = NativeTaskLauncherConfig(path)
+                self.assertIs(config.memory_admission_enabled, False)
+                self.assertEqual(config.memory_admission_max_used_percent, threshold)
+                client = object.__new__(AppServerClient)
+                client.config = config
+                stream = io.StringIO()
+                client.process = types.SimpleNamespace(poll=lambda: None, stdin=stream)
+                client._write_lock = threading.Lock()
+                client.before_turn_dispatch = Mock()
+                port = adapter.CodexAppServerTaskProvisioningAdapter(path, state_dir=root / 'state')
+                with patch.object(adapter, 'physical_memory_sample',
+                        side_effect=AssertionError('disabled policy must not sample')) as sample:
+                    admission = adapter.require_memory_admission(config)
+                    self.assertEqual(admission['status'], 'allowed')
+                    self.assertIs(admission['enabled'], False)
+                    self.assertEqual(admission['reason'], 'memory admission disabled by configuration')
+                    self.assertNotIn('used_percent', admission)
+                    receipt = port.provision(TaskProvisionRequest(request_id='TEST-disabled',
+                        project='TEST', title='TEST', prompt='TEST', source_ref='TEST'))
+                    self.assertEqual(receipt.status, 'accepted')
+                    self.assertTrue((root / 'state/task-holds' / receipt.hold_id / 'request.json').is_file())
+                    client._write({'method': 'turn/start', 'params': {'threadId': 'TEST'}})
+                    client.before_turn_dispatch.assert_called_once()
+                    self.assertEqual(json.loads(stream.getvalue())['method'], 'turn/start')
+                    # Disabling this gate must not disable the independent read-only guard.
+                    client.read_only = True
+                    with self.assertRaisesRegex(NativeTaskError, 'read-only'):
+                        client._write({'method': 'turn/start', 'params': {'threadId': 'TEST'}})
+                    sample.assert_not_called()
+
+    def test_memory_switch_preserves_legacy_default_and_rejects_non_boolean_flags(self):
+        from adapters.codex_app_server import task_provisioning_adapter as adapter
+        from jarvis_runtime.jarvis_native_task_launcher import NativeTaskLauncherConfig
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / 'launcher.json'
+            base = {'dispatcher_thread_id': 'TEST', 'allowed_projects': {'TEST': temp}}
+            for policy in ({}, {'memory_admission_enabled': True}):
+                with self.subTest(policy=policy):
+                    path.write_text(json.dumps({**base, **policy}), encoding='utf-8')
+                    config = NativeTaskLauncherConfig(path)
+                    self.assertIs(config.memory_admission_enabled, True)
+                    with patch.object(adapter, 'physical_memory_sample', return_value=self.sample(500)):
+                        admission = adapter.physical_memory_admission(config)
+                    self.assertEqual(admission['error_code'], 'physical_memory_pressure')
+                    self.assertEqual(admission['threshold_percent'], 95)
+            for invalid in (None, 0, 1, '', 'false', [], {}):
+                with self.subTest(invalid=invalid):
+                    path.write_text(json.dumps({**base, 'memory_admission_enabled': invalid}), encoding='utf-8')
+                    config = NativeTaskLauncherConfig(path)  # Invalid policy must remain readable.
+                    with patch.object(adapter, 'physical_memory_sample',
+                            side_effect=AssertionError('invalid policy must not sample')) as sample:
+                        admission = adapter.physical_memory_admission(config)
+                    self.assertEqual(admission['status'], 'blocked')
+                    self.assertEqual(admission['error_code'], 'memory_policy_invalid')
+                    self.assertIn('memory_admission_enabled must be boolean', admission['reason'])
+                    sample.assert_not_called()
+
     def test_boundary_configurable_policy_unknown_and_live_os_sample(self):
         from adapters.codex_app_server import task_provisioning_adapter as adapter
         config = types.SimpleNamespace()

@@ -1,39 +1,24 @@
 {
   "schema": "jarvis-test-distribution-check/v1",
-  "release_tag": "v0.3.0-rev9-test",
+  "release_tag": "v0.3.0-rev10-test",
   "status": "passed_selected_scope",
-  "counts": {
-    "passed": 2,
-    "failed": 0,
-    "error": 0,
-    "skipped": 0,
-    "partial": 0,
-    "not_run": 0,
-    "running": 0,
-    "not_implemented": 0,
-    "methods_run": 2,
-    "failure_records": 0,
-    "error_records": 0,
-    "method_skip_records": 0,
-    "subtest_skip_records": 0,
-    "subtest_pass_records": 0
-  },
-  "cleanup": {
-    "confirmed": true,
-    "owned_process_count": 5,
-    "residual_process_count": 0,
-    "mechanism": "Windows private kill-on-close Job"
-  },
-  "selectors": [
-    "source::test_027_registry_versions.CurrentRegistryVersions.test_distribution_and_advertised_mcp_version_are_same_prerelease",
-    "source::test_distribution_identity.DistributionIdentityE2E.test_unrelated_installed_dependency_does_not_change_product_identity"
-  ],
-  "ended_at": "2026-10-12T11:44:08.850449+08:00",
+  "distribution_methods_passed": 2,
+  "public_redaction_affected_existing_methods_passed": 28,
+  "source_windows_sha256": "2005b02ba488a14675661dc1df03397e8aaaa141244057e8bfaa5350d73763fd",
   "source_version": "0.3.0",
-  "source_windows_sha256": "621c3db30dac2adcbcd71a05a72428350cc44f445cf6ca29792d6e2b51a6a226",
+  "product_python_files": 52,
   "model_turns": 0,
-  "product_files_changed": false,
-  "validation_scope": "Shipping layout, installed-like source identity and advertised version. No live service or model E2E.",
-  "initial_invocation": "Rejected before test execution because source:: selector prefix was omitted; corrected command ran both existing cases.",
-  "command": "python -B source/tests/run_suite.py --source source --receipt-dir <NEW_RECEIPT_DIR> --select source::test_distribution_identity.DistributionIdentityE2E.test_unrelated_installed_dependency_does_not_change_product_identity --select source::test_027_registry_versions.CurrentRegistryVersions.test_distribution_and_advertised_mcp_version_are_same_prerelease --deadline 45"
+  "production_accessed": false,
+  "services_restarted": false,
+  "scope": "Shipping layout, installed-like identity and scoped dispatcher/native-launcher fixtures only.",
+  "selectors": [
+    "source::test_distribution_identity.DistributionIdentityE2E.test_unrelated_installed_dependency_does_not_change_product_identity",
+    "source::test_027_registry_versions.CurrentRegistryVersions.test_distribution_and_advertised_mcp_version_are_same_prerelease"
+  ],
+  "public_redaction_modules": [
+    "tests.jarvis_runtime.test_coo_dispatcher_store",
+    "tests.jarvis_runtime.test_jarvis_native_task_launcher"
+  ],
+  "initial_rejected_invocations": "Historical default source hash was rejected; a separate module-only selector attempt was rejected before tests. The final invocation explicitly pinned the sanitized source identity and exact method selectors.",
+  "repeat": "See source/tests/README_SUITE.md for the exact bounded Windows command."
 }

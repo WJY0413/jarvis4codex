@@ -1,55 +1,73 @@
-# Jarvis 0.3.0 rev9 — TEST prerelease
+# Jarvis 0.3.0 rev10 — TEST prerelease
 
-This snapshot contains the Jarvis control plane source, 17 integration Skills,
-the canonical tests and their fixtures. It is a TEST distribution, not a stable
-production release. Package metadata remains `0.3.0`; the GitHub release tag is
-`v0.3.0-rev9-test`. Prediction/task additions proposed for 3.1 are not included.
+Jarvis coordinates bounded Codex work through Hold, Monitor and Loop. This TEST
+snapshot adds native prediction/task continuation, a configurable physical-memory
+admission gate and the reviewed Windows result-archive locking repair to rev9.
+Package metadata remains `0.3.0`; the release tag is `v0.3.0-rev10-test`.
 
-## Download and inspect
+## Download and review
 
-Download `Jarvis-0.3.0-rev9-test.zip`, `SHA256SUMS.txt`, and `FILE_MANIFEST.json`
-from the release's Assets section. Verify the ZIP SHA256 before extracting it
-to a new directory. Prefer this named asset over GitHub's generated source ZIP
-when comparing the archive checksum. The manifest pins every included file.
+Download `Jarvis-0.3.0-rev10-test.zip`, `FILE_MANIFEST.json` and `SHA256SUMS.txt`
+from the release assets. Verify the ZIP checksum before extracting it into a new
+directory. The manifest records the exact bytes of every included file.
 
 ```powershell
-gh release download v0.3.0-rev9-test --repo WJY0413/jarvis4codex --dir jarvis-download
-Get-FileHash jarvis-download/Jarvis-0.3.0-rev9-test.zip -Algorithm SHA256
+gh release download v0.3.0-rev10-test --repo WJY0413/jarvis4codex --dir jarvis-download
+Get-FileHash jarvis-download/Jarvis-0.3.0-rev10-test.zip -Algorithm SHA256
 # Compare with SHA256SUMS.txt before extraction.
-Expand-Archive jarvis-download/Jarvis-0.3.0-rev9-test.zip -DestinationPath jarvis-test-source
+Expand-Archive jarvis-download/Jarvis-0.3.0-rev10-test.zip -DestinationPath jarvis-test-source
 ```
 
-Source is under `source/`; Skills are under `skills/`. Python 3.11 or later is
-required. Install declared dependencies into a separate environment, following
-`source/pyproject.toml`. In that environment `python -m pip install ./source`
-installs the Python package. Skills/resources remain in the extracted archive;
-pip does not register them with a client. Keep the full extracted source for
-canonical tests and fixtures.
+Source and canonical tests are under `source/`; 17 existing integration Skills
+are under `skills/`. Python 3.11 or later is required. In an isolated environment,
+`python -m pip install ./source` installs the declared Python package and
+dependencies. It does not register Skills or MCP tools, configure a service,
+copy authentication, migrate production state or restart Codex. Keep the full
+extracted source to run the canonical tests and fixtures.
 
-For isolated cloud setup, read `CLOUD_COLD_START_GUIDE_REV6.md` (its contents
-describe rev9 despite the historical filename). Follow its original-environment
-guard, explicit TEST paths and bounded read-only protocol procedure. Do not copy
-authentication files or reuse production state. This archive does not change
-client MCP registrations, install an autostart service, or restart Codex.
+Experimental native prediction depends on an existing authorized login and the
+supported native prediction interface. No authentication material is included.
+
+## Memory admission switch
+
+The optional launcher setting is a strict JSON boolean. Protection remains
+enabled when the setting is absent. The normal configuration is:
+
+```json
+{
+  "memory_admission_enabled": true,
+  "memory_admission_max_used_percent": 95
+}
+```
+
+Explicit `false` skips memory sampling and threshold checks at queue admission
+and native dispatch. It does not disable capacity, identity, read-only or
+cancellation checks. `true` restores the existing policy: reject used physical
+memory at or above the threshold, and reject unknown measurements. Non-boolean
+switch values fail closed. No machine-specific launcher configuration ships in
+this package; one workstation's explicit opt-out is not the product default.
+Updating files or JSON does not prove a resident Host loaded the new code.
 
 ## Verification and limits
 
-`VERIFICATION_RECEIPT_REV9.json` preserves historical results and attribution;
-its `public_release=false` describes the original review stage. The current
-publication is a prerelease and does not change full acceptance to complete.
-Historical Windows reconciled evidence is 587 passed, 11 skipped, 1 partial and
-1 not run; this is not a newly executed single full-suite result. Linux affected
-checks cover 91 distinct methods, not a full-suite claim.
+The reviewed memory switch passed 64 directly relevant isolated checks, including
+adapter and native-launcher contracts. The Windows result-archive repair passed
+its scoped independent review and regression checks. Four inherited cancellation
+fixture testcase failures remain recorded; this is not an all-tests-pass claim.
 
-New distribution checks belong to `DISTRIBUTION_CHECK.json`. They verify source
-identity and the shipping layout only; no live model acceptance is implied.
-Use `source/tests/run_suite.py` as the canonical entry; its `--help` describes
-explicit source, receipt, selectors and deadline arguments.
+A preceding five-seat, five-turn live run produced 15 fully accepted results
+across three healthy seats. One further correct output lacked complete owner
+terminal evidence; nine results were not completed. Memory refusals at the then
+active 95% threshold were correct policy behavior, not an overall Loop failure.
+The distinct owner-terminal anomaly remains unresolved. All 25 results were not
+accepted, and this release does not rerun or complete that acceptance.
 
-Real model-to-Schema-to-terminal-to-release/close acceptance on this source,
-optional integration acceptance and claimed high-concurrency capacity remain
-incomplete. The current local TEST HTTP activation is separately blocked by an
-execution-tool policy rejection. A GitHub download cannot override that policy.
+`DISTRIBUTION_CHECK.json` records only shipping-layout/source-identity checks.
+Use `source/tests/run_suite.py --help` for the canonical runner. Production
+readiness, full live-model acceptance and high-concurrency capacity are not
+certified by this prerelease. Publication does not activate a local service.
 
-No new license grant is introduced by this distribution. Existing ownership
-and third-party terms continue to apply.
+Credentials, local runtime state, raw operational receipts, logs, private chat
+identifiers and customer/contact data are excluded. Two source/fixture metadata
+values were sanitized; `SHARE_REPORT.md` identifies the boundaries. No new
+license grant is introduced; existing ownership and third-party terms apply.

@@ -29,6 +29,9 @@ class FakeProvisioner:
     def creation_enabled(self):
         return True
 
+    def validate_loop_start(self, request):
+        return {"project": request["project"], "profile": "TEST"}
+
     def ensure_hold_host_ready(self, *, required_workers):
         self.ready_calls += 1
         return {"status": "ready", "worker_capacity": required_workers}
@@ -47,7 +50,8 @@ class LoopSchemaRegistryE2E(unittest.TestCase):
             "status": "accepted", "data": {"hold_id": kw["hold_id"]},
             "target_thread_id": "thread-isolated",
         })
-        self.control.heartbeat = Mock(return_value={"status": "active"})
+        self.control.heartbeat = Mock(side_effect=lambda **kw: {
+            "status": "validated" if kw["action"] == "validate" else "active", "data": {"limits": {}}})
         self.control.monitor = Mock(return_value={
             "status": "completed", "target_thread_id": "thread-isolated",
             "data": {"lifecycle_status": "running", "status": "running",

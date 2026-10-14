@@ -24,6 +24,8 @@ from adapters.codex_app_server.task_provisioning_adapter import append_terminal_
 from jarvis_runtime.coo_dispatcher_store import ProcessLock
 from jarvis_runtime.cancellation import cancellation_path, commit_dispatch, DispatchCancelledBeforeSend
 from jarvis_control.provisioning import lane_batch_ids, lane_batch_size, final_answer_mode
+from jarvis_control.provisioning import validate_prediction_options
+from adapters.codex_app_server.prediction import prepare_prediction_prompt
 
 
 def _now() -> str:
@@ -310,6 +312,7 @@ def hold_task(
         })
 
     try:
+        prediction_options = validate_prediction_options(request.get("prediction_options"))
         pocket = final_answer_mode(request.get("input_binding") or {})
         if pocket and "lane_item_count" not in request["input_binding"]:
             raise ValueError("final_answer_json requires a finite lane binding")
@@ -356,10 +359,25 @@ def hold_task(
                 thread_id = str(request.get("thread_id") or "").strip()
                 if not thread_id:
                     raise RuntimeError("hold resume requires thread_id")
+                first_prompt = str(request.get("prompt") or "")
+                if prediction_options:
+                    report("waiting_for_prediction_source")
+                    predicted = prepare_prediction_prompt(client, thread_id=thread_id,
+                        request_id=request_id + ":prediction:first", options=prediction_options,
+                        receipt_dir=request_path.parent / "predictions", stop_requested=stop_requested)
+                    publish(request_path.with_name("prediction-first.json"),
+                            {"request_id":request_id, "hold_id":hold_id, "prediction":predicted})
+                    if predicted.get("status") != "completed":
+                        if predicted.get("cleanup_completed") is False:
+                            terminal_confirmed = False
+                        raise RuntimeError("prediction continuation stopped: " + str(predicted.get("status")))
+                    if stop_requested():
+                        raise DispatchCancelledBeforeSend("stop requested before predictive resume")
+                    first_prompt = predicted["prompt"]
                 terminal_confirmed = False
                 created = client.resume_turn_async(
                     thread_id,
-                    str(request.get("prompt") or ""),
+                    first_prompt,
                     client_user_message_id=request_id,
                     model=request.get("model"),
                     reasoning_effort=request.get("reasoning_effort"),
@@ -410,6 +428,7 @@ def hold_task(
                 stop_requested=stop_requested,
                 control_poll=control_poll,
                 receive_final_answer=receive_final_answer if pocket else None,
+                completion_marker=prediction_options.get("completion_marker"),
             )
             decision = turn_monitor.observe(client, monitor_request)
             terminal_confirmed = decision.result_status in {
@@ -467,13 +486,33 @@ def hold_task(
                 })
                 if decision.action != "CONTINUE":
                     break
+                client.read_only = False  # Validated continuation still passes native dispatch admission.
+                next_prompt = str(decision.continue_prompt or continue_prompt)
+                if prediction_options:
+                    predicted = prepare_prediction_prompt(client, thread_id=thread_id,
+                        source_turn_id=turn_id, request_id=decision.command_id + ":prediction",
+                        options=prediction_options, receipt_dir=request_path.parent / "predictions", stop_requested=stop_requested)
+                    publish(request_path.with_name(f"prediction-{total_turn_count + 1}.json"),
+                            {"request_id":request_id, "hold_id":hold_id, "prediction":predicted})
+                    if predicted.get("status") != "completed":
+                        if predicted.get("cleanup_completed") is False:
+                            terminal_confirmed = False
+                        terminal_status = "blocked"
+                        decision = turn_monitor._stop(monitor_request, decision.command_id, terminal_status,
+                            final_message, "prediction_" + str(predicted.get("status")))
+                        break
+                    if stop_requested():
+                        terminal_status = "cancelled"
+                        decision = turn_monitor._stop(monitor_request, decision.command_id, terminal_status,
+                            final_message, "stop_requested")
+                        break
+                    next_prompt = predicted["prompt"]
                 terminal_confirmed = False
                 turn_id = ""  # A failed next dispatch must not reuse the previous terminal turn.
                 dispatch_evidence = "not_sent"
-                client.read_only = False  # Validated continuation still passes native dispatch admission.
                 started = client.start_turn_async(
                     thread_id,
-                    str(decision.continue_prompt or continue_prompt),
+                    next_prompt,
                     client_user_message_id=decision.command_id,
                     model=request.get("model"),
                     reasoning_effort=request.get("reasoning_effort"),

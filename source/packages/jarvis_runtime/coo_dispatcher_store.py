@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import io
 import json
 import os
 import time
@@ -73,6 +74,32 @@ class DispatcherError(RuntimeError):
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def read_shared(path: Path, *, encoding: str | None = None) -> str | bytes:
+    """Read one immutable file image without blocking atomic replacement on Windows."""
+    def opener(name, flags):
+        import ctypes
+        from ctypes import wintypes
+        import msvcrt
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                                     wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+        kernel.CreateFileW.restype = wintypes.HANDLE
+        kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel.CloseHandle.restype = wintypes.BOOL
+        # GENERIC_READ; SHARE_READ | SHARE_WRITE | SHARE_DELETE; OPEN_EXISTING.
+        handle = kernel.CreateFileW(os.fsdecode(name), 0x80000000, 0x7, None, 3, 0x80, None)
+        if handle == wintypes.HANDLE(-1).value:
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            return msvcrt.open_osfhandle(handle, os.O_RDONLY | os.O_BINARY)
+        except BaseException:
+            kernel.CloseHandle(handle)
+            raise
+    with io.open(path, "r" if encoding else "rb", encoding=encoding,
+                 opener=opener if os.name == "nt" else None) as stream:
+        return stream.read()
 
 
 def read_json(path: Path) -> dict[str, Any]:
@@ -265,7 +292,7 @@ class DispatcherStore:
             "dispatcher_thread_id": dispatcher_thread_id,
             "project": project,
             "thread_role": "fixed_coo_dispatcher",
-            "source_requirement_thread_id": "019f74a1-2bb2-7fd3-aa58-294c07591723",
+            "source_requirement_thread_id": "",
             "expected_bot_profile": None,
             "expected_app_id": None,
             "expected_bot_open_id": None,

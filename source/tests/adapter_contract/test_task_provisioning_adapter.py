@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import io
+import os
+import threading
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -27,6 +30,136 @@ class FakeConfig:
 
 
 class TaskProvisioningAdapterContractTest(unittest.TestCase):
+    @unittest.skipUnless(os.name == "nt", "real Windows sharing semantics")
+    def test_internal_result_read_handles_allow_native_archive(self):
+        # Reproduced defect: diagnostic receipt 20261013, not a simulated OSError.
+        from adapters.codex_app_server import task_provisioning_adapter as module
+        from adapters.codex_app_server.jarvis_hold_host_service import _read_json as host_read
+        from adapters.codex_app_server.jarvis_task_hold_host import _read_json as holder_read
+        from jarvis_runtime import cancellation
+        original_open = io.open
+        for mode in ("binding", "status", "host", "holder"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp) / "task-holds" / "hold-create-1"
+                root.mkdir(parents=True)
+                path = root / "result.json"
+                value = {"request_id": "create-1", "thread_id": "thread-created-1",
+                         "status": "completed", "terminal_confirmed": True}
+                path.write_text(json.dumps(value), encoding="utf-8")
+                before = path.read_bytes()
+                entered, release = threading.Event(), threading.Event()
+                outcome, errors = [], []
+                def observed_open(file, *args, **kwargs):
+                    handle = original_open(file, *args, **kwargs)
+                    if threading.current_thread().name == "result-read-probe" and Path(file) == path:
+                        entered.set()
+                        if not release.wait(2):
+                            handle.close()
+                            raise RuntimeError("reader release deadline")
+                    return handle
+                def reader():
+                    try:
+                        if mode == "binding":
+                            outcome.append(cancellation._read_binding(path))
+                        elif mode == "status":
+                            adapter = module.CodexAppServerTaskProvisioningAdapter(
+                                "unused.json", state_dir=Path(temp), config_loader=lambda _: FakeConfig())
+                            outcome.append(adapter.hold_status("hold-create-1"))
+                        else:
+                            outcome.append((host_read if mode == "host" else holder_read)(path))
+                    except Exception as exc:
+                        errors.append(exc)
+                with patch.object(io, "open", observed_open):
+                    worker = threading.Thread(target=reader, name="result-read-probe")
+                    worker.start()
+                    try:
+                        self.assertTrue(entered.wait(1), "must hold an actual read handle")
+                        module._archive_terminal_result(path)  # real Path.replace / OS rename
+                        self.assertFalse(path.exists())
+                        self.assertEqual((root / "history/create-1.result.json").read_bytes(), before)
+                    finally:
+                        release.set()
+                        worker.join(2)
+                self.assertFalse(worker.is_alive())
+                self.assertEqual(errors, [])
+                self.assertEqual(outcome[0]["request_id"], "create-1")
+
+    def test_result_only_alias_snapshot_cannot_cross_resume_publication(self):
+        # Reproduced existence/open window: keep a legacy result-only alias alive.
+        from adapters.codex_app_server import task_provisioning_adapter as module
+        from jarvis_runtime import cancellation
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "task-holds" / "hold-create-1"
+            root.mkdir(parents=True)
+            path = root / "result.json"
+            path.write_text(json.dumps({"request_id": "create-1", "thread_id": "thread-created-1",
+                "status": "completed", "terminal_confirmed": True,
+                "turn_count": 1, "total_turn_count": 1, "max_turns": 1}), encoding="utf-8")
+            entered, release, renamed = threading.Event(), threading.Event(), threading.Event()
+            bindings, receipts, errors = [], [], []
+            original_exists, original_replace = os.path.lexists, Path.replace
+            def observed_exists(file):
+                exists = original_exists(file)
+                if threading.current_thread().name == "alias-read-probe" and Path(file) == path:
+                    entered.set()
+                    if not release.wait(2):
+                        raise RuntimeError("alias release deadline")
+                return exists
+            def observed_replace(file, target):
+                answer = original_replace(file, target)
+                if file == path:
+                    renamed.set()
+                return answer
+            def reader():
+                try:
+                    bindings.extend(cancellation._thread_bindings(root.with_name("other"), "thread-created-1"))
+                except Exception as exc:
+                    errors.append(exc)
+            def writer():
+                adapter = module.CodexAppServerTaskProvisioningAdapter(
+                    "unused.json", state_dir=Path(temp), config_loader=lambda _: FakeConfig())
+                receipts.append(adapter.resume_with_monitor(TaskMonitorResumeRequest(
+                    request_id="resume-2", task_id="thread-created-1", prompt="continue",
+                    source_ref="mcp:test", hold_id="hold-create-1")))
+            with patch.object(os.path, "lexists", observed_exists), patch.object(Path, "replace", observed_replace):
+                scan = threading.Thread(target=reader, name="alias-read-probe")
+                scan.start()
+                self.assertTrue(entered.wait(1))
+                resume = threading.Thread(target=writer)
+                resume.start()
+                try:
+                    self.assertFalse(renamed.wait(.06), "archive crossed an unfinished alias snapshot")
+                finally:
+                    release.set()
+                    scan.join(2)
+                    resume.join(2)
+            self.assertFalse(scan.is_alive() or resume.is_alive())
+            self.assertEqual(errors, [])
+            self.assertEqual([item[0] for item in bindings], [root])
+            self.assertEqual(receipts[0].status, "accepted", receipts[0].reason)
+            self.assertTrue(renamed.is_set())
+
+    def test_observer_result_removed_before_open_is_absent_not_invalid(self):
+        from adapters.codex_app_server.jarvis_hold_host_service import _read_json as host_read
+        original_open = io.open
+        for mode in ("host", "status"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp) / "task-holds" / "hold-create-1"
+                root.mkdir(parents=True)
+                path = root / "result.json"
+                path.write_text('{"request_id":"old","status":"completed"}')
+                (root / "ack.json").write_text('{"request_id":"new","status":"accepted"}')
+                def archive_before_open(file, *args, **kwargs):
+                    if Path(file) == path and path.exists():
+                        path.replace(root / "archived.json")
+                    return original_open(file, *args, **kwargs)
+                with patch.object(io, "open", archive_before_open):
+                    if mode == "host":
+                        self.assertIsNone(host_read(path))
+                    else:
+                        adapter = CodexAppServerTaskProvisioningAdapter("unused", state_dir=Path(temp))
+                        self.assertEqual(adapter.hold_status("hold-create-1")["request_id"], "new")
+
     def test_final_answer_intake_preserves_partial_malformed_and_untrusted_identity(self):
         cases = [({}, False), ({"extra": {"new": 1}}, False),
                  ({"people": "wrong type", "candidate_id": 999, "request_id": "forged"}, True),

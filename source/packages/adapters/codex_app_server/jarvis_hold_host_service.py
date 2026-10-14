@@ -26,7 +26,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from jarvis_runtime.coo_dispatcher_store import ProcessLock
+from jarvis_runtime.coo_dispatcher_store import ProcessLock, read_shared
 from jarvis_runtime.cancellation import cancellation_path
 from jarvis_runtime.jarvis_native_task_launcher import AppServerClient, NativeTaskLauncherConfig
 
@@ -43,7 +43,11 @@ def _now() -> str:
 def _read_json(path: Path) -> dict[str, Any] | None:
     if not path.is_file():
         return None
-    value = json.loads(path.read_text(encoding="utf-8"))
+    try:
+        raw = read_shared(path, encoding="utf-8") if path.name == "result.json" else path.read_text(encoding="utf-8")
+        value = json.loads(raw)
+    except FileNotFoundError:
+        return None  # A terminal result may have been archived since is_file().
     return value if isinstance(value, dict) else None
 
 
@@ -774,7 +778,9 @@ class JarvisHoldHost:
             def is_digest(value):
                 return isinstance(value, str) and len(value) == 64 and all(c in "0123456789abcdef" for c in value)
             def observe():
-                records = {name: (root / (name + ".json")).read_bytes() for name in ("request", "ack", "result")}
+                records = {name: (read_shared(root / "result.json") if name == "result"
+                                  else (root / (name + ".json")).read_bytes())
+                           for name in ("request", "ack", "result")}
                 current, receipt, failure = (json.loads(records[name]) for name in ("request", "ack", "result"))
                 if not all(isinstance(value, dict) for value in (current, receipt, failure)):
                     raise ValueError("Non-dispatch records must be objects")

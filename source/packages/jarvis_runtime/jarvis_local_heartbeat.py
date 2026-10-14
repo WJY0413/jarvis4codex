@@ -133,8 +133,8 @@ class LocalHeartbeatStore:
             raise ValueError("function must be a supported JarvisControl function")
         if not isinstance(arguments, Mapping):
             raise ValueError("arguments must be an object")
-        interval = int(request.get("interval_seconds") or 0)
-        if not self.config.min_interval_seconds <= interval <= self.config.max_interval_seconds:
+        interval = request.get("interval_seconds")
+        if type(interval) is not int or not self.config.min_interval_seconds <= interval <= self.config.max_interval_seconds:
             raise ValueError("interval_seconds is outside configured limits")
         max_runs = int(request.get("max_runs") or 0)
         if max_runs < 1:
@@ -184,15 +184,21 @@ class LocalHeartbeatStore:
         with self._session() as db:
             return [dict(row) for row in db.execute("SELECT * FROM jarvis_local_heartbeats ORDER BY heartbeat_id")]
 
-    def cancel(self, heartbeat_id: str) -> dict[str, Any]:
+    def cancel(self, heartbeat_id: str, *, creation_rejected: bool = False) -> dict[str, Any] | None:
+        if not heartbeat_id.strip():
+            raise ValueError("heartbeat_id is required")
         with self._session() as db:
-            changed = db.execute("UPDATE jarvis_local_heartbeats SET status='CANCELLED',next_run_epoch=NULL,updated_at=? WHERE heartbeat_id=? AND status='ACTIVE'", (_now().isoformat(), heartbeat_id)).rowcount
-        if changed != 1:
-            existing = self.get(heartbeat_id)
-            if existing["status"] not in TERMINAL or existing["next_run_epoch"] is not None:
+            db.execute("UPDATE jarvis_local_heartbeats SET status='CANCELLED',next_run_epoch=NULL,updated_at=? WHERE heartbeat_id=? AND status='ACTIVE'", (_now().isoformat(), heartbeat_id))
+            row = db.execute("SELECT * FROM jarvis_local_heartbeats WHERE heartbeat_id=?", (heartbeat_id,)).fetchone()
+            # Rejected creation may never have inserted a schedule. Prove absence
+            # in the same transaction; database errors must still propagate.
+            if row is None:
+                if creation_rejected:
+                    return None
+                raise ValueError("heartbeat not found")
+            if row["status"] not in TERMINAL or row["next_run_epoch"] is not None:
                 raise ValueError("heartbeat is not confirmed inactive")
-            return existing
-        return self.get(heartbeat_id)
+            return dict(row)
 
     def claim_due(self) -> list[dict[str, Any]]:
         now = _now()
@@ -315,6 +321,17 @@ class JarvisControlHeartbeat:
         self.store = LocalHeartbeatStore(LocalHeartbeatConfig.load(config_path))
 
     def invoke_heartbeat(self, _request_id: str, capability: str, _source_ref: str, arguments: Mapping[str, Any]) -> dict[str, Any]:
+        if capability == "heartbeat.validate":
+            try:
+                self.store._validate(arguments)
+            except ValueError as exc:
+                if str(exc) == "interval_seconds is outside configured limits":
+                    raise ValueError(f"{exc}: received {arguments.get('interval_seconds')!r}; "
+                                     f"expected integer {self.store.config.min_interval_seconds}..{self.store.config.max_interval_seconds}") from exc
+                raise
+            return {"status": "validated", "limits": {
+                "min_interval_seconds": self.store.config.min_interval_seconds,
+                "max_interval_seconds": self.store.config.max_interval_seconds}}
         if capability == "heartbeat.health":
             return {"status": "completed", **computer_time(), **self.store.summary(),
                     "scheduler": HeartbeatService(self.store.config, store=self.store).health()}
@@ -324,7 +341,11 @@ class JarvisControlHeartbeat:
         if capability == "heartbeat.update":
             raise ValueError("local heartbeat update is not implemented; cancel then create a new bounded schedule")
         if capability == "heartbeat.cancel":
-            heartbeat = self.store.cancel(str(arguments.get("heartbeat_id") or ""))
+            heartbeat_id = str(arguments.get("heartbeat_id") or "")
+            heartbeat = self.store.cancel(heartbeat_id, creation_rejected=arguments.get("creation_rejected") is True)
+            if heartbeat is None:
+                return {"status": "not_required", "heartbeat_id": heartbeat_id,
+                        "heartbeat": None, "reason": "heartbeat_absent"}
             return {"status": "cancelled" if heartbeat["status"] == "CANCELLED" else "not_required",
                     "heartbeat_id": heartbeat["heartbeat_id"], "heartbeat": heartbeat}
         raise ValueError("unsupported heartbeat capability")

@@ -240,7 +240,7 @@ class JarvisMcpServer:
 
         @self.mcp.tool(
             name="jarvis_loop",
-            description="Preflight, register/read a reusable result schema, start, inspect or stop one bounded Jarvis loop. Schema validation checks structure, not business facts.",
+            description="Preflight, register/read a reusable result schema, start, inspect or stop one bounded Jarvis loop. Preflight with complete start fields validates deployment and actual scheduler limits without starting work; without start fields it only describes inputs. Start always repeats admission validation before Host/queue side effects. Schema validation checks structure, not business facts.",
             annotations=ToolAnnotations(destructiveHint=False, idempotentHint=False, openWorldHint=False),
         )
         def jarvis_loop(
@@ -275,7 +275,7 @@ class JarvisMcpServer:
             turns_per_thread: Annotated[int | None, Field(description="Optional positive turn quota per thread, including its first turn. Rotate to a new thread in the same seat; max_rounds remains the total per seat.")] = None,
             continue_prompt: Annotated[str | None, Field(description="Optional continuation task prompt. New threads use prompt; omitted continuation reuses prompt.")] = None,
             auto_continue: bool | None = None,
-            interval_seconds: int | None = None,
+            interval_seconds: Annotated[int | None, Field(strict=True, ge=1, description="Omit to use the program default (1800). Explicit values must satisfy the deployed scheduler limits; full preflight/start rejects invalid values without queuing work.")] = None,
             expires_at: str | None = None,
             model: str | None = None,
             reasoning_effort: str | None = None,
@@ -347,6 +347,8 @@ class JarvisMcpServer:
             auto_continue: bool = False,
             continue_prompt: str = "继续",
             notifications: dict[str, Any] | None = None,
+            prompt_mode: Literal["fixed", "prediction", "prediction_plus_fixed"] = "fixed",
+            fixed_prompt: str | None = None,
         ) -> CallToolResult:
             return _tool_result(self._invoke("resume",
                 request_id=request_id, task_id=task_id, prompt=prompt, source_ref=source_ref,
@@ -354,7 +356,24 @@ class JarvisMcpServer:
                 hold_with_monitor=hold_with_monitor, monitor_id=monitor_id, hold_id=hold_id,
                 max_turns=max_turns, auto_continue=auto_continue,
                 continue_prompt=continue_prompt, notifications=notifications,
+                prompt_mode=prompt_mode, fixed_prompt=fixed_prompt,
             ))
+
+        @self.mcp.tool(name="jarvis_predict", description="Generate a native next-message prediction from a completed source turn; never send it to the source chat.",
+                       annotations=ToolAnnotations(idempotentHint=True, openWorldHint=False))
+        def jarvis_predict(thread_id: str, request_id: str, source_turn_id: str | None = None) -> CallToolResult:
+            return _tool_result(self._invoke("predict", thread_id=thread_id, request_id=request_id, source_turn_id=source_turn_id))
+
+        @self.mcp.tool(name="jarvis_task", description="Continue an existing chat with a fresh native prediction each turn, optionally combined with fixed user instructions. max_turns counts resumed task turns; project mode stops on an agreed exact completion-marker line or the budget. status and stop require hold_id.",
+                       annotations=ToolAnnotations(idempotentHint=True, openWorldHint=False))
+        def jarvis_task(action: Literal["start", "status", "stop"] = "start", task_id: str | None = None,
+                        request_id: str | None = None, hold_id: str | None = None, max_turns: int = 1,
+                        fixed_prompt: str = "", stop_mode: Literal["turns", "project"] = "turns",
+                        completion_marker: str | None = None, model: str | None = None,
+                        reasoning_effort: str | None = None) -> CallToolResult:
+            return _tool_result(self._invoke("task", action=action, task_id=task_id, request_id=request_id,
+                hold_id=hold_id, max_turns=max_turns, fixed_prompt=fixed_prompt, stop_mode=stop_mode,
+                completion_marker=completion_marker, model=model, reasoning_effort=reasoning_effort))
 
         @self.mcp.tool(
             name="jarvis_monitor",

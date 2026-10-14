@@ -1,24 +1,25 @@
-# Distribution review
+# Share report: Jarvis rev10 TEST
 
-Intended recipient: users of the public WJY0413/jarvis4codex TEST prerelease.
+This distribution makes the reviewed prediction/task, Windows result-lock and
+memory-admission changes available for source review without bundling a local
+installation or its state. It advances the TEST release line only. The previous
+TEST assets and the stable release are retained.
 
-The package preserves 140 files from the rev9 review snapshot byte-for-byte:
-product code, all 17 Skills, canonical tests and fixtures, and review guidance.
-Seven historical diff files containing workstation paths were excluded. No
-product or test implementation was changed for this publication.
+Start with `README.md`, inspect `source/packages/`, then use the canonical suite
+under `source/tests/` for explicitly selected checks. Skills are unchanged from
+rev9. `DISTRIBUTION_CHECK.json` is a bounded packaging check, not model acceptance.
 
-The source review found no credentials, customer/contact records or raw runtime
-state in the included file set. Mechanical scan hits were dates, source hashes,
-generic business/schema vocabulary and synthetic test paths. The excluded diffs
-are not required for execution. Internal session logs, diagnostic reports,
-environment configuration, databases and the dirty root worktree are excluded.
+The public copy comes from the reviewed candidate, not the repository's dirty
+working tree. A historical private requirement-chat identifier in dispatcher
+metadata is blanked. A native-launcher fixture uses a clearly synthetic UUID.
+Those redactions do not change admission or dispatch behavior. Existing public
+author/operator wording and compatibility parsing are retained.
 
-The product and Skills are first-party project material; schema fixtures are
-protocol definitions retained for compatibility checks, not conversation data.
-Dependencies are referenced by package metadata rather than copied as vendored
-code. No change of project license is asserted.
+No local launcher, credentials, runtime databases, raw logs, customer records or
+internal audit receipts are included. The product memory gate still defaults to
+enabled. Explicit per-machine opt-out remains possible and requires newly loaded
+code; this publication neither reloads nor restarts a resident process.
 
-Publication recommendation: suitable for a clearly labelled TEST prerelease,
-with the README's incomplete acceptance and activation limitations retained.
-Publication, downloaded-file installation and live service activation must be
-reported separately.
+The known owner-terminal evidence gap and inherited cancellation fixture failures
+remain visible in the README. Review this as a prerelease, not as production or
+complete 5-by-5 acceptance. No license change is part of this publication.

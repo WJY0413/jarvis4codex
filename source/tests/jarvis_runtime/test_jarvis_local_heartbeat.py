@@ -20,6 +20,21 @@ from contract_fake_inputs import host_config_fixture
 
 @host_config_fixture
 class LocalHeartbeatTest(unittest.TestCase):
+    def test_validate_and_create_share_policy_without_validation_writes(self):
+        control = JarvisControlHeartbeat(self.config_path)
+        valid = control.invoke_heartbeat("validate", "heartbeat.validate", "test", self.request())
+        self.assertEqual(valid["status"], "validated")
+        self.assertEqual(valid["limits"], {"min_interval_seconds": 10, "max_interval_seconds": 3600})
+        self.assertEqual(self.store.list(), [])
+        for value in (1, 3601, True, "30", 30.5):
+            for capability in ("heartbeat.validate", "heartbeat.create"):
+                with self.subTest(value=value, capability=capability):
+                    with self.assertRaisesRegex(ValueError, "interval_seconds"):
+                        control.invoke_heartbeat("bad", capability, "test", {**self.request(), "interval_seconds": value})
+                    self.assertEqual(self.store.list(), [])
+        created = control.invoke_heartbeat("create", "heartbeat.create", "test", self.request())
+        self.assertEqual(created["heartbeat"]["interval_seconds"], 30)
+
     def test_health_remains_readable_while_next_tick_is_being_written(self):
         # Independent QA reproduced an empty health file during a normal write.
         service = HeartbeatService(self.config, store=self.store)
@@ -276,6 +291,64 @@ class LocalHeartbeatTest(unittest.TestCase):
         stored = self.store.get(str(heartbeat["heartbeat_id"]))
         self.assertEqual(stored["run_count"], 1)
         self.assertEqual(stored["status"], "COMPLETED")
+
+    def test_cancel_rejected_creation_reports_absence_without_inventing_a_row(self):
+        control = JarvisControlHeartbeat(self.config_path)
+        request = {**self.request(), "interval_seconds": 1}
+        with self.assertRaisesRegex(ValueError, "outside configured limits"):
+            control.invoke_heartbeat("create", "heartbeat.create", "test", request)
+        with self.assertRaisesRegex(ValueError, "heartbeat not found"):
+            control.invoke_heartbeat("ordinary-cancel", "heartbeat.cancel", "test",
+                {"heartbeat_id": request["heartbeat_id"]})
+        for _ in range(2):
+            receipt = control.invoke_heartbeat("cancel", "heartbeat.cancel", "test",
+                {"heartbeat_id": request["heartbeat_id"], "creation_rejected": True})
+            self.assertEqual(receipt["status"], "not_required")
+            self.assertEqual(receipt["heartbeat_id"], request["heartbeat_id"])
+            self.assertIsNone(receipt["heartbeat"])
+            self.assertEqual(receipt["reason"], "heartbeat_absent")
+        self.assertEqual(self.store.list(), [])
+        with self.assertRaises(ValueError):
+            control.invoke_heartbeat("empty", "heartbeat.cancel", "test", {"heartbeat_id": ""})
+        with patch.object(control.store, "_connect", side_effect=OSError("unreadable database")):
+            with self.assertRaisesRegex(OSError, "unreadable database"):
+                control.invoke_heartbeat("cancel", "heartbeat.cancel", "test", {"heartbeat_id": "missing"})
+
+    def test_rejected_loop_schedule_cleanup_still_requires_exact_hold_release(self):
+        from jarvis_control import LoopController, LoopStore
+        from tests.contract.test_jarvis_loop import FakeRuntime
+        control = JarvisControlHeartbeat(self.config_path)
+        class Runtime(FakeRuntime):
+            def heartbeat(_self, **kwargs):
+                try:
+                    return control.invoke_heartbeat(kwargs["request_id"], "heartbeat." + kwargs["action"],
+                        kwargs["source_ref"], {**(kwargs.get("options") or {}),
+                            **({"heartbeat_id": kwargs["heartbeat_id"]} if "heartbeat_id" in kwargs else {})})
+                except ValueError as exc:
+                    return {"status": "invalid_request", "reason": str(exc)}
+            def stop_hold(_self, hold_id):
+                return {"status": "stop_requested"}
+        controller = LoopController(LoopStore(Path(self.temp.name) / "loops"))
+        runtime = Runtime()
+        started = controller.start(runtime, request_id="rejected-heartbeat", project="test", title="test",
+            prompt="synthetic", target_thread_count=1, max_rounds=1, interval_seconds=1,
+            expires_at="2099-01-01T00:00:00+00:00")
+        self.assertEqual(started.status, "finalizing")
+        self.assertEqual(started.reason, "interval_seconds is outside configured limits")
+        self.assertTrue(started.data["cleanup"]["heartbeat_cancelled"])
+        self.assertEqual(started.data["cleanup"]["status"], "pending")
+        hold_id = started.data["children"][0]["hold_id"]
+        for released, confirmed in ((False, True), (True, False), (True, True)):
+            with self.subTest(released=released, confirmed=confirmed):
+                runtime.states[hold_id] = {"status": "cancelled", "hold_released": released,
+                    "terminal_confirmed": confirmed}
+                result = controller.stop(runtime, loop_id=started.loop_id)
+                self.assertEqual(result.data["cleanup"]["status"],
+                    "completed" if released and confirmed else "pending")
+        self.assertEqual(self.store.list(), [])
+        print("REJECTED_HEARTBEAT_CLEANUP_RECEIPT", json.dumps({"status": result.status,
+            "cleanup": result.data["cleanup"], "schedule_rows": 0, "model_calls": 0,
+            "transport": "isolated real scheduler store with synthetic Hold"}))
 
     def test_shared_db_overlapping_services_have_one_owner_and_one_bounded_run(self):
         # PKG-3: Astra's nested second tick after one interval, before accounting.

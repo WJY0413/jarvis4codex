@@ -9,6 +9,7 @@ from pathlib import Path, PurePosixPath
 import time
 import uuid
 from urllib.parse import unquote
+from jarvis_runtime.coo_dispatcher_store import read_shared
 
 MARKER = "cancellation.json"
 
@@ -26,7 +27,9 @@ def _read_binding(path: Path):
     deadline = time.monotonic() + 0.2
     while True:
         try:
-            return json.loads(path.read_text(encoding="utf-8"))
+            raw = (read_shared(path, encoding="utf-8") if path.name == "result.json"
+                   else path.read_text(encoding="utf-8"))
+            return json.loads(raw)
         except PermissionError:
             if time.monotonic() >= deadline:
                 raise
@@ -97,6 +100,12 @@ def _recorded_roots(root: Path, request: dict | None = None) -> list[Path]:
     return roots
 
 
+def _binding_gate(root: Path) -> Path:
+    # Registry-level lock file: observing another Hold must not mutate its contents.
+    key = hashlib.sha256(os.path.normcase(str(root.absolute())).encode()).hexdigest()
+    return root.parents[1] / (".binding-hold-" + key)
+
+
 def _thread_bindings(root: Path, thread_id: str):
     """Resolve aliases from current and legacy receipts; unknown JSON fails closed."""
     for name in ("task-holds", "task-monitors"):
@@ -110,17 +119,20 @@ def _thread_bindings(root: Path, thread_id: str):
                 raise RuntimeError("symlink thread alias rejected")
             if not alias.is_dir():
                 continue
-            records = {}
-            for filename in ("request.json", "ack.json", "result.json"):
-                path = alias / filename
-                if not os.path.lexists(path):
-                    continue
-                if path.is_symlink():
-                    raise RuntimeError("symlink thread binding rejected")
-                value = json.loads(path.read_text(encoding="utf-8"))
-                if not isinstance(value, dict):
-                    raise RuntimeError("invalid thread binding record")
-                records[filename] = value
+            # Snapshot only this alias; release BEFORE yielding or taking dispatch gates.
+            # Resume holds the same short gate over archive + successor publication.
+            with report_guard(_binding_gate(alias)):
+                records = {}
+                for filename in ("request.json", "ack.json", "result.json"):
+                    path = alias / filename
+                    if not os.path.lexists(path):
+                        continue
+                    if path.is_symlink():
+                        raise RuntimeError("symlink thread binding rejected")
+                    value = _read_binding(path)
+                    if not isinstance(value, dict):
+                        raise RuntimeError("invalid thread binding record")
+                    records[filename] = value
             if any(value.get("thread_id") == thread_id for value in records.values()):
                 yield alias, records.get("request.json", {})
 
@@ -204,16 +216,17 @@ def _hold_guard(root: Path, request: dict | None = None):
     """Native identities first, then exact Hold/Loop; never wait on request.lock here."""
     if root.is_symlink() or root.parent.is_symlink():
         raise RuntimeError("symlink state registry rejected")
-    records = [request or {}]
-    for name in ("request.json", "ack.json", "result.json"):
-        path = root / name
-        if os.path.lexists(path):
-            if path.is_symlink():
-                raise RuntimeError("symlink thread binding rejected")
-            value = _read_binding(path)
-            if not isinstance(value, dict):
-                raise RuntimeError("invalid Hold identity record")
-            records.append(value)
+    with report_guard(_binding_gate(root)):
+        records = [request or {}]
+        for name in ("request.json", "ack.json", "result.json"):
+            path = root / name
+            if os.path.lexists(path):
+                if path.is_symlink():
+                    raise RuntimeError("symlink thread binding rejected")
+                value = _read_binding(path)
+                if not isinstance(value, dict):
+                    raise RuntimeError("invalid Hold identity record")
+                records.append(value)
     identities = [value["thread_id"] for value in records if value.get("thread_id")]
     with _thread_guard(root, identities), report_guard(root / ".dispatch-gate"):
         yield

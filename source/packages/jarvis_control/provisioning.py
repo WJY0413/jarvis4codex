@@ -114,6 +114,37 @@ def validate_saved_output(schema: Any, output: Any) -> None:
 ProvisionStatus = Literal["accepted", "holding", "running", "completed", "failed", "requires_readback", "partial"]
 
 
+def validate_prediction_options(value: Mapping[str, Any] | None) -> dict[str, Any]:
+    if value is None:
+        return {}
+    if not isinstance(value, Mapping):
+        raise ValueError("prediction_options must be an object")
+    result = dict(value)
+    if set(result) - {"mode", "fixed_prompt", "completion_marker"}:
+        raise ValueError("unknown prediction_options field")
+    if result.get("mode") not in {"prediction", "prediction_plus_fixed"}:
+        raise ValueError("prediction mode must be prediction or prediction_plus_fixed")
+    if not isinstance(result.get("fixed_prompt", ""), str):
+        raise ValueError("fixed_prompt must be a string")
+    if result["mode"] == "prediction_plus_fixed" and not result.get("fixed_prompt", "").strip():
+        raise ValueError("prediction_plus_fixed requires fixed_prompt")
+    if "completion_marker" in result and (not isinstance(result["completion_marker"], str)
+            or not result["completion_marker"].strip() or "\n" in result["completion_marker"]):
+        raise ValueError("completion_marker must be one nonempty exact line")
+    return result
+
+
+def compose_resume_prompt(mode: str, fixed_prompt: str, suggestion: str | None) -> str:
+    if mode == "fixed":
+        return fixed_prompt
+    if mode not in {"prediction", "prediction_plus_fixed"} or not isinstance(suggestion, str) or not suggestion.strip():
+        raise ValueError("a nonempty native prediction is required")
+    if mode == "prediction":
+        return suggestion
+    return ("Predicted next step:\n" + suggestion + "\n\n"
+            "Fixed user instructions (retain these requirements if the suggestion conflicts):\n" + fixed_prompt)
+
+
 @dataclass(frozen=True)
 class TaskProvisionRequest:
     request_id: str
@@ -179,8 +210,10 @@ class TaskMonitorResumeRequest:
     continue_prompt: str = "继续"
     notifications: Mapping[str, Any] | None = None
     input_binding: Mapping[str, Any] | None = None
+    prediction_options: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
+        validate_prediction_options(self.prediction_options)
         required = {
             "request_id": self.request_id,
             "task_id": self.task_id,
@@ -240,6 +273,8 @@ class TaskProvisioningPort(Protocol):
     """Create one durable thread, start its first turn, and return exact identity."""
 
     def provision(self, request: TaskProvisionRequest) -> TaskProvisionReceipt: ...
+
+    def validate_loop_start(self, request: Mapping[str, Any]) -> dict[str, Any]: ...
 
     def ensure_hold_host_ready(self, *, required_workers: int) -> dict[str, str]: ...
 

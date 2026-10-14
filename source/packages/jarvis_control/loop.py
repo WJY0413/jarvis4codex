@@ -373,13 +373,11 @@ class LoopController:
             heartbeat = runtime.heartbeat(
                 action="create", request_id=f"{loop_id}:reconcile-heartbeat",
                 source_ref=f"jarvis_loop:{loop_id}:reconcile-heartbeat",
-                options=_reconcile_heartbeat_options(
-                    loop_id=loop_id, request_id=request["request_id"], heartbeat_id=heartbeat_id,
-                    interval_seconds=request["interval_seconds"], expires_at=request["expires_at"],
-                ),
+                options=self.heartbeat_options(request),
             )
             state["heartbeat_id"] = heartbeat_id
             state["heartbeat"] = heartbeat
+            state["heartbeat_creation"] = heartbeat
             if str(heartbeat.get("status") or "").lower() not in {"active", "accepted", "completed"}:
                 state["status"] = "blocked"
                 state["reason"] = str(heartbeat.get("reason") or "loop reconciliation heartbeat was not accepted")
@@ -463,9 +461,19 @@ class LoopController:
         return LoopResult("completed", None, {"reconciled": reconciled})
 
     @staticmethod
+    def heartbeat_options(request: Mapping[str, Any]) -> dict[str, Any]:
+        loop_id = f"loop-{request['request_id']}"
+        return _reconcile_heartbeat_options(
+            loop_id=loop_id, request_id=request["request_id"], heartbeat_id=f"{loop_id}:reconcile",
+            interval_seconds=request["interval_seconds"], expires_at=request["expires_at"],
+        )
+
+    @staticmethod
     def preflight_contract(*, allowed_projects: list[str]) -> dict[str, Any]:
         """Describe start inputs without creating Loop, Hold, or heartbeat state."""
         return {
+            "request_validated": False,
+            "validation_scope": "input description only; supply a complete start request for read-only admission validation",
             "allowed_projects": sorted(allowed_projects),
             "output_schema_registry": {
                 "actions": ["schema_register", "schema_read"],
@@ -784,14 +792,16 @@ class LoopController:
         if not state.get("heartbeat_id") or not state.get("heartbeat"):
             return {"status": "not_required"}
         return runtime.heartbeat(action="cancel", request_id=f"{state['loop_id']}:stop",
-                                 source_ref=f"jarvis_loop:{state['loop_id']}", heartbeat_id=state["heartbeat_id"])
+                                 source_ref=f"jarvis_loop:{state['loop_id']}", heartbeat_id=state["heartbeat_id"],
+                                 **({"options": {"creation_rejected": True}}
+                                    if (state.get("heartbeat_creation") or {}).get("status") == "invalid_request" else {}))
 
     @staticmethod
     def _result(state: Mapping[str, Any]) -> LoopResult:
         data = {key: state.get(key) for key in ("loop_id", "project", "status", "target_thread_count", "heartbeat_id", "heartbeat", "max_rounds", "max_turns", "turns_per_thread", "auto_continue", "continue_prompt", "controller_skill", "business_skill", "model", "reasoning_effort", "notifications", "interval_seconds", "expires_at", "children", "cleanup", "close")}
         data["business_status"] = ("review" if any(child.get("business_status") in {"review", "unverified"}
             or child.get("phase") == "blocked" for child in state["children"]) else "not_evaluated")
-        return LoopResult(str(state["status"]), str(state["loop_id"]), data)
+        return LoopResult(str(state["status"]), str(state["loop_id"]), data, state.get("reason"))
 
 
 def _validate_start(raw: Mapping[str, Any]) -> dict[str, Any]:

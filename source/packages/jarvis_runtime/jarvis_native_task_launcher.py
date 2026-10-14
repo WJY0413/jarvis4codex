@@ -237,6 +237,7 @@ class NativeTaskLauncherConfig:
         raw = read_json(self.path)
         self.version = int(raw.get("version", 1))
         # Keep invalid policy readable; validate only when admitting new work.
+        self.memory_admission_enabled = raw.get("memory_admission_enabled", True)
         self.memory_admission_max_used_percent = raw.get("memory_admission_max_used_percent", 95)
         self.dispatcher_thread_id = _as_nonempty_string(
             raw.get("dispatcher_thread_id"), "dispatcher_thread_id"

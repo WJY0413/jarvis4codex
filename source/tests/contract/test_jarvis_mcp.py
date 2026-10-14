@@ -144,6 +144,8 @@ class JarvisMcpContractTest(unittest.TestCase):
                 "jarvis_close",
                 "jarvis_read",
                 "jarvis_resume",
+                "jarvis_predict",
+                "jarvis_task",
                 "jarvis_monitor",
                 "jarvis_heartbeat",
                 "jarvis_update",

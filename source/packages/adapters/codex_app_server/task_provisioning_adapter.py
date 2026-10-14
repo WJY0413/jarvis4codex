@@ -16,10 +16,10 @@ from pathlib import Path
 from typing import Any
 from jarvis_schema import MAX_CONCURRENCY
 
-from jarvis_runtime.coo_dispatcher_store import ProcessLock
+from jarvis_runtime.coo_dispatcher_store import ProcessLock, read_shared
 from jarvis_runtime.cancellation import (
     cancel_management, cancellation_path, require_dispatch_open, report_guard,
-    dispatch_roots, _hold_guard, _dispatch_guard, _require_roots_open,
+    dispatch_roots, _hold_guard, _dispatch_guard, _require_roots_open, _binding_gate,
 )
 
 from jarvis_control.provisioning import (
@@ -70,8 +70,15 @@ def physical_memory_sample() -> dict[str, Any]:
 
 def physical_memory_admission(config: Any) -> dict[str, Any]:
     """Validate policy only for a new admission; errors never disable read/close."""
-    threshold = getattr(config, "memory_admission_max_used_percent", 95)
+    enabled = getattr(config, "memory_admission_enabled", True)
     evidence = {"status": "blocked", "observed_at": observed_now().isoformat()}
+    if type(enabled) is not bool:
+        return {**evidence, "error_code": "memory_policy_invalid",
+                "reason": "memory_admission_enabled must be boolean"}
+    evidence["enabled"] = enabled
+    if not enabled:
+        return {**evidence, "status": "allowed", "reason": "memory admission disabled by configuration"}
+    threshold = getattr(config, "memory_admission_max_used_percent", 95)
     if (type(threshold) not in (int, float) or not 0 < threshold <= 100
             or not math.isfinite(threshold)):
         return {**evidence, "error_code": "memory_policy_invalid",
@@ -190,6 +197,20 @@ class CodexAppServerTaskProvisioningAdapter:
 
     def creation_enabled(self) -> bool:
         return self._config_loader(self._config_path).live_creation_enabled is True
+
+    def validate_loop_start(self, request: Mapping[str, Any]) -> dict[str, Any]:
+        """Read-only deployment admission; never initializes a Host or queues work."""
+        try:
+            config = self._config_loader(self._config_path)
+            profile = str(getattr(config, "profile", "") or "").strip()
+            if not profile:
+                raise ValueError("launcher.profile is required and must be nonempty; received missing/blank")
+            project, _ = config.resolve_project(request["project"])
+            if config.live_creation_enabled is not True:
+                raise ValueError("live creation is disabled for this deployment")
+            return {"project": project, "profile": profile}
+        except Exception as exc:
+            raise ValueError(str(exc)) from exc
 
     def contract_snapshot(self) -> dict[str, Any]:
         config = self._config_loader(self._config_path)
@@ -336,6 +357,22 @@ class CodexAppServerTaskProvisioningAdapter:
             return health
         return {"status": "ready", "phase": str(started.get("phase") or "started")}
 
+    def predict(self, *, thread_id: str, request_id: str, source_turn_id: str | None = None) -> dict[str, Any]:
+        from .prediction import NativePredictor, official_prediction_config
+        from jarvis_runtime.jarvis_native_task_launcher import AppServerClient
+        config = self._config_loader(self._config_path)
+        if not self.creation_enabled():
+            return {"status":"disabled", "reason":"live creation is disabled for this deployment"}
+        require_memory_admission(config)
+        client = AppServerClient(config)
+        try:
+            client.start()
+            home = Path(config.expected_codex_home)
+            return NativePredictor(client, self._state_dir / "predictions", lambda: official_prediction_config(home)).predict(
+                thread_id=thread_id, request_id=request_id, source_turn_id=source_turn_id)
+        finally:
+            client.close()
+
     def resume_with_monitor(self, request: TaskMonitorResumeRequest) -> TaskProvisionReceipt:
         try:
             config = self._config_loader(self._config_path)
@@ -351,6 +388,8 @@ class CodexAppServerTaskProvisioningAdapter:
                 "continue_prompt": request.continue_prompt,
                 "notifications": dict(request.notifications or {}), "input_binding": dict(request.input_binding or {}),
             }
+            if request.prediction_options:
+                declaration["prediction_options"] = dict(request.prediction_options)
             paths = self._existing_paths(hold_id) or self._paths_at(hint_root)
             historical_root = paths["request"].parent / "history" / _safe_id(request.request_id)
             historical = _read_json_file(historical_root / "request.json")
@@ -427,9 +466,10 @@ class CodexAppServerTaskProvisioningAdapter:
                     pause = _pause_original_generation(paths, snapshot, recovery, self._recovery_backend)
                     _complete_original_transfer(paths, pause, roots, self._recovery_backend)
                 else:
-                    _archive_terminal_result(paths["result"])
-                    _write_json(paths["request"], payload)
-                    _write_json(paths["ack"], accepted)
+                    with report_guard(_binding_gate(paths["request"].parent)):
+                        _archive_terminal_result(paths["result"])
+                        _write_json(paths["request"], payload)
+                        _write_json(paths["ack"], accepted)
         except _OriginalRecoveryBlocked as exc:
             return TaskProvisionReceipt(request_id=request.request_id, status="requires_readback", observed_at=observed_now(),
                 error_code=exc.code, phase="original_backend_recovery", reason=str(exc), hold_id=hold_id,
@@ -477,7 +517,8 @@ class CodexAppServerTaskProvisioningAdapter:
                 if input_binding and input_binding != saved_binding:
                     raise RuntimeError("existing Hold batch/output_schema binding cannot change on resume; use a new request")
                 input_binding = dict(saved_binding)
-            max_turns = _positive_int(previous.get("max_turns")) or request.max_turns
+            max_turns = (request.max_turns if request.prediction_options else
+                         _positive_int(previous.get("max_turns")) or request.max_turns)
             total = existing_total + 1
             if "lane_item_count" in input_binding:
                 lane_batch_ids(input_binding, total)
@@ -541,7 +582,10 @@ class CodexAppServerTaskProvisioningAdapter:
         ):
             for path in (root / "result.json", root / "ack.json"):
                 if path.is_file():
-                    value = json.loads(path.read_text(encoding="utf-8"))
+                    try:
+                        value = json.loads(read_shared(path, encoding="utf-8"))
+                    except FileNotFoundError:
+                        continue  # Archived after the existence check; consult the current ack.
                     if isinstance(value, dict):
                         binding = (_read_json_file(root / "request.json") or {}).get("input_binding") or {}
                         if "lane_item_count" in binding and "result_verification" not in binding:
@@ -1345,14 +1389,15 @@ def _complete_original_transfer(paths, pause, roots, backend):
         raise _OriginalRecoveryBlocked("recovery_fence_unverified", "Saved fence/transfer is not bound to this operation", identity)
     _archive_original_generation(paths, pause, roots)
     _check_transfer_state(paths, pause, roots)
-    if paths["result"].exists():
-        _archive_terminal_result(paths["result"])
-    _check_transfer_state(paths, pause, roots)
-    if paths["request"].read_bytes() != _json_bytes(transfer["target_request"]):
-        _persist_transfer_json(paths["request"], transfer["target_request"])
-    _check_transfer_state(paths, pause, roots)
-    if not paths["ack"].exists() or paths["ack"].read_bytes() != _json_bytes(transfer["target_ack"]):
-        _persist_transfer_json(paths["ack"], transfer["target_ack"])
+    with report_guard(_binding_gate(paths["request"].parent)):
+        if paths["result"].exists():
+            _archive_terminal_result(paths["result"])
+        _check_transfer_state(paths, pause, roots)
+        if paths["request"].read_bytes() != _json_bytes(transfer["target_request"]):
+            _persist_transfer_json(paths["request"], transfer["target_request"])
+        _check_transfer_state(paths, pause, roots)
+        if not paths["ack"].exists() or paths["ack"].read_bytes() != _json_bytes(transfer["target_ack"]):
+            _persist_transfer_json(paths["ack"], transfer["target_ack"])
 
 
 def reconcile_original_generation(root, backend):
@@ -1373,7 +1418,7 @@ def reconcile_original_generation(root, backend):
 
 
 def _resume_snapshot(paths):
-    values = {name: path.read_bytes() if path.exists() else None
+    values = {name: (read_shared(path) if name == "result" else path.read_bytes()) if path.exists() else None
               for name, path in paths.items() if name in {"request", "ack", "result"}}
     claim = paths["request"].parent / ".user-host-claim"
     values["claimed"] = claim.exists()
@@ -1476,7 +1521,8 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
 
 def _read_json_file(path: Path) -> dict[str, Any] | None:
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        raw = read_shared(path, encoding="utf-8") if path.name == "result.json" else path.read_text(encoding="utf-8")
+        value = json.loads(raw)
     except (OSError, json.JSONDecodeError):
         return None
     return value if isinstance(value, dict) else None
@@ -1651,7 +1697,7 @@ def _archive_terminal_result(result_path: Path) -> None:
     """Preserve the previous terminal hold receipt before one new resume."""
     if not result_path.is_file():
         return
-    value = json.loads(result_path.read_text(encoding="utf-8"))
+    value = json.loads(read_shared(result_path, encoding="utf-8"))
     request_id = _safe_id(str(value.get("request_id") or "previous")) if isinstance(value, dict) else "previous"
     archive_dir = result_path.parent / "history"
     archive_dir.mkdir(parents=True, exist_ok=True)
