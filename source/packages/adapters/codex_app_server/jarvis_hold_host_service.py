@@ -27,8 +27,11 @@ from pathlib import Path
 from typing import Any, Callable
 
 from jarvis_runtime.coo_dispatcher_store import ProcessLock, read_shared
-from jarvis_runtime.cancellation import cancellation_path
+from jarvis_runtime.cancellation import cancellation_path, StateGateBusy
 from jarvis_runtime.jarvis_native_task_launcher import AppServerClient, NativeTaskLauncherConfig
+from jarvis_runtime.holder_transport_release import (
+    holder_transport_cleanup_confirmed, unix_attachment_release_valid,
+)
 
 try:  # Supports both package import and the deployed direct-script entry point.
     from .jarvis_task_hold_host import hold_task, _write_json, _publish_generation
@@ -60,6 +63,12 @@ def _controlled_stop_intent(request: dict[str, Any]) -> bool:
         request.get("mode") == "recover" and request.get("stop_requested") is True)
 
 
+def _unverified_host_owner() -> dict[str, str]:
+    return {"status": "host_not_ready", "error_code": "host_owner_unverified",
+            "reason": "Existing HoldHost ownership cannot be verified; automatic start is blocked. "
+                      "Run readiness from the owning host environment or use an isolated state directory."}
+
+
 def initialize_user_host(
     *,
     state_dir: Path,
@@ -72,7 +81,7 @@ def initialize_user_host(
     pid_alive: Callable[[int], bool] | None = None,
     pid_started_at: Callable[[int], datetime | str | None] | None = None,
 ) -> dict[str, str]:
-    """Start one normal-user Hold Host only when its matching health is absent or stale.
+    """Start a normal-user Hold Host only when no health record exists.
 
     This entry is intended for a normal-user bootstrapper, never for MCP.  It
     returns only after a matching Host health record is read back.
@@ -95,6 +104,8 @@ def initialize_user_host(
         return {"status": "failed", "reason": "HoldHost launcher config requires profile and expected_codex_home"}
     health_checks = {"now": now, "pid_alive": pid_alive or _pid_is_alive, "pid_started_at": pid_started_at or _pid_started_at}
     existing_matches = _matching_health(state_dir, profile, codex_home, **health_checks)
+    if not existing_matches and ((state_dir / "hold-host.json").exists() or (state_dir / "hold-host.json").is_symlink()):
+        return _unverified_host_owner()
     if existing_matches and _matching_health(state_dir, profile, codex_home, required_workers=workers, **health_checks):
         return {"status": "ready", "phase": "already_running"}
 
@@ -105,6 +116,10 @@ def initialize_user_host(
         return {"status": "blocked", "reason": "HoldHost bootstrap is already in progress"}
     try:
         existing_matches = _matching_health(state_dir, profile, codex_home, **health_checks)
+        # Recheck inside the bootstrap lock: another caller may have published
+        # ownership after the first read. Never replace an unverified owner.
+        if not existing_matches and ((state_dir / "hold-host.json").exists() or (state_dir / "hold-host.json").is_symlink()):
+            return _unverified_host_owner()
         upgraded = False
         if existing_matches:
             if _matching_health(state_dir, profile, codex_home, required_workers=workers, **health_checks):
@@ -281,7 +296,10 @@ def _matching_health(
     pid_started_at: Callable[[int], datetime | str | None],
     required_workers: int = 1,
 ) -> bool:
-    health = _read_json(state_dir / "hold-host.json")
+    try:
+        health = _read_json(state_dir / "hold-host.json")
+    except (OSError, ValueError):
+        return False
     if health is None or str(health.get("status") or "") not in {"ready", "holding"}:
         return False
     observed_at = _parse_time(health.get("observed_at"))
@@ -431,12 +449,15 @@ class JarvisHoldHost:
         self._recovery_backend = recovery_backend
         self.launcher_config = launcher_config.resolve()
         launcher = NativeTaskLauncherConfig(self.launcher_config)
+        self._business_quarantine_config = launcher
         self.profile = launcher.profile
         self.codex_home = launcher.expected_codex_home
         self.codex_home_resolution = {"input": launcher.expected_codex_home_input,
             "base_dir": launcher.expected_codex_home_base_dir, "resolved": launcher.expected_codex_home}
         self.started_at = _now()
         self.instance_id = uuid.uuid4().hex
+        from jarvis_runtime.owner_readback_diagnostics import OwnerReadbackDiagnostics
+        self._readback_diagnostics = OwnerReadbackDiagnostics(state_dir, self.instance_id)
         self.requests_roots = (state_dir / "task-holds", state_dir / "task-monitors")
         self.health_path = state_dir / "hold-host.json"
         if type(workers) is not int or not 1 <= workers <= MAX_CONCURRENCY:
@@ -456,6 +477,10 @@ class JarvisHoldHost:
         self._pool_ready = False
         self._legacy_scan_cursor = ""
 
+    def _quarantine_kwargs(self):
+        config = getattr(self, "_business_quarantine_config", None)
+        return {"quarantine_config": config} if getattr(config, "business_quarantine_file", None) else {}
+
     def run_once(self, *, request_root: Path | None = None) -> bool:
         self._write_health("ready")
         for requests_root in self.requests_roots if request_root is None else (request_root.parent,):
@@ -472,28 +497,46 @@ class JarvisHoldHost:
                 ack = _read_json(ack_path)
                 if request is None or ack is None or result_path.exists() or cancellation_path(root, request):
                     continue
+                from jarvis_runtime.business_quarantine_gate import require_not_abandoned
+                try:
+                    require_not_abandoned(self._business_quarantine_config, self.state_dir, request)
+                except Exception:
+                    continue  # Isolation never produces a fabricated completion or cleanup.
+                if (root / "owner-control.json").exists():
+                    continue  # Explicit query-stop only; never replay an ambiguous start.
                 if str(ack.get("status") or "") != "accepted":
-                    if self._requeue_dead_claim(root, request_path, ack_path, request, ack):
+                    if self._requeue_dead_claim(root, request_path, ack_path, request, ack, **self._quarantine_kwargs()):
                         return True
                     continue
                 if str(ack.get("phase") or "") != "queued_for_user_host":
-                    if self._requeue_dead_claim(root, request_path, ack_path, request, ack):
+                    if self._requeue_dead_claim(root, request_path, ack_path, request, ack, **self._quarantine_kwargs()):
                         return True
                     continue
                 hold_id = str(request.get("hold_id") or request.get("monitor_id") or root.name)
                 if not self._reserve_slot(root, request):
                     continue
                 try:
-                    claimed = self._claim(root, ack_path, ack, request, host_instance_id=self.instance_id)
+                    claimed = self._claim(root, ack_path, ack, request, host_instance_id=self.instance_id, **self._quarantine_kwargs())
                 except Exception:
                     self._mark_inactive(hold_id, expected_request=request)
                     raise
                 if not claimed:
                     self._mark_inactive(hold_id, expected_request=request)
-                    if self._requeue_dead_claim(root, request_path, ack_path, request, ack):
+                    if self._requeue_dead_claim(root, request_path, ack_path, request, ack, **self._quarantine_kwargs()):
                         return True
                     continue
                 self._write_health("holding", request_id=str(request.get("request_id") or ""))
+                if "owner_control" in request:
+                    # The opted-in Holder owns publication AND claim settlement
+                    # under one kernel lease. Legacy finally must not overwrite a
+                    # recovery generation, or release an unknown remote turn.
+                    try:
+                        hold_task(self.launcher_config, request_path, ack_path, result_path,
+                                  diagnostic_sink=self._readback_diagnostics.enqueue)
+                    finally:
+                        self._mark_inactive(hold_id, expected_request=request)
+                        self._write_health("ready")
+                    return True
                 holder_returned = False
                 def controlled_intent() -> bool:
                     current = _read_json(request_path) or {}
@@ -501,9 +544,13 @@ class JarvisHoldHost:
                         return True  # Changed ownership is never permission to release.
                     return _controlled_stop_intent(request) or _controlled_stop_intent(current)
                 try:
-                    hold_task(self.launcher_config, request_path, ack_path, result_path)
+                    hold_task(self.launcher_config, request_path, ack_path, result_path,
+                              diagnostic_sink=self._readback_diagnostics.enqueue)
                     holder_returned = True
                 except Exception as exc:
+                    from jarvis_runtime.business_quarantine import QuarantineError
+                    if isinstance(exc, QuarantineError):
+                        return True
                     # The holder may already have persisted exact identity/terminal
                     # evidence before its ack or close failed. Never overwrite it.
                     persisted = _read_json(result_path) or {}
@@ -526,9 +573,16 @@ class JarvisHoldHost:
                     _publish_generation(ack_path, failed, request)
                 finally:
                     self._mark_inactive(hold_id, expected_request=request)
+                    from jarvis_runtime.business_quarantine_gate import require_not_abandoned
+                    try:
+                        require_not_abandoned(getattr(self, "_business_quarantine_config", None), self.state_dir, request)
+                    except Exception:
+                        self._write_health("ready")
+                        return True  # Preserve claim/receipts when business isolation changed mid-flight.
                     cleanup_owner = _read_json(root / ".user-host-claim" / "owner.json")
                     try:
                         saved = _read_json(result_path) or {}
+                        cleanup_request = _read_json(request_path) or {}
                         controlled = saved.get("host_stop") is True or (not holder_returned and controlled_intent())
                         if controlled:
                             saved = {**saved, "host_stop": True, "holder_exit_confirmed": holder_returned,
@@ -536,17 +590,19 @@ class JarvisHoldHost:
                             if not holder_returned:
                                 saved.update(terminal_confirmed=False, execution_evidence="requires_owner_terminal")
                             evidence = saved.get("owner_terminal_readback") or {}
-                            if (holder_returned and saved.get("holder_client_exit_confirmed") is True
+                            if (holder_returned and holder_transport_cleanup_confirmed(saved, cleanup_request)
                                     and evidence.get("thread_id") == saved.get("thread_id")
                                     and evidence.get("turn_id") == saved.get("turn_id")
                                     and evidence.get("status") in {"completed", "failed", "interrupted", "cancelled", "canceled"}):
                                 saved.update(terminal_confirmed=True, phase="host_stop_reconciled",
-                                             terminal_evidence="holder_readback_and_owned_exit")
+                                             terminal_evidence=("holder_readback_and_local_attachment_close"
+                                                 if unix_attachment_release_valid(saved, cleanup_request)
+                                                 else "holder_readback_and_owned_exit"))
                             _publish_generation(result_path, saved, request)
                             _publish_generation(ack_path, saved, request)
                         if not controlled or (saved.get("terminal_confirmed") is True
-                                              and holder_returned and saved.get("holder_client_exit_confirmed") is True):
-                            self._release_claim(root, expected_request=request)
+                                              and holder_returned and holder_transport_cleanup_confirmed(saved, cleanup_request)):
+                            self._release_claim(root, expected_request=request, **self._quarantine_kwargs())
                     except OSError as exc:
                         saved = _read_json(result_path)
                         if saved is not None:
@@ -571,8 +627,22 @@ class JarvisHoldHost:
     @staticmethod
     def _requeue_dead_claim(
         root: Path, request_path: Path, ack_path: Path, request: dict[str, Any], ack: dict[str, Any],
+        *, quarantine_config=None,
+    ) -> bool:
+        from jarvis_runtime.business_quarantine_gate import control_scope
+        try:
+            with control_scope(quarantine_config, root.parents[1], request):
+                return JarvisHoldHost._requeue_dead_claim_allowed(root, request_path, ack_path, request, ack)
+        except Exception:
+            return False
+
+    @staticmethod
+    def _requeue_dead_claim_allowed(
+        root: Path, request_path: Path, ack_path: Path, request: dict[str, Any], ack: dict[str, Any],
     ) -> bool:
         try:
+            if "owner_control" in request or (root / "owner-control.json").exists():
+                return False  # Time/PID guesses never transfer a fenced controller.
             if cancellation_path(root, request):
                 return False  # Cancellation never requires a legacy PID death guess.
             claim_dir = root / ".user-host-claim"
@@ -630,13 +700,35 @@ class JarvisHoldHost:
             return False
 
     @staticmethod
-    def _claim(root: Path, ack_path: Path, ack: dict[str, Any], request: dict[str, Any] | None = None, *, host_instance_id: str | None = None) -> bool:
+    def _claim(root: Path, ack_path: Path, ack: dict[str, Any], request: dict[str, Any] | None = None, *, host_instance_id: str | None = None, quarantine_config=None) -> bool:
+        from jarvis_runtime.business_quarantine_gate import control_scope
+        try:
+            with control_scope(quarantine_config, root.parents[1], request or _read_json(root / "request.json") or {}):
+                return JarvisHoldHost._claim_allowed(root, ack_path, ack, request, host_instance_id=host_instance_id)
+        except Exception:
+            return False
+
+    @staticmethod
+    def _claim_allowed(root: Path, ack_path: Path, ack: dict[str, Any], request: dict[str, Any] | None = None, *, host_instance_id: str | None = None) -> bool:
         claim_dir = root / ".user-host-claim"
         captured = request or _read_json(root / "request.json")
+        if not captured:
+            return False
         if cancellation_path(root, captured): return False
+        from jarvis_runtime.business_quarantine_gate import require_not_abandoned
         try:
-            claim_dir.mkdir()
-        except FileExistsError:
+            require_not_abandoned(registry=root.parents[1], request=captured)
+        except Exception:
+            return False
+        try:
+            # A scanner may arrive after the original finite controller settled.
+            # Serialize ledger exclusion and mkdir with generation/claim changes,
+            # rather than creating a replacement that legacy cleanup cannot own.
+            with generation_guard(root, captured):
+                if (root / "owner-control.json").exists():
+                    return False
+                claim_dir.mkdir()
+        except (FileExistsError, GenerationRetired):
             return False
         claimed = False
         created_claim = (claim_dir.stat().st_dev, claim_dir.stat().st_ino)
@@ -680,7 +772,18 @@ class JarvisHoldHost:
                         JarvisHoldHost._release_claim(root)
 
     @staticmethod
-    def _release_claim(root: Path, *, expected_request=None) -> bool:
+    def _release_claim(root: Path, *, expected_request=None, quarantine_config=None) -> bool:
+        from jarvis_runtime.business_quarantine_gate import control_scope
+        try:
+            with control_scope(quarantine_config, root.parents[1], expected_request or _read_json(root / "request.json") or {}):
+                return JarvisHoldHost._release_claim_allowed(root, expected_request=expected_request)
+        except Exception:
+            return False
+
+    @staticmethod
+    def _release_claim_allowed(root: Path, *, expected_request=None) -> bool:
+        if (root / "owner-control.json").exists():
+            return False  # Only the exact ledger controller may settle this claim.
         try:
             with (generation_guard(root, expected_request) if expected_request is not None else nullcontext()):
                 claim_dir = root / ".user-host-claim"
@@ -701,8 +804,23 @@ class JarvisHoldHost:
             return False
 
     def request_host_stop(self, hold_id: str, thread_id: str, turn_id: str) -> dict[str, Any]:
+        from jarvis_runtime.business_quarantine_gate import control_scope
+        try:
+            with control_scope(getattr(self, "_business_quarantine_config", None), getattr(self, "state_dir", None),
+                               {"hold_id": hold_id, "thread_id": thread_id, "turn_id": turn_id}):
+                return self._request_host_stop_allowed(hold_id, thread_id, turn_id)
+        except Exception as exc:
+            return {"status": "rejected", "hold_id": hold_id, "hold_released": False, "reason": str(exc)}
+
+    def _request_host_stop_allowed(self, hold_id: str, thread_id: str, turn_id: str) -> dict[str, Any]:
         """Ask the owning Host to stop one exact holder; acceptance is not release."""
         rejected = {"status": "rejected", "hold_id": hold_id, "hold_released": False}
+        from jarvis_runtime.business_quarantine_gate import require_not_abandoned
+        try:
+            require_not_abandoned(getattr(self, "_business_quarantine_config", None), self.state_dir,
+                                  {"hold_id": hold_id, "thread_id": thread_id, "turn_id": turn_id})
+        except Exception as exc:
+            return {**rejected, "reason": str(exc)}
         matches = []
         for parent in self.requests_roots:
             if parent.is_dir():
@@ -729,7 +847,8 @@ class JarvisHoldHost:
                     and result.get("status") in {"completed", "failed", "interrupted", "cancelled", "canceled"}
                     and ack.get("status") == result.get("status")
                     and all(value.get(key) is True for value in (ack, result)
-                            for key in ("host_stop", "terminal_confirmed", "holder_exit_confirmed", "holder_client_exit_confirmed"))
+                            for key in ("host_stop", "terminal_confirmed", "holder_exit_confirmed"))
+                    and all(holder_transport_cleanup_confirmed(value, request) for value in (ack, result))
                     and all((value.get("owner_terminal_readback") or {}).get("thread_id") == thread_id
                             and (value.get("owner_terminal_readback") or {}).get("turn_id") == turn_id
                             for value in (ack, result)))
@@ -912,6 +1031,18 @@ class JarvisHoldHost:
             return {**unknown, "reason": str(exc)}
 
     def reconcile_hold(self, hold_id: str) -> dict[str, Any]:
+        from jarvis_runtime.business_quarantine_gate import control_scope
+        registry = getattr(self, "state_dir", None)
+        if registry is None and self.requests_roots:
+            registry = self.requests_roots[0].parent
+        try:
+            with control_scope(getattr(self, "_business_quarantine_config", None), registry, {"hold_id": hold_id}):
+                return self._reconcile_hold_allowed(hold_id)
+        except Exception as exc:
+            return {"status": "requires_readback", "hold_id": hold_id, "terminal_confirmed": False,
+                    "hold_released": False, "reason": str(exc)}
+
+    def _reconcile_hold_allowed(self, hold_id: str) -> dict[str, Any]:
         """Read an exact orphaned turn and retry cleanup; never dispatch work.
 
         Explicitly scoped so a shared live Host need not be restarted. Old
@@ -930,7 +1061,19 @@ class JarvisHoldHost:
         if len(matches) != 1:
             return {**unknown, "reason": "Hold identity missing or ambiguous"}
         root = matches[0]
+        from jarvis_runtime.business_quarantine_gate import require_not_abandoned
+        try:
+            require_not_abandoned(getattr(self, "_business_quarantine_config", None), root.parents[1],
+                                  _read_json(root / "request.json") or {"hold_id": hold_id})
+        except Exception as exc:
+            return {**unknown, "reason": str(exc)}
         request_path, ack_path, result_path = (root / name for name in ("request.json", "ack.json", "result.json"))
+        if (root / "owner-control.json").exists():
+            from jarvis_runtime.owner_control_ledger import query_stop
+            try:
+                return query_stop(root, "query", **self._quarantine_kwargs())
+            except Exception as exc:
+                return {**unknown, "reason": str(exc), "phase": "owner_control_query"}
         existing = _read_json(result_path) or {}
         current_request, current_ack = _read_json(request_path) or {}, _read_json(ack_path) or {}
         owned = existing.get("owner_terminal_readback") or {}
@@ -945,7 +1088,8 @@ class JarvisHoldHost:
         if (all(identity.values()) and current_request.get("hold_id") == hold_id
                 and all(record.get(k) == v for record in (current_ack, existing) for k, v in identity.items())
                 and all(record.get(k) is True for record in (current_ack, existing)
-                        for k in ("terminal_confirmed", "holder_exit_confirmed", "holder_client_exit_confirmed"))
+                        for k in ("terminal_confirmed", "holder_exit_confirmed"))
+                and all(holder_transport_cleanup_confirmed(record, current_request) for record in (current_ack, existing))
                 and existing.get("status") in {"completed", "failed", "interrupted", "cancelled", "canceled", "blocked", "turn_limit_reached"}
                 and current_ack.get("status") == existing["status"]
                 and (owned.get("status") == existing["status"] or
@@ -960,7 +1104,7 @@ class JarvisHoldHost:
                             or _read_json(result_path) != existing
                             or (_read_json(owner_path) if owner_path.exists() else None) != current_owner):
                         return {**unknown, "error_code": "identity_changed", "reason": "Owned closure proof changed before cleanup"}
-                    self._release_claim(root)  # Locked exact-generation proof includes actual owned exits.
+                    self._release_claim(root, **self._quarantine_kwargs())  # Exact terminal plus appropriate transport cleanup proof.
                 return {**existing, "hold_released": not (root / ".user-host-claim").exists()}
             except (OSError, RuntimeError) as exc:
                 return {**existing, "hold_released": False, "cleanup_error": str(exc)}
@@ -983,14 +1127,14 @@ class JarvisHoldHost:
                     return {**unknown, "reason": "No exception/terminal result; live execution not reconciled"}
                 if _controlled_stop_intent(request) and not (result.get("host_stop") is True
                         and result.get("holder_exit_confirmed") is True
-                        and result.get("holder_client_exit_confirmed") is True
+                        and holder_transport_cleanup_confirmed(result, request)
                         and result.get("terminal_confirmed") is True):
                     return {**unknown, "reason": "Controlled request lacks owned terminal/exit proof; receipt fallback is not legacy evidence"}
                 if result.get("execution_evidence") == "requires_owner_terminal":
                     return {**unknown, "holder_exit_confirmed": result.get("holder_exit_confirmed", False),
                             "reason": "Holder exited but execution remains unknown; external interrupted is not owner terminal evidence"}
                 if result.get("host_stop") and not (result.get("holder_exit_confirmed") is True
-                                                      and result.get("holder_client_exit_confirmed") is True):
+                                                      and holder_transport_cleanup_confirmed(result, request)):
                     return {**unknown, "reason": "Host-owned exit not yet confirmed"}
                 request_id = request.get("request_id")
                 receipts = (ack, result)
@@ -1092,20 +1236,25 @@ class JarvisHoldHost:
                     client.close()
                 thread = readback.get("thread") or {}
                 turns = [turn for turn in thread.get("turns", []) if isinstance(turn, dict) and turn.get("id") == identities["turn_id"]]
-                if thread.get("id") != identities["thread_id"] or len(turns) != 1 or turns[0].get("status") not in {"completed", "failed", "interrupted", "cancelled", "canceled"}:
-                    return {**unknown, **identities, "reason": "Exact turn has no authoritative terminal readback"}
+                from .native_execution_evidence import classify_native_turn
+                witness = classify_native_turn(identities["thread_id"], identities["turn_id"],
+                    turns[0] if len(turns) == 1 else {}, observed_thread_id=thread.get("id"),
+                    protocol_version=getattr(client, "cli_version", None))
+                if witness.get("terminal_confirmed") is not True:
+                    return {**unknown, **identities, "native_terminal_evidence": witness,
+                            "reason": "Exact turn has no authoritative terminal readback"}
                 # Preserve execution failure/business uncertainty rather than
                 # turning a transport terminal into business success.
                 reconciled = {**result, **identities, "terminal_confirmed": True,
                               "status": result.get("status") if result.get("status") in terminal_statuses else "failed",
-                              "recovery": {"source": "app_server_thread_read", "turn_status": turns[0]["status"],
+                              "recovery": {"source": "app_server_thread_read", "native_terminal_evidence": witness, "turn_status": turns[0]["status"],
                                            "observed_at": _now()}}
                 reconciled.pop("cleanup_error", None)
                 reconciled.pop("cleanup_owner", None)
                 _publish_generation(result_path, reconciled, request)
                 _publish_generation(ack_path, {**ack, **reconciled}, request)
                 try:
-                    self._release_claim(root, expected_request=request)
+                    self._release_claim(root, expected_request=request, **self._quarantine_kwargs())
                 except OSError as exc:
                     reconciled = {**reconciled, "cleanup_error": str(exc)}
                     _publish_generation(result_path, reconciled, request)
@@ -1169,7 +1318,7 @@ class JarvisHoldHost:
             candidates.sort(key=lambda entry: str(entry[0]))
             root, request, ack = next((entry for entry in candidates if str(entry[0]) > self._legacy_scan_cursor), candidates[0])
             self._legacy_scan_cursor = str(root)
-            self._requeue_dead_claim(root, root / "request.json", root / "ack.json", request, ack)
+            self._requeue_dead_claim(root, root / "request.json", root / "ack.json", request, ack, **self._quarantine_kwargs())
 
 
     def _reserve_slot(self, root: Path, request: dict[str, Any]) -> bool:
@@ -1316,6 +1465,10 @@ class JarvisHoldHost:
         while not stop.is_set():
             try:
                 self._schedule_requests_once()
+            except StateGateBusy:
+                # Unknown alias/capacity snapshots cannot authorize admission.
+                # Preserve the queue and all owners; retry on the normal tick.
+                pass
             except OSError:
                 pass
             stop.wait(max(poll_seconds, .25))
@@ -1326,6 +1479,7 @@ class JarvisHoldHost:
     def _run_health_heartbeat(self, stop_event: threading.Event, poll_seconds: float) -> None:
         while not stop_event.is_set():
             self._write_health("ready")
+            self._readback_diagnostics.flush()
             stop_event.wait(min(max(poll_seconds, 0.25), 5.0))
 
     def _run_worker(self, pending: queue.Queue[Path], scheduled: set[Path],
@@ -1364,7 +1518,14 @@ class JarvisHoldHost:
     def _write_health(self, status: str, *, request_id: str | None = None) -> None:
         with self._health_lock:
             active_hold_ids = sorted(self._active_hold_ids)
-            capacity = self.capacity_snapshot()
+            try:
+                capacity = self.capacity_snapshot()
+            except StateGateBusy:
+                # Incomplete binding/backlog sampling is unknown, never fresh ready/zero.
+                # Keep the last truthful health timestamp and all ownership intact.
+                # The heartbeat loop retries after its ordinary bounded wait; direct
+                # capacity/admission callers still receive StateGateBusy and fail closed.
+                return
             try:
                 _write_json(self.health_path, {
                     "profile": self.profile,

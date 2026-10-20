@@ -293,12 +293,55 @@ class NativeTaskLauncherConfig:
                 raise NativeTaskError("linux_cloud requires runtime_environments=[], explicit home and runtime_constraints")
             if self.jarvis_connection:
                 raise NativeTaskError("linux_cloud does not support gateway connection overrides")
-        self.live_creation_enabled = raw.get("live_creation_enabled", False) is True
+        self.live_creation_enabled = raw.get("live_creation_enabled", True) is True
+        # Explicit attach-only selection, not a socket discovery or bootstrap
+        # hint. Freeze the pin at config load; never reread it after a failure.
+        self.unix_owner_pin_json = None
+        self.unix_initial_dispatch = False
+        if "unix_owner" in raw:
+            pin = raw["unix_owner"]
+            if not isinstance(pin, dict) or set(pin) != {
+                "schema", "process", "socket", "instance_id"
+            } or pin.get("schema") != "jarvis-unix-owner/v1":
+                raise NativeTaskError("unix_owner requires an exact serialized owner pin")
+            if not self.expected_codex_home:
+                raise NativeTaskError("unix_owner requires an explicit expected_codex_home")
+            try:
+                self.unix_owner_pin_json = json.dumps(
+                    pin, sort_keys=True, separators=(",", ":"), allow_nan=False
+                )
+            except (TypeError, ValueError) as exc:
+                raise NativeTaskError("unix_owner contains invalid pin data") from exc
+            initial = raw.get("unix_initial_dispatch", False)
+            if type(initial) is not bool:
+                raise NativeTaskError("unix_initial_dispatch must be boolean")
+            if initial and not self.live_creation_enabled:
+                raise NativeTaskError("unix_initial_dispatch requires live_creation_enabled")
+            self.unix_initial_dispatch = initial
+        elif "unix_initial_dispatch" in raw:
+            raise NativeTaskError("unix_initial_dispatch requires unix_owner")
+        self.scheduling_generation_id = raw.get("scheduling_generation_id")
+        if self.scheduling_generation_id is not None and (not isinstance(self.scheduling_generation_id, str)
+                or not re.fullmatch(r"budget-[a-f0-9]{64}", self.scheduling_generation_id)
+                or not raw.get("business_quarantine_file")):
+            raise NativeTaskError("scheduling generation requires an explicit pinned quarantine policy")
+        self.business_quarantine_file = raw.get("business_quarantine_file")
+        if self.business_quarantine_file is not None:
+            if not isinstance(self.business_quarantine_file, str) or not Path(self.business_quarantine_file).is_absolute():
+                raise NativeTaskError("business_quarantine_file must be an explicit absolute path")
+            from jarvis_runtime.business_quarantine import policy_for
+            policy_for(Path(self.business_quarantine_file).parent, explicit_path=self.business_quarantine_file, expected_generation_id=self.scheduling_generation_id)
+        self.owner_control_enabled = raw.get("owner_control_enabled", False)
+        if type(self.owner_control_enabled) is not bool:
+            raise NativeTaskError("owner_control_enabled must be boolean")
+        if self.owner_control_enabled and (self.unix_owner_pin_json is None
+                or not self.unix_initial_dispatch or self.jarvis_connection):
+            raise NativeTaskError("owner_control_enabled requires explicit pinned initial dispatch without gateway bootstrap")
         self.default_model = str(raw.get("default_model") or "").strip() or None
         self.default_reasoning_effort = str(raw.get("default_reasoning_effort") or "").strip() or None
         if self.default_reasoning_effort is not None and self.default_reasoning_effort not in REASONING_EFFORTS:
             raise NativeTaskError("unsupported default_reasoning_effort")
-        self.worker_capacity = raw.get("worker_capacity", 1)
+        self.worker_capacity = raw.get("worker_capacity", MAX_CONCURRENCY)
         if type(self.worker_capacity) is not int or not 1 <= self.worker_capacity <= MAX_CONCURRENCY:
             raise NativeTaskError(f"worker_capacity must be an integer from 1 to {MAX_CONCURRENCY}")
         self.poll_seconds = max(float(raw.get("poll_seconds", 2)), 0.25)
@@ -918,13 +961,56 @@ def resolve_codex_runtime(configured: str) -> dict[str, Any]:
 
 
 class AppServerClient:
-    def __init__(self, config: NativeTaskLauncherConfig):
+    def __init__(self, config: NativeTaskLauncherConfig, *, unix_owner=None,
+                 unix_initial_dispatch: bool | None = None):
         self.config = config
-        self.cli_command, self.cli_version = _resolve_codex_command(config.codex_cli)
-        self.executable = self.cli_command[0]
+        # All public launcher/Host callers construct AppServerClient(config).
+        # Consume the explicit config pin here, before resolving a CLI or
+        # creating a process. Malformed/stale pins are fatal, never stdio hints.
+        configured_pin = getattr(config, "unix_owner_pin_json", None)
+        if configured_pin is not None or unix_owner is not None:
+            try:
+                from .unix_owner_transport import OwnerEndpoint, OwnerTransportError
+            except ImportError:
+                from unix_owner_transport import OwnerEndpoint, OwnerTransportError
+            try:
+                if configured_pin is not None:
+                    pinned = OwnerEndpoint.from_dict(json.loads(configured_pin))
+                    if unix_owner is not None and (
+                        not isinstance(unix_owner, OwnerEndpoint)
+                        or unix_owner.to_dict() != pinned.to_dict()
+                    ):
+                        raise NativeTaskError("explicit Unix owner conflicts with configured pin")
+                    unix_owner = pinned
+                elif not isinstance(unix_owner, OwnerEndpoint):
+                    raise NativeTaskError("unix_owner must be a verified OwnerEndpoint")
+                else:
+                    unix_owner.verify()
+            except (OwnerTransportError, TypeError, ValueError, KeyError) as exc:
+                raise NativeTaskError("configured Unix owner is unavailable or invalid") from exc
+        if unix_initial_dispatch is None:
+            unix_initial_dispatch = getattr(config, "unix_initial_dispatch", False)
+        if type(unix_initial_dispatch) is not bool:
+            raise NativeTaskError("unix_initial_dispatch must be boolean")
+        if unix_initial_dispatch and unix_owner is None:
+            raise NativeTaskError("unix_initial_dispatch requires a pinned Unix owner")
+        if unix_owner is None:
+            self.cli_command, self.cli_version = _resolve_codex_command(config.codex_cli)
+            self.executable = self.cli_command[0]
+        else:
+            # A local CLI version does not establish the attached server's
+            # protocol provenance. Do not run or resolve a local CLI for attach.
+            # Exact owner events remain usable; history classifiers fail closed
+            # until this owner's protocol semantics are independently verified.
+            self.cli_command = []
+            self.cli_version = None
+            self.executable = json.loads(unix_owner.process_json)["executable"]
         self.process: subprocess.Popen[str] | None = None
         self.response_queue: queue.Queue[dict[str, Any]] = queue.Queue()
+        self._stdout_eof = threading.Event()  # Read-only lifecycle evidence; never a restart trigger.
+        self._stdout_protocol_failure = threading.Event()
         self.notifications: queue.Queue[dict[str, Any] | None] = queue.Queue()
+        self.owner_transport_health_recorder = None  # Optional owning-client evidence only.
         self.stderr_lines: list[str] = []
         self._request_id = 0
         self._write_lock = threading.Lock()
@@ -936,6 +1022,298 @@ class AppServerClient:
         self._terminal_probe_lock = threading.Lock()
         self._terminal_probe_pending_id: int | None = None
         self._terminal_probe_expired = False
+        # Opt-in attach-only transport. Never masquerade as the server's Popen.
+        # Initial research dispatch requires an explicit new-owner caller opt-in.
+        self._unix_owner = unix_owner
+        self._unix_initial_dispatch = unix_initial_dispatch is True
+        self._unix_connection = None
+        self._unix_epoch = 0
+        self._unix_started = False
+        self._unix_had_gap = False
+        self._unix_rpc_lock = threading.RLock()
+        self._unix_state_lock = threading.RLock()
+        self._unix_failures = []
+
+    _UNIX_READ_METHODS = frozenset({"thread/read", "thread/turns/list", "thread/items/list",
+        "thread/loaded/list", "thread/list", "model/list", "config/read"})
+
+    def transport_health(self) -> dict[str, Any]:
+        """Read-only connection health, never task execution or process-exit proof.
+
+        ``connected`` permits current reads. ``contiguous`` is stricter: a Unix
+        notification gap remains permanent even after an explicit same-owner
+        reattachment. Neither value authorizes reconnect, bootstrap or replay.
+        """
+        mode = "unix_owner" if self._unix_owner is not None else "stdio"
+        failure = None
+        if self._unix_owner is not None:
+            # Recorder guards may already hold their own lock. Do not acquire
+            # the Unix state lock here: disconnect stops the recorder under it.
+            # Read a bounded snapshot and reject any observed epoch transition.
+            connection, epoch = self._unix_connection, self._unix_epoch
+            closed = connection is None or connection.closed.is_set()
+            if self._stdout_protocol_failure.is_set():
+                failure = "malformed_protocol"
+            elif closed:
+                failure = "unix_connection_closed"
+            elif self.initialize_result is None:
+                failure = "unix_not_initialized"
+            else:
+                peer = getattr(connection, "socket", None)
+                if peer is None:
+                    failure = "unix_peer_unavailable"
+                else:
+                    try:
+                        self._unix_owner.verify(peer)
+                    except Exception:
+                        failure = "unix_owner_identity_unavailable"
+            if connection is not self._unix_connection or epoch != self._unix_epoch:
+                failure = "unix_connection_changed"
+                closed = False  # The replacement observer's closure is unknown.
+            elif connection is not None and connection.closed.is_set():
+                closed = True
+                failure = failure or "unix_connection_closed"
+            if self._stdout_protocol_failure.is_set():
+                failure = "malformed_protocol"
+            connected = failure is None
+            contiguous = connected and not self._unix_had_gap and not self._stdout_eof.is_set()
+        else:
+            process = self.process
+            closed = process is None or process.poll() is not None
+            if self._stdout_protocol_failure.is_set():
+                failure = "malformed_protocol"
+            elif self._stdout_eof.is_set():
+                failure = "stdout_eof"
+            elif closed:
+                failure = "process_exit"
+            connected = failure is None
+            contiguous = connected
+        return {"schema": "jarvis-client-transport-health/v1", "mode": mode,
+                "connected": connected, "contiguous": contiguous, "failure": failure,
+                "local_connection_closed": closed, "execution_status": "unknown"}
+
+    def unix_connection_evidence(self) -> dict[str, Any]:
+        """Sanitized connection evidence only; never native execution authority."""
+        with self._unix_state_lock:
+            connection = self._unix_connection
+            return {"schema": "jarvis-unix-connection/v1", "epoch": self._unix_epoch,
+                    "owner_instance_id": getattr(self._unix_owner, "instance_id", None),
+                    "connected": connection is not None and not connection.closed.is_set(),
+                    "notification_gap": self._unix_had_gap,
+                    "execution_status": "unknown", "failures": list(self._unix_failures)}
+
+    def _unix_error(self, kind, *, may_have_sent=False):
+        error = NativeTaskError("Unix owner connection unavailable: " + kind)
+        error.transport_origin = "unix_owner"
+        error.transport_kind = kind
+        error.connection_epoch = self._unix_epoch
+        error.execution_unknown = True
+        error.may_have_sent = bool(may_have_sent)
+        return error
+
+    def _unix_disconnect(self, connection, epoch, kind):
+        with self._unix_state_lock:
+            if epoch != self._unix_epoch or connection is not self._unix_connection:
+                return  # A prior reader cannot affect a new connection epoch.
+            connection.close()
+            self._unix_had_gap = True
+            self._stdout_eof.set()  # Historical EOF stays monotonic across reconnect.
+            if kind.startswith('protocol_') or kind in {'message_limit', 'fragment_limit', 'queue_limit'}:
+                self._stdout_protocol_failure.set()
+            if not self._unix_failures or self._unix_failures[-1]['epoch'] != epoch:
+                self._unix_failures.append({"epoch": epoch, "kind": kind, "at": time.time()})
+                del self._unix_failures[:-8]
+            recorder = self.owner_transport_health_recorder
+            if recorder is not None:
+                try: recorder.stop()
+                except Exception: recorder.disabled = True
+                # A connection gap cannot silently restore native health proof.
+                self.owner_transport_health_recorder = None
+            try: self.notifications.put_nowait(None)
+            except queue.Full: pass
+
+    def _read_unix(self, connection, epoch, responses, notifications):
+        try:
+            def pairs(values):
+                out = {}
+                for key, value in values:
+                    if key in out: raise ValueError('duplicate key')
+                    out[key] = value
+                return out
+            while not connection.closed.is_set():
+                raw = connection.receive_text()
+                try:
+                    item = json.loads(raw, object_pairs_hook=pairs,
+                        parse_constant=lambda _: (_ for _ in ()).throw(ValueError('nonfinite')))
+                except (ValueError, TypeError) as exc:
+                    raise self._unix_error('protocol_json') from exc
+                if not isinstance(item, dict):
+                    raise self._unix_error('protocol_envelope')
+                with self._unix_state_lock:
+                    if epoch != self._unix_epoch or connection is not self._unix_connection:
+                        return
+                    if 'id' in item:
+                        if (type(item['id']) is not int or 'method' in item
+                                or ('result' in item) == ('error' in item)):
+                            raise self._unix_error('protocol_response')
+                        responses.put_nowait(item)
+                    else:
+                        if not isinstance(item.get('method'), str):
+                            raise self._unix_error('protocol_notification')
+                        recorder = self.owner_transport_health_recorder
+                        if recorder is not None and not self._unix_had_gap:
+                            try: recorder.observe(item)
+                            except Exception:
+                                try: recorder.invalidate()
+                                except Exception: pass
+                                self.owner_transport_health_recorder = None
+                        notifications.put_nowait(item)
+                item = raw = None
+        except Exception as exc:
+            kind = ('queue_limit' if isinstance(exc, queue.Full) else
+                    getattr(exc, 'kind', getattr(exc, 'transport_kind', 'connection_lost')))
+            self._unix_disconnect(connection, epoch, kind)
+
+    def _connect_unix(self, *, deadline=None):
+        try:
+            from .unix_owner_transport import UnixOwnerConnection, OwnerTransportError
+        except ImportError:
+            from unix_owner_transport import UnixOwnerConnection, OwnerTransportError
+        self._unix_started = True
+        if self._stdout_protocol_failure.is_set():
+            raise self._unix_error('protocol_failure_latched')
+        deadline = min(deadline if deadline is not None else float('inf'),
+                       time.monotonic() + self.config.request_timeout_seconds)
+        connection = UnixOwnerConnection(self._unix_owner)
+        with self._unix_state_lock:
+            self._unix_epoch += 1
+            epoch = self._unix_epoch
+            self._unix_connection = connection
+            self.response_queue = queue.Queue(maxsize=64)
+            self.notifications = queue.Queue(maxsize=256)
+            self.initialize_result = None
+        try:
+            connection.connect(deadline=deadline)
+            threading.Thread(target=self._read_unix,
+                args=(connection, epoch, self.response_queue, self.notifications), daemon=True).start()
+            result = self.request("initialize", {
+                "clientInfo": {"name": "jarvis-native-task-launcher",
+                    "title": "Jarvis Native Task Launcher", "version": "0.1.0"},
+                "capabilities": {"experimentalApi": True}}, deadline=deadline)
+            expected = self.config.expected_codex_home
+            if expected and Path(str(result.get('codexHome') or '')).resolve() != Path(expected).resolve():
+                raise self._unix_error('codex_home_mismatch')
+            self.notify('initialized')
+            self.initialize_result = result
+            return result
+        except BaseException as exc:
+            self._unix_disconnect(connection, epoch, getattr(exc, 'kind', 'initialization_failed'))
+            if isinstance(exc, OwnerTransportError):
+                raise self._unix_error(exc.kind, may_have_sent=exc.may_have_sent) from exc
+            raise
+
+    def reconnect_same_owner(self, *, deadline=None):
+        """Explicit attach to the original pin. Never restart or replay an RPC.
+
+        New research writes remain sealed permanently after a connection gap.
+        Exact reads and explicit exact turn/interrupt remain available. initialize
+        is per-connection; it is not a thread resume or notification resubscribe.
+        """
+        if self._unix_owner is None:
+            raise NativeTaskError('same-owner reconnect requires a pinned Unix endpoint')
+        with self._unix_rpc_lock:
+            connection = self._unix_connection
+            if connection is not None and not connection.closed.is_set():
+                raise self._unix_error('connection_still_live')
+            if not self._unix_started:
+                raise self._unix_error('initial_attach_required')
+            self._unix_had_gap = True
+            return self._connect_unix(deadline=deadline)
+
+    def _business_write_scope(self, value):
+        from contextlib import nullcontext
+        from jarvis_runtime.business_quarantine_gate import dispatch_scope, control_scope
+        method = value.get("method")
+        if method in self._UNIX_READ_METHODS or method in {"initialize", "initialized"}:
+            return nullcontext()
+        context = getattr(self, "business_quarantine_context", {})
+        if method == "turn/interrupt":
+            return control_scope(self.config, request={**context,
+                "thread_id": (value.get("params") or {}).get("threadId"),
+                "turn_id": (value.get("params") or {}).get("turnId")})
+        return dispatch_scope(self.config, request=context, native_params=value.get("params") or {})
+
+    def _write_unix(self, value, *, deadline):
+        with self._business_write_scope(value):
+            return self._write_unix_allowed(value, deadline=deadline)
+
+    def _write_unix_allowed(self, value, *, deadline):
+        with self._unix_rpc_lock:
+            connection, epoch = self._unix_connection, self._unix_epoch
+            if connection is None or connection.closed.is_set():
+                raise self._unix_error('explicit_reconnect_required')
+            method = value.get('method')
+            read_or_handshake = method in self._UNIX_READ_METHODS or method in {'initialize', 'initialized'}
+            exact_interrupt = method == 'turn/interrupt' and all(
+                isinstance((value.get('params') or {}).get(k), str) and (value['params'][k]).strip()
+                for k in ('threadId', 'turnId'))
+            if getattr(self, 'read_only', False) and not read_or_handshake:
+                raise self._unix_error('read_only_method_forbidden')
+            if not read_or_handshake and not exact_interrupt:
+                if self._unix_had_gap or not self._unix_initial_dispatch:
+                    raise self._unix_error('research_write_sealed')
+                if method not in {'thread/start', 'turn/start', 'thread/resume'}:
+                    raise self._unix_error('unsupported_write_method')
+            if method == 'turn/interrupt' and not exact_interrupt:
+                raise self._unix_error('exact_interrupt_identity_required')
+            if (getattr(self.config, "owner_control_enabled", False) and not read_or_handshake
+                    and not (callable(getattr(self, "owner_control_rpc_guard", None))
+                             and callable(getattr(self, "owner_control_wire_scope", None)))):
+                raise self._unix_error("durable_owner_control_required")
+            if method in {'thread/start', 'turn/start'}:
+                self._require_memory_admission()
+            # Keep the original durable cancellation/dispatch-journal gate before
+            # the first byte. A lost reply never invokes this hook a second time.
+            gate = getattr(self, 'before_turn_dispatch', None)
+            if method == 'turn/start' and callable(gate): gate(value.get('params') or {})
+            from contextlib import nullcontext
+            control_scope = getattr(self, "owner_control_wire_scope", None)
+            with (control_scope(method, value.get("params") or {}) if callable(control_scope) else nullcontext()):
+                control_guard = getattr(self, "owner_control_rpc_guard", None)
+                if callable(control_guard):
+                    control_guard(method, value.get("params") or {})
+                try:
+                    connection.send_text(json.dumps(value, ensure_ascii=False,
+                        separators=(',', ':'), allow_nan=False), deadline=deadline)
+                except Exception as exc:
+                    self._unix_disconnect(connection, epoch, getattr(exc, 'kind', 'write_failed'))
+                    raise self._unix_error(getattr(exc, 'kind', 'write_failed'),
+                        may_have_sent=getattr(exc, 'may_have_sent', True)) from exc
+
+    def _request_unix(self, method, params, *, deadline=None):
+        with self._unix_rpc_lock:
+            deadline = min(deadline if deadline is not None else float('inf'),
+                           time.monotonic() + self.config.request_timeout_seconds)
+            if time.monotonic() >= deadline:
+                raise self._unix_error('request_deadline_before_send')
+            self._request_id += 1
+            request_id = self._request_id
+            connection, epoch, responses = self._unix_connection, self._unix_epoch, self.response_queue
+            self._write_unix({'id': request_id, 'method': method, 'params': params}, deadline=deadline)
+            while time.monotonic() < deadline:
+                if connection.closed.is_set():
+                    raise self._unix_error('connection_lost_after_send', may_have_sent=True)
+                try: item = responses.get(timeout=min(.1, max(0, deadline - time.monotonic())))
+                except queue.Empty: continue
+                if item.get('id') != request_id:
+                    self._unix_disconnect(connection, epoch, 'protocol_response_id')
+                    raise self._unix_error('protocol_response_id', may_have_sent=True)
+                if 'error' in item:
+                    raise NativeRpcError(method, item['error'])
+                result = item.get('result')
+                return result if isinstance(result, dict) else {'result': result}
+            self._unix_disconnect(connection, epoch, 'request_timeout')
+            raise self._unix_error('request_timeout', may_have_sent=True)
 
     def _runtime_thread_params(self, model: str | None) -> dict[str, Any]:
         model = model or getattr(self.config, "default_model", None)
@@ -1029,6 +1407,13 @@ class AppServerClient:
             raise
 
     def _start_impl(self, *, deadline: float | None = None) -> dict[str, Any]:
+        if getattr(self, '_unix_owner', None) is not None:
+            with self._unix_rpc_lock:
+                if self._unix_started:
+                    if self._unix_connection is not None and not self._unix_connection.closed.is_set() and self.initialize_result is not None:
+                        return self.initialize_result
+                    raise self._unix_error('explicit_reconnect_required')
+                return self._connect_unix(deadline=deadline)
         if self.process and self.process.poll() is None:
             return self.initialize_result or {}
         if not getattr(self, "read_only", False):
@@ -1112,12 +1497,27 @@ class AppServerClient:
                 try:
                     item = json.loads(raw)
                     if not isinstance(item, dict):
+                        if getattr(self, "read_only", False):
+                            self._stdout_protocol_failure.set()
                         continue
                     if "id" in item:
                         self._queue_response(item)
                     else:
+                        recorder = getattr(self, "owner_transport_health_recorder", None)
+                        if recorder is not None:
+                            try:
+                                recorder.observe(item)
+                            except Exception:
+                                # Optional health evidence must not alter native delivery.
+                                try:
+                                    recorder.invalidate()
+                                except Exception:
+                                    pass
+                                self.owner_transport_health_recorder = None
                         self.notifications.put(item)
                 except json.JSONDecodeError:
+                    if getattr(self, "read_only", False):
+                        self._stdout_protocol_failure.set()
                     continue
                 finally:
                     # A reader may block until the next notification for minutes.
@@ -1128,6 +1528,15 @@ class AppServerClient:
         finally:
             # FIFO preserves terminal evidence already read before EOF. A closed
             # transport is not evidence that the remote execution is terminal.
+            recorder = getattr(self, "owner_transport_health_recorder", None)
+            if recorder is not None:
+                try:
+                    recorder.stop()
+                except Exception:
+                    recorder.disabled = True
+            eof = getattr(self, "_stdout_eof", None)
+            if eof is not None:
+                eof.set()
             self.notifications.put(None)
 
     def _read_stderr(self) -> None:
@@ -1138,6 +1547,12 @@ class AppServerClient:
                 del self.stderr_lines[:20]
 
     def _write(self, value: dict[str, Any]) -> None:
+        with self._business_write_scope(value):
+            return self._write_allowed(value)
+
+    def _write_allowed(self, value: dict[str, Any]) -> None:
+        if getattr(self, '_unix_owner', None) is not None:
+            return self._write_unix_allowed(value, deadline=time.monotonic() + self.config.request_timeout_seconds)
         if not self.process or self.process.poll() is not None or not self.process.stdin:
             raise NativeTaskError("Codex app-server is not running")
         encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
@@ -1190,6 +1605,9 @@ class AppServerClient:
         self, method: str, params: dict[str, Any], *, deadline: float | None = None,
         _terminal_probe: bool = False,
     ) -> dict[str, Any]:
+        if getattr(self, '_unix_owner', None) is not None:
+            # One RPC per connection, no unanswered probes or retry on reconnect.
+            return self._request_unix(method, params, deadline=deadline)
         request_deadline = time.monotonic() + self.config.request_timeout_seconds
         deadline = min(request_deadline, deadline) if deadline is not None else request_deadline
         if time.monotonic() >= deadline:
@@ -1390,6 +1808,10 @@ class AppServerClient:
         on_phase: Callable[[str, dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         """Create one durable thread and return as soon as its first turn starts."""
+        self.business_quarantine_context = dict(request)
+        from jarvis_runtime.business_quarantine_gate import dispatch_scope
+        with dispatch_scope(self.config, request=request):
+            pass
         project_path = _as_nonempty_string(request.get("project_path"), "project_path")
         title = _as_nonempty_string(request.get("title"), "title")
         prompt = _as_nonempty_string(request.get("prompt"), "prompt")
@@ -1409,6 +1831,7 @@ class AppServerClient:
             thread_id = str(thread.get("id") or "") if isinstance(thread, dict) else ""
             if not thread_id:
                 raise NativeTaskCreationError("thread/start response is missing thread.id")
+            self.business_quarantine_context = {**request, "thread_id": thread_id}
             _report_phase(on_phase, "thread_started", thread_id=thread_id)
             self._verify_runtime_context(
                 started, operation="thread/start", thread_id=thread_id,
@@ -1830,30 +2253,48 @@ class AppServerClient:
 
     def read_exact_turn(
         self, thread_id: str, turn_id: str, *, deadline: float,
-        _terminal_only: bool = False,
-        _control_poll: Callable[[], None] | None = None,
-        _terminal_probe: bool = False,
+        _terminal_only: bool = False, _control_poll=None, _terminal_probe: bool = False,
     ) -> dict[str, Any]:
-        """Fresh native metadata and an explicit final-only projection of one turn.
+        scan = self._exact_turn_pages(thread_id, turn_id, _terminal_only=_terminal_only,
+                                      _control_poll=None)
+        try:
+            pending = next(scan)
+            while True:
+                if _control_poll is not None:
+                    _control_poll()
+                if time.monotonic() >= deadline:
+                    raise NativeTaskError("Exact-turn readback deadline exhausted; scan is incomplete")
+                options = {"_terminal_probe": True} if _terminal_probe else {}
+                response = self.request(*pending, deadline=deadline, **options)
+                if time.monotonic() >= deadline:
+                    raise NativeTaskError("Exact-turn readback deadline exhausted; scan is incomplete")
+                pending = scan.send(response)
+                response = None
+        except StopIteration as completed:
+            response = None
+            if _control_poll is not None:
+                _control_poll()
+            if time.monotonic() >= deadline:
+                raise NativeTaskError("Exact-turn readback deadline exhausted; scan is incomplete")
+            return completed.value
+        finally:
+            scan.close()
 
-        Exhaust every item page before returning counts or scan completeness. Tool
-        payloads are released pagewise; full evidence stays available through the
-        native paginated endpoint. No SQL, latest-turn or full-history fallback.
+    def _exact_turn_pages(self, thread_id, turn_id, *, _terminal_only=False, _control_poll=None,
+                          _metadata_only=False, _bounded=False):
+        """Shared exact-page validator. Suspends only after dropping native pages.
+
+        The owning fallback may retain this bounded public projection between
+        slices. A suspended iterator is never completion or release evidence.
         """
         if not isinstance(thread_id, str) or not thread_id.strip():
             raise NativeTaskError("Exact-turn read requires a non-empty thread_id")
         if not isinstance(turn_id, str) or not turn_id.strip():
             raise NativeTaskError("Exact-turn read requires a non-empty turn_id")
 
-        def check_deadline(*, poll: bool = True) -> None:
+        def check_deadline(*, poll=True):
             if poll and _control_poll is not None:
                 _control_poll()
-            if time.monotonic() >= deadline:
-                raise NativeTaskError("Exact-turn readback deadline exhausted; scan is incomplete")
-
-        def read_page(method: str, params: dict[str, Any]) -> dict[str, Any]:
-            options = {"_terminal_probe": True} if _terminal_probe else {}
-            return self.request(method, params, deadline=deadline, **options)
 
         def next_page(page: dict[str, Any], seen: set[str]) -> str | None:
             cursor = page.get("nextCursor")
@@ -1865,7 +2306,7 @@ class AppServerClient:
             return cursor
 
         check_deadline()
-        metadata = read_page(
+        metadata = yield (
             "thread/read", {"threadId": thread_id, "includeTurns": False},
         )
         check_deadline(poll=False)
@@ -1873,6 +2314,12 @@ class AppServerClient:
         if not isinstance(thread, dict) or thread.get("id") != thread_id:
             raise NativeTaskError("Exact-thread metadata readback identity mismatch")
         thread_status = thread.get("status")
+        try:
+            from .native_scan_receipt import PublicScanReceiptBuilder
+        except ImportError:  # direct runtime-script execution
+            from native_scan_receipt import PublicScanReceiptBuilder
+        scan = PublicScanReceiptBuilder(thread_id, turn_id,
+            model_provider=thread.get("modelProvider"), protocol_version=getattr(self, "cli_version", None))
         del metadata, thread
 
         cursor = None
@@ -1886,7 +2333,7 @@ class AppServerClient:
             }
             if cursor is not None:
                 params["cursor"] = cursor
-            page = read_page("thread/turns/list", params)
+            page = yield ("thread/turns/list", params)
             check_deadline(poll=False)
             turns = page.get("data")
             if not isinstance(turns, list):
@@ -1906,13 +2353,19 @@ class AppServerClient:
                         raise NativeTaskError("Exact-turn metadata readback has duplicate target identity")
                     selected = {"turn_id": turn_id, "status": turn["status"],
                                 "error": str(turn["error"]) if turn.get("error") is not None else None,
-                                "native_error": turn.get("error")}
+                                "native_error": turn.get("error"),
+                                "startedAt": turn.get("startedAt"), "completedAt": turn.get("completedAt")}
+            scan.add_turn_page(cursor, page)
+            if _bounded and scan.failure:
+                raise NativeTaskError(scan.failure)
             cursor = next_page(page, seen_cursors)
             del page, turns
             turn = error = None
             if selected is None and cursor is None:
                 raise NativeTaskError("Requested exact turn was not found in native readback")
 
+        if _metadata_only:
+            return selected
         cursor = None
         seen_cursors.clear()
         if _terminal_only and selected["status"] == "inProgress":
@@ -1927,7 +2380,7 @@ class AppServerClient:
                       "sortDirection": "desc", "limit": 50}
             if cursor is not None:
                 params["cursor"] = cursor
-            page = read_page("thread/items/list", params)
+            page = yield ("thread/items/list", params)
             check_deadline(poll=False)
             entries = page.get("data")
             if not isinstance(entries, list):
@@ -1946,8 +2399,11 @@ class AppServerClient:
                         raise NativeTaskError("Exact-turn final answer has an invalid text shape")
                     if final is None:
                         final = {key: item[key] for key in ("id", "type", "phase", "text") if key in item}
+            scan.add_item_page(cursor, page)
+            if _bounded and scan.failure:
+                raise NativeTaskError(scan.failure)
             cursor = next_page(page, seen_cursors)
-            # Do not pin a large tool page while issuing the next native request.
+            # Only bounded public projections survive the next native request.
             del page, entries
             item = entry = None
             if cursor is None:
@@ -1960,6 +2416,7 @@ class AppServerClient:
             final_answer_present=final is not None,
             final_answer_nonempty=final is not None and bool(final["text"].strip()),
         )
+        selected["native_scan_receipt"] = scan.finish(selected)
         return {"thread_id": thread_id, "status": thread_status, "turns": [selected],
                 "read_source": "native_exact_turn", "turn_id": turn_id,
                 "turns_complete": False, "turns_projection": "exact_turn"}
@@ -2056,6 +2513,53 @@ class AppServerClient:
                 raise
             raise NativeTaskCreationError(str(exc), thread_id=thread_id) from exc
 
+    def _advance_owner_scan(self, state, thread_id, turn_id, *, deadline, control_poll):
+        """Advance a single bounded exact scan without replaying validated pages."""
+        if state["identity"] != (thread_id, turn_id, getattr(self, "cli_version", None)):
+            raise NativeTaskError("Owner scan identity changed")
+        while time.monotonic() < deadline:
+            control_poll()
+            if time.monotonic() >= deadline:
+                break
+            if state["calls"] >= 512:
+                raise NativeTaskError("Owner scan total page bound exceeded")
+            pending = state["pending"]
+            state["retryable"] = False
+            try:
+                response = self.request(*pending, deadline=deadline, _terminal_probe=True)
+            except NativeTaskError as exc:
+                state["retryable"] = (not isinstance(exc, NativeRpcError) and
+                    (time.monotonic() >= deadline or
+                     getattr(self, "_terminal_probe_pending_id", None) is not None))
+                raise
+            state["calls"] += 1
+            # Validate a received page once even at the slice boundary; it is
+            # never returned as authority until the whole-scan deadline check.
+            try:
+                state["pending"] = state["scan"].send(response)
+            except StopIteration as complete:
+                response = None
+                control_poll()
+                if state["phase"] == "revalidate":
+                    selected = state["result"]["turns"][0]
+                    keys = ("turn_id", "status", "native_error", "startedAt", "completedAt")
+                    before = json.dumps([selected.get(k) for k in keys], sort_keys=True, allow_nan=False)
+                    after = json.dumps([complete.value.get(k) for k in keys], sort_keys=True, allow_nan=False)
+                    if before != after:
+                        raise NativeTaskError("Owner scan terminal metadata changed across slices")
+                    return state["result"]
+                result = complete.value
+                if not state["resumed"] or not result["turns"][0].get("items_scan_complete"):
+                    return result
+                state["result"] = result
+                state["phase"] = "revalidate"
+                state["scan"] = self._exact_turn_pages(thread_id, turn_id,
+                    _metadata_only=True, _bounded=True)
+                state["pending"] = next(state["scan"])
+            finally:
+                response = None
+        return None
+
     def wait_for_turn_terminal(
         self,
         thread_id: str,
@@ -2077,6 +2581,7 @@ class AppServerClient:
                 "unsupported client role" if terminal_readback else "not enabled"),
         }
         next_probe = time.monotonic() + 30.0
+        checkpoint = None
 
         def checked_control_poll() -> None:
             if control_poll is not None:
@@ -2111,21 +2616,47 @@ class AppServerClient:
                 turn = params.get("turn") if isinstance(params, dict) else None
                 if (isinstance(turn, dict) and params.get("threadId") == thread_id
                         and turn.get("id") == turn_id):
+                    control_terminal = getattr(self, "owner_control_terminal", None)
+                    if callable(control_terminal):
+                        control_terminal(thread_id, turn)
                     return turn
             # Unrelated notification storms cannot starve the monotonic probe.
             if enabled and time.monotonic() >= next_probe:
-                # Limit from the *end* as well, including failed/partial probes.
-                probe_deadline = time.monotonic() + min(self.config.turn_readback_timeout_seconds, 5.0)
-                if deadline is not None:
-                    probe_deadline = min(probe_deadline, deadline)
+                slice_deadline = time.monotonic() + 5.0
+                if checkpoint is None:
+                    scan_deadline = time.monotonic() + self.config.turn_readback_timeout_seconds
+                    if deadline is not None:
+                        scan_deadline = min(scan_deadline, deadline)
+                    scan = self._exact_turn_pages(thread_id, turn_id, _terminal_only=True,
+                        _bounded=True)
+                    checkpoint = {"identity": (thread_id, turn_id, getattr(self, "cli_version", None)),
+                        "scan": scan, "pending": None, "deadline": scan_deadline,
+                        "calls": 0, "resumed": False, "phase": "scan", "result": None, "retryable": False}
+                probe_deadline = min(slice_deadline, checkpoint["deadline"])
                 try:
-                    data = self.read_exact_turn(
-                        thread_id, turn_id, deadline=probe_deadline,
-                        _terminal_only=True, _control_poll=checked_control_poll,
-                        _terminal_probe=True,
-                    )
+                    if checkpoint["pending"] is None:
+                        checkpoint["pending"] = next(checkpoint["scan"])
+                    data = self._advance_owner_scan(checkpoint, thread_id, turn_id,
+                        deadline=probe_deadline, control_poll=checked_control_poll)
+                    if data is None:
+                        checkpoint["resumed"] = True
+                        self._held_terminal_readback_diagnostic = {"state": "holding",
+                            "reason": ("one unanswered native RPC" if getattr(self, "_terminal_probe_pending_id", None) is not None
+                                       else "exact scan slice pending"), "method": checkpoint["pending"][0],
+                            "cursor": checkpoint["pending"][1].get("cursor"),
+                            "stage": checkpoint["phase"], "classification": "slice_pending"}
+                        continue
+                    authority_deadline = checkpoint["deadline"]
+                    checkpoint["scan"].close()
+                    checkpoint = None
                     selected = data["turns"][0]
-                    if (selected["status"] in {"completed", "failed", "interrupted"}
+                    from adapters.codex_app_server.native_execution_evidence import classify_native_turn
+                    witness = classify_native_turn(thread_id, turn_id,
+                        {"id": selected.get("turn_id"), "status": selected.get("status"),
+                         "startedAt": selected.get("startedAt"), "completedAt": selected.get("completedAt"),
+                         "error": selected.get("native_error")}, observed_thread_id=data.get("thread_id"),
+                        protocol_version=getattr(self, "cli_version", None))
+                    if (witness.get("terminal_confirmed") is True
                             and selected.get("items_scan_complete") is True
                             and (selected["status"] != "completed"
                                  or selected.get("final_answer_nonempty") is True)):
@@ -2133,7 +2664,7 @@ class AppServerClient:
                         # Hold. Do not begin another readback with a fresh budget.
                         final = selected["items"][0]["text"] if selected["items"] else ""
                         checked_control_poll()
-                        if time.monotonic() >= probe_deadline:
+                        if time.monotonic() >= authority_deadline:
                             raise NativeTaskError("Hold terminal readback deadline exhausted after control poll")
                         self._held_terminal_readback_diagnostic = {"state": "terminal", "reason": "exact native readback"}
                         return OwnerExactTerminalReadback({"id": turn_id, "status": selected["status"],
@@ -2148,17 +2679,43 @@ class AppServerClient:
                     # Identity, protocol, partial scans and RPC errors license
                     # neither owner results nor non-controlled Host cleanup.
                     self._held_terminal_readback_diagnostic = {"state": "holding", "reason": str(exc)[:512]}
+                    # Only a timeout/unanswered read may retain the exact cursor.
+                    # Shape, identity, protocol and native RPC failures invalidate it.
+                    resumable = checkpoint is not None and checkpoint.get("retryable") is True
+                    if checkpoint is not None and checkpoint.get("pending") is not None:
+                        self._held_terminal_readback_diagnostic.update(
+                            method=checkpoint["pending"][0], cursor=checkpoint["pending"][1].get("cursor"),
+                            stage=checkpoint["phase"], pages_validated=checkpoint["calls"],
+                            classification="read_timeout_or_pending" if resumable else "scan_rejected")
+                    if checkpoint is not None and not resumable:
+                        checkpoint["scan"].close()
+                        checkpoint = None
                 finally:
-                    # Keep only the fixed-size diagnostic while holding. Even
-                    # a huge blank final projection is not cached across polls.
                     data = selected = final = None
-                    next_probe = time.monotonic() + 30.0
+                    if checkpoint is not None and time.monotonic() >= checkpoint["deadline"]:
+                        self._held_terminal_readback_diagnostic["classification"] = "overall_budget_exhausted"
+                        checkpoint["scan"].close()
+                        checkpoint = None
+                    if checkpoint is not None:
+                        checkpoint["resumed"] = True
+                    next_probe = time.monotonic() + (0.25 if checkpoint is not None else 30.0)
+                    sink = getattr(self, "_terminal_diagnostic_sink", None)
+                    if sink is not None:
+                        try:
+                            sink(dict(self._held_terminal_readback_diagnostic))
+                        except Exception:
+                            pass # Telemetry cannot alter owner execution or cleanup.
         raise NativeTaskCreationError(
             "timed out waiting for turn/completed",
             thread_id=thread_id,
         )
 
     def close(self) -> None:
+        if getattr(self, '_unix_owner', None) is not None:
+            with self._unix_rpc_lock:
+                if self._unix_connection is not None:
+                    self._unix_disconnect(self._unix_connection, self._unix_epoch, 'client_closed')
+            return  # Never reach stdio process wait/terminate/kill for an attachment.
         process = self.process
         self.process = None
         lock_fd = getattr(self, "_instance_lock_fd", None)

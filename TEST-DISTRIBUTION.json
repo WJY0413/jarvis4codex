@@ -1,0 +1,731 @@
+{
+  "version": "0.3.2",
+  "channel": "test-capacity99-auto-config-v1",
+  "archive_name": "Jarvis-0.3.2-test.capacity99-auto-config-v1-r2-linux-x86_64-external-python.tar.gz",
+  "archive_sha256": "f2a824838b50b0be7f32db748bdd772884d6cd50c3788786c4e24b75932728be",
+  "archive_bytes": 15081192,
+  "source_pin": {
+    "version": "0.3.2",
+    "channel": "test-capacity99-v1",
+    "source_code_sha256": "7f99c6515ba38c78f13c215a520b68c884f7aa595629af6b49ecfeb5aec19213",
+    "source_archive_sha256": "e1f1b7e2a59782b461646ace5fd77be6390fe4fc1be16b5406a031e9887fd2ae",
+    "runner_source_sha256": "c6ac50889d82aa9bcfc1c59a8635e812f4d67ffbddeee84a7d1d52befc22c0a0"
+  },
+  "file_manifest": {
+    "CLOUD-TEST-SCOPE.md": {
+      "kind": "file",
+      "bytes": 1792,
+      "sha256": "64b3f98303fcd515fca637618d6011e812f18ad586d3a9fefb58729d72a188ef"
+    },
+    "OFFLINE-INSTALLER-R2.md": {
+      "kind": "file",
+      "bytes": 431,
+      "sha256": "82c3eb84e5e7a030cc85e93b4f6e5b9bb2c8f988aee8f3180d7cd9579dcb71ee"
+    },
+    "README.md": {
+      "kind": "file",
+      "bytes": 5378,
+      "sha256": "f0139e3ddb833ee022729fbec7d70a3a7deef6a191e09a2fc4c0712e76b1c8f2"
+    },
+    "execution_setup.py": {
+      "kind": "file",
+      "bytes": 20087,
+      "sha256": "3f5861ff512f918cf9a45b9562049b62a1f67e455b276b59bd8031abe7251571"
+    },
+    "install.py": {
+      "kind": "file",
+      "bytes": 19103,
+      "sha256": "6a0b15e1e8c1353628e12e5438fb1d1106684306e615d7906e8917d6ddd5e0e4"
+    },
+    "install.sh": {
+      "kind": "file",
+      "bytes": 1853,
+      "sha256": "db9702cc04d037b8c41867a8ba76e21d8ceeb6bc414d35dd86c3a14da72b1006"
+    },
+    "offline_phase.py": {
+      "kind": "file",
+      "bytes": 5098,
+      "sha256": "0ed61c57b6be8ab552f4f0d2a70440f973a9d434102cee1ce992344247e7f192"
+    },
+    "provenance/pbs-download-verified.json": {
+      "kind": "file",
+      "bytes": 320,
+      "sha256": "79da18c39bffdeb8dd0b2f6a16361389c33e5bcaed73b622f3975adeeceba66b"
+    },
+    "provenance/pbs-licenses-verified.json": {
+      "kind": "file",
+      "bytes": 7049,
+      "sha256": "e455f589403d5eccd661cc7a3f3172e76babbe04f7a9264d0c4c33cf81a2d8be"
+    },
+    "provenance/pbs-official-release.json": {
+      "kind": "file",
+      "bytes": 900,
+      "sha256": "d130f6f456df851ec54709566cdbd18710459311f66437e51c92e814fa7cdaa3"
+    },
+    "provenance/pip-bootstrap-official.json": {
+      "kind": "file",
+      "bytes": 511,
+      "sha256": "4d48fbc7ebd12e2b75f30f8e36aeb0475d37dc8ce5b5864194ef704a44e8b209"
+    },
+    "provenance/requirements.lock.txt": {
+      "kind": "file",
+      "bytes": 692,
+      "sha256": "0de78d86fbfdc780698f886e73652ce933fce6636116391074ba1fe36aa4e07e"
+    },
+    "provenance/third-party-package-notices.json": {
+      "kind": "file",
+      "bytes": 12016,
+      "sha256": "fdea781f5308816b5896f34c11f0b3d6de34b7b65fc686822e7620169babf10c"
+    },
+    "provenance/wheelhouse-manifest.json": {
+      "kind": "file",
+      "bytes": 12463,
+      "sha256": "9680b7396c2f751f9bc8ceccd38b53d3dffeb08f8e355473d67d0baa2f811f91"
+    },
+    "release/deploy/requirements.lock.txt": {
+      "kind": "file",
+      "bytes": 692,
+      "sha256": "0de78d86fbfdc780698f886e73652ce933fce6636116391074ba1fe36aa4e07e"
+    },
+    "release/deploy/smoke-config.json": {
+      "kind": "file",
+      "bytes": 867,
+      "sha256": "c4da2847598cf777b59c309d691241370489fe150298b12e8380a94d29cd6d01"
+    },
+    "release/deployment-manifest.json": {
+      "kind": "file",
+      "bytes": 11456,
+      "sha256": "f42ca42b007a1ef8f0c7cd070f7a284a564d7a0126442a6d88d4ded42de92886"
+    },
+    "release/source/packages/adapters/__init__.py": {
+      "kind": "file",
+      "bytes": 55,
+      "sha256": "857e1a5eab3fb8a6f94d1c44a0bf1dbec300e1131fb51b75ea3c7784d3d6e35b"
+    },
+    "release/source/packages/adapters/codex_app_server/__init__.py": {
+      "kind": "file",
+      "bytes": 239,
+      "sha256": "7ac6688ee3e6ff3b3c30cdca205475fe3dac49197c63ea0bbf19817ce5a2d694"
+    },
+    "release/source/packages/adapters/codex_app_server/finite_terminal_settlement.py": {
+      "kind": "file",
+      "bytes": 22252,
+      "sha256": "c1f4dcee46f3d1c2966f61a23136fe17a71bad484b257eef40ea12f849855220"
+    },
+    "release/source/packages/adapters/codex_app_server/jarvis_connection.py": {
+      "kind": "file",
+      "bytes": 8749,
+      "sha256": "fd4ca16f3eae3ea5f82393a646649f13ac4c52775afc2d5d708c04b48e5e0290"
+    },
+    "release/source/packages/adapters/codex_app_server/jarvis_hold_host_service.py": {
+      "kind": "file",
+      "bytes": 98341,
+      "sha256": "1539eb02c411a670088b25364dcabf126e6bb0eb678d034f921a62e18bc2d2e9"
+    },
+    "release/source/packages/adapters/codex_app_server/jarvis_local_heartbeat_host.py": {
+      "kind": "file",
+      "bytes": 5245,
+      "sha256": "40280695f5169219755c6f77971e342fc7be58f44da70d5507e8799b3fe15143"
+    },
+    "release/source/packages/adapters/codex_app_server/jarvis_task_hold_host.py": {
+      "kind": "file",
+      "bytes": 45819,
+      "sha256": "ec4662a2bf0912826a0ad4e24c0f040bc1df382f34adce63728aba5c7f875dc4"
+    },
+    "release/source/packages/adapters/codex_app_server/mcp_wiring.py": {
+      "kind": "file",
+      "bytes": 7673,
+      "sha256": "3f0574527d3e7b1ab5aec351042ad2fad8974d3afe62ec4e52334f6514443ac4"
+    },
+    "release/source/packages/adapters/codex_app_server/monitor_adapter.py": {
+      "kind": "file",
+      "bytes": 1951,
+      "sha256": "e8dbfabad40bab702e36cfbd74838d05b6a4f418831119755de7762eb8b51ac3"
+    },
+    "release/source/packages/adapters/codex_app_server/native_execution_evidence.py": {
+      "kind": "file",
+      "bytes": 7745,
+      "sha256": "f429e7918f4a74aa50ed8d8e617951b60a8853c39edb50de11ba52117b2ade22"
+    },
+    "release/source/packages/adapters/codex_app_server/prediction.py": {
+      "kind": "file",
+      "bytes": 16343,
+      "sha256": "dd031f853894149e0d3b375c3e5e69674c9a4939291b433adc42919b9443873a"
+    },
+    "release/source/packages/adapters/codex_app_server/task_provisioning_adapter.py": {
+      "kind": "file",
+      "bytes": 112479,
+      "sha256": "0a8a5c809a7144296d3c3eff0f46575c54ce860bf2e2d551a3b14438c56bb904"
+    },
+    "release/source/packages/adapters/feishu_outbox_notification.py": {
+      "kind": "file",
+      "bytes": 6368,
+      "sha256": "ae97b241a494d086db6c12086d33b3e05e3ac77511e1529b656d73996beb62fc"
+    },
+    "release/source/packages/adapters/local_test_inbox.py": {
+      "kind": "file",
+      "bytes": 13060,
+      "sha256": "8f1c84185755261ffe8fcc8ff55a22f7ac4602a8ce5595351fbb64cfebee335f"
+    },
+    "release/source/packages/adapters/local_test_inbox_receiver.py": {
+      "kind": "file",
+      "bytes": 14962,
+      "sha256": "acc52d580e3534d6e0dca1ed8760ace439c04a791670f7a0c28f6db682836397"
+    },
+    "release/source/packages/jarvis_codex_bridge/__init__.py": {
+      "kind": "file",
+      "bytes": 1507,
+      "sha256": "53014013f3750295fa787f568b7680db0a36101c1a88086b1f77054e31cbc052"
+    },
+    "release/source/packages/jarvis_codex_bridge/contracts.py": {
+      "kind": "file",
+      "bytes": 6849,
+      "sha256": "d53977c6061f11437b366f2d1fa6867d61747734ec771d5c8b4130592c73cb02"
+    },
+    "release/source/packages/jarvis_codex_bridge/dispatch_owner.py": {
+      "kind": "file",
+      "bytes": 13863,
+      "sha256": "0389cb87cbf13e9b0cf9e9032f3399473fdcaabc4738b6697ab4dd6a39893166"
+    },
+    "release/source/packages/jarvis_codex_bridge/journal.py": {
+      "kind": "file",
+      "bytes": 6682,
+      "sha256": "4b2f3494dd11c4d062561ed7087a5950850054a90d51aaf319cd7b7ea97b5de4"
+    },
+    "release/source/packages/jarvis_codex_bridge/monitor.py": {
+      "kind": "file",
+      "bytes": 15994,
+      "sha256": "585a3b0126c365aa2b004b4882b11a3b1fcfed6515c1ef2cbd043c18184fc48a"
+    },
+    "release/source/packages/jarvis_codex_bridge/port.py": {
+      "kind": "file",
+      "bytes": 8649,
+      "sha256": "4a8fe90ea12ffa8c06b1284a0dba04aa67e53848980fd8c6c53d7f4605f2745d"
+    },
+    "release/source/packages/jarvis_codex_bridge/service.py": {
+      "kind": "file",
+      "bytes": 10263,
+      "sha256": "622ee940251224e25bae8b34ff0c85572f301d846808563bb0b687e449bdb4f3"
+    },
+    "release/source/packages/jarvis_codex_bridge/transport.py": {
+      "kind": "file",
+      "bytes": 625,
+      "sha256": "d3a5d4389c67adcf31d85ca1a987ed7cc26ac06b0ecbe91b5530cfd76f05c00f"
+    },
+    "release/source/packages/jarvis_contracts/__init__.py": {
+      "kind": "file",
+      "bytes": 156,
+      "sha256": "b2cd80e5c758af5e475bdb99f2b9f9762fd2b94c0cdb0a3f2bb725fedc3b29f5"
+    },
+    "release/source/packages/jarvis_contracts/models.py": {
+      "kind": "file",
+      "bytes": 771,
+      "sha256": "f7aede362200c735107edafa16c253c3f3124e070d2b3d5dcf03a05d58ece4c4"
+    },
+    "release/source/packages/jarvis_control/__init__.py": {
+      "kind": "file",
+      "bytes": 542,
+      "sha256": "1548f27727adc42a90495ad35c0b7b0e906ed73de613b9eed26411e624435b74"
+    },
+    "release/source/packages/jarvis_control/contact_campaign.py": {
+      "kind": "file",
+      "bytes": 7088,
+      "sha256": "f0833a3064802e05769122c60b17897839cc3a6041a2480a170d48dd369f340b"
+    },
+    "release/source/packages/jarvis_control/contact_task.py": {
+      "kind": "file",
+      "bytes": 33729,
+      "sha256": "b6c830ecb6c70ea522bb581a62aa2544eca2f9aeb0fd8ff67ab09dee25c1f6fd"
+    },
+    "release/source/packages/jarvis_control/failed_before_send_consumer.py": {
+      "kind": "file",
+      "bytes": 19024,
+      "sha256": "ccfb66bfcb24bd3b30ebd1e7ebaf4652e147683eb650195545f792664614d49e"
+    },
+    "release/source/packages/jarvis_control/file_task.py": {
+      "kind": "file",
+      "bytes": 25872,
+      "sha256": "e425706fb4eb96acd961b7a82b38072488cd1938eec09a7534d5e281620053bc"
+    },
+    "release/source/packages/jarvis_control/formal_predecessor.py": {
+      "kind": "file",
+      "bytes": 23548,
+      "sha256": "3acef8ef80efe5f5980e1fdcf099168006d4149ea239705e6203506f5958276a"
+    },
+    "release/source/packages/jarvis_control/loop.py": {
+      "kind": "file",
+      "bytes": 61732,
+      "sha256": "c0932a1cc69e881e41c2e7e48fb48907b3aac9272fb1a95b43f00c1e14cb7528"
+    },
+    "release/source/packages/jarvis_control/operations.py": {
+      "kind": "file",
+      "bytes": 21703,
+      "sha256": "144f4a6e7f703ab6f482de4cfcb393c9ab7e6f0199833487efd2a0ed327100ed"
+    },
+    "release/source/packages/jarvis_control/partial_predecessor.py": {
+      "kind": "file",
+      "bytes": 17866,
+      "sha256": "71a5bd76cfb6f9e3eaf93826a550e5482278871ea6da5dc42ca2b9bddf961e44"
+    },
+    "release/source/packages/jarvis_control/provisioning.py": {
+      "kind": "file",
+      "bytes": 13683,
+      "sha256": "79d348b1acfa6c70ee5d4af8519a916674d32699fbb67f4a79d31a0b57a0651d"
+    },
+    "release/source/packages/jarvis_control/retained_partial_predecessor.py": {
+      "kind": "file",
+      "bytes": 10626,
+      "sha256": "0c531cb4f62159ae0232195e599d50f03fe148988779884e3f84569f959c4a5e"
+    },
+    "release/source/packages/jarvis_control/retained_union_transition.py": {
+      "kind": "file",
+      "bytes": 22949,
+      "sha256": "19efe60fe24942d5f5399bbb18822360f6defe0bb51dd44d135a65c229403f5b"
+    },
+    "release/source/packages/jarvis_control/retired_union_transition.py": {
+      "kind": "file",
+      "bytes": 18769,
+      "sha256": "31a6f4ec5cd0fb52d8be3c2fb0c6469bbfd82712836ebeceb8aa2a84f8987750"
+    },
+    "release/source/packages/jarvis_control/scheduling_generation_run.py": {
+      "kind": "file",
+      "bytes": 6130,
+      "sha256": "c6f97142d4d4077fd95c0fcfcfdeff6435b765a102dd5825fe9e7eb3734cfa0f"
+    },
+    "release/source/packages/jarvis_control/service.py": {
+      "kind": "file",
+      "bytes": 53023,
+      "sha256": "1dd50a20a3e026951df2cf1a0ab8a489a9dbeda166a1bdb2f89cd2ce6ad8fc82"
+    },
+    "release/source/packages/jarvis_control/shared_union_transition.py": {
+      "kind": "file",
+      "bytes": 18404,
+      "sha256": "8c22962acb35a4effb4a15341a3c96d34e32a8cd94d290ab2e518a4af5ac722e"
+    },
+    "release/source/packages/jarvis_control/sustained_research.py": {
+      "kind": "file",
+      "bytes": 92183,
+      "sha256": "a6116786c557c7aaa7151b7f53c4623bea7cc4d44bd71a73bd94bc38eeb9e023"
+    },
+    "release/source/packages/jarvis_control/sustained_runner.py": {
+      "kind": "file",
+      "bytes": 61819,
+      "sha256": "b07ff3ac0e8eb3b7017dc228c07603e1260004d796344647a3f6232752fc921b"
+    },
+    "release/source/packages/jarvis_deploy/__init__.py": {
+      "kind": "file",
+      "bytes": 81,
+      "sha256": "7b78c37ae6d485693ad9718c484f1c540777c5f359339cbfbdcfd01904dc7e86"
+    },
+    "release/source/packages/jarvis_deploy/artifact.py": {
+      "kind": "file",
+      "bytes": 14650,
+      "sha256": "91dd0c794553cf876bdc0569444690231189cba4c3e1b5b1302422aeba29d9f8"
+    },
+    "release/source/packages/jarvis_deploy/cli.py": {
+      "kind": "file",
+      "bytes": 14743,
+      "sha256": "44464ce874871475ba0368058b222b692edd52cb36cd297e7631479da93ec311"
+    },
+    "release/source/packages/jarvis_deploy/lifecycle.py": {
+      "kind": "file",
+      "bytes": 29535,
+      "sha256": "0b64f272b0ce84e46b77809274ee53cb4307c877bda8c7fa2d82e661e546fe2b"
+    },
+    "release/source/packages/jarvis_deploy/smoke.py": {
+      "kind": "file",
+      "bytes": 3859,
+      "sha256": "d9f8dd8010bce55083a7991d2e3d0db9b33f985f803024dfb8d82e022c6e4eb5"
+    },
+    "release/source/packages/jarvis_engine/__init__.py": {
+      "kind": "file",
+      "bytes": 71,
+      "sha256": "afae1f15d543c1b3d66e49f60c7b88017cd49d2d18766c8c7c2aa889ba81553e"
+    },
+    "release/source/packages/jarvis_engine/service.py": {
+      "kind": "file",
+      "bytes": 454,
+      "sha256": "a6018262270c359baf3bbeca8a66d7d039339f821cd2f70d98c205e487e104bc"
+    },
+    "release/source/packages/jarvis_harness_sdk/__init__.py": {
+      "kind": "file",
+      "bytes": 69,
+      "sha256": "cfed6d087fb595d8a941b5e002c1156580eef028a1dfc0625b599d74e04a0504"
+    },
+    "release/source/packages/jarvis_harness_sdk/adapter.py": {
+      "kind": "file",
+      "bytes": 1088,
+      "sha256": "c36da55336a75698f2188e8d0ab38fd3d3e1ed1dc349d1e9fea7ed6ef7219409"
+    },
+    "release/source/packages/jarvis_mcp/__init__.py": {
+      "kind": "file",
+      "bytes": 137,
+      "sha256": "77d1c8e0f67716ff90eba53e56cb525276354051fa76d182ae0157f1b9490180"
+    },
+    "release/source/packages/jarvis_mcp/entrypoint.py": {
+      "kind": "file",
+      "bytes": 2229,
+      "sha256": "a8acb94bd85ff91ee195c29537bb0d457ed12d6ad3c56cb629557bfa95021216"
+    },
+    "release/source/packages/jarvis_mcp/server.py": {
+      "kind": "file",
+      "bytes": 28550,
+      "sha256": "67661e787184bafe49f2c5a6e52e31b3c0e4ec730ab5b4e41e4fc37f54b3f5bc"
+    },
+    "release/source/packages/jarvis_monitor/__init__.py": {
+      "kind": "file",
+      "bytes": 460,
+      "sha256": "2c693be820310347ecc26e345e42713e2fbafb48c5b78b88eeda052bb8013e12"
+    },
+    "release/source/packages/jarvis_monitor/hold_turn_monitor.py": {
+      "kind": "file",
+      "bytes": 8418,
+      "sha256": "7b1cff5678e2cec2034a4e1a147c9af5f256397f162e9c8df314ee9e62ea7ef1"
+    },
+    "release/source/packages/jarvis_monitor/service.py": {
+      "kind": "file",
+      "bytes": 12818,
+      "sha256": "3a93794b65ca5e5938cafdf41d09f4067a2fc86e689c60f8975d5f15df9eb1c6"
+    },
+    "release/source/packages/jarvis_runtime/attendance_end_of_day_memo_probe.py": {
+      "kind": "file",
+      "bytes": 8258,
+      "sha256": "c05b787611e1fcef3a8e1a9c02acfc41ebbdf9d7d5cb945410f32aabfae867ba"
+    },
+    "release/source/packages/jarvis_runtime/business_quarantine.py": {
+      "kind": "file",
+      "bytes": 26207,
+      "sha256": "06e106562d890d9347d0d194e4b5e1050785c1d62c98c552254931e569956580"
+    },
+    "release/source/packages/jarvis_runtime/business_quarantine_gate.py": {
+      "kind": "file",
+      "bytes": 7243,
+      "sha256": "dd93924571bbc53e00e29e07786d57d86c4a94e250215074b70b88f29e78dfc3"
+    },
+    "release/source/packages/jarvis_runtime/cancellation.py": {
+      "kind": "file",
+      "bytes": 15885,
+      "sha256": "50df45655aa15605a14152cf69e8b9ac1d350f7328100e6eea5e73ba0eff99cd"
+    },
+    "release/source/packages/jarvis_runtime/coo_dispatcher_store.py": {
+      "kind": "file",
+      "bytes": 45525,
+      "sha256": "1c9789581029b2f463ff663fbbda48ad138c634e14bfebc23cf16938199d5c0b"
+    },
+    "release/source/packages/jarvis_runtime/holder_transport_release.py": {
+      "kind": "file",
+      "bytes": 5865,
+      "sha256": "8439d475131c5612ead97446cf03628657703e32a5c8bfa67f1a967983b45ed6"
+    },
+    "release/source/packages/jarvis_runtime/jarvis_heartbeat_service.py": {
+      "kind": "file",
+      "bytes": 157893,
+      "sha256": "0a30c349f39e3169726613abd8a2e06bc14d0080092219f574b8d4558690b2de"
+    },
+    "release/source/packages/jarvis_runtime/jarvis_local_heartbeat.py": {
+      "kind": "file",
+      "bytes": 19443,
+      "sha256": "960d6ca308bf28670d4e44b68c529d341afef472ba0b490af6cb7e986aee2a14"
+    },
+    "release/source/packages/jarvis_runtime/jarvis_monitor_service.py": {
+      "kind": "file",
+      "bytes": 2247,
+      "sha256": "6ab41d69d55b6393911ad1a75c36cb08576c3defe621f6803bddfc45d64ffb20"
+    },
+    "release/source/packages/jarvis_runtime/jarvis_native_task_launcher.py": {
+      "kind": "file",
+      "bytes": 142496,
+      "sha256": "a84ada8eacd9c196445efa99873094d257e146b699a1a9de7250ffb9007d8b7c"
+    },
+    "release/source/packages/jarvis_runtime/linux_cloud.py": {
+      "kind": "file",
+      "bytes": 3439,
+      "sha256": "cf5da4c7bf67f706671ccef96907c55e26636e055a175e3949d1673b3839ff63"
+    },
+    "release/source/packages/jarvis_runtime/management_archive.py": {
+      "kind": "file",
+      "bytes": 23796,
+      "sha256": "1a53039f607f5f68452a2da37eae8f0f8e17d19f1cda5b11deeb41954dae8085"
+    },
+    "release/source/packages/jarvis_runtime/native_error_origin.py": {
+      "kind": "file",
+      "bytes": 4948,
+      "sha256": "592e64e5f04aaa1b0ae0803877e0c57527f5cbb8b61dc3588716e4a4b76ff539"
+    },
+    "release/source/packages/jarvis_runtime/native_scan_receipt.py": {
+      "kind": "file",
+      "bytes": 14117,
+      "sha256": "400556f0d8eb41a15d7b5789bc57bf5cde3b9a9c1f6c59d9555367117f0791d9"
+    },
+    "release/source/packages/jarvis_runtime/owner_control_ledger.py": {
+      "kind": "file",
+      "bytes": 33527,
+      "sha256": "3a4886d3db4eaf985b0f1bbe0d8748201156a69efd322060c7038d0232cad808"
+    },
+    "release/source/packages/jarvis_runtime/owner_readback_diagnostics.py": {
+      "kind": "file",
+      "bytes": 3227,
+      "sha256": "e013541252a13a1625cb1a9c458bba400b6c20500f2466cc21f94fd2fa033157"
+    },
+    "release/source/packages/jarvis_runtime/owner_transport_health.py": {
+      "kind": "file",
+      "bytes": 15393,
+      "sha256": "a1811ae9f91c0490006ab4973620a53fb3dfd9459390e0e1502e988e570ac0e5"
+    },
+    "release/source/packages/jarvis_runtime/scheduling_budget_capacity.py": {
+      "kind": "file",
+      "bytes": 16236,
+      "sha256": "4cfcfc22beefdb07e24692b1e609dd1fe297a67eded2ff4f6d00b8d1b3f5ea64"
+    },
+    "release/source/packages/jarvis_runtime/scheduling_budget_generation.py": {
+      "kind": "file",
+      "bytes": 32040,
+      "sha256": "ac8629005f1acc64627947eff55a7ec5c5738730e4128e247ad6cf2394c8db97"
+    },
+    "release/source/packages/jarvis_runtime/shared_transport_recovery.py": {
+      "kind": "file",
+      "bytes": 37843,
+      "sha256": "d8469c40ad1cbbf2e1971dfc592743fd7f1d8a5086fa63d36f1d3c0a1b07bead"
+    },
+    "release/source/packages/jarvis_runtime/unix_owner_transport.py": {
+      "kind": "file",
+      "bytes": 14076,
+      "sha256": "fc5e1a64aaa9f35345410521c85093006fe84dde1fced2c1c2fa7aa628b35d60"
+    },
+    "release/source/packages/jarvis_runtime/workbench_queue_progress_probe.py": {
+      "kind": "file",
+      "bytes": 11258,
+      "sha256": "4a0c1cc7e31642e366354cdefd7be70aa0c29d88edc0d8fa4d08ecde971809d7"
+    },
+    "release/source/packages/jarvis_schema/__init__.py": {
+      "kind": "file",
+      "bytes": 246,
+      "sha256": "3158e2ab4cb93938cf1e9b89c79cca32f7890bf49152b363055e9cb1557f9970"
+    },
+    "release/source/packages/jarvis_schema/contact_v25.py": {
+      "kind": "file",
+      "bytes": 1165,
+      "sha256": "2feee7197218b0c76a31d4a6c37e2f17202e0c33172da53bbd26dba4209c670b"
+    },
+    "release/source/pyproject.toml": {
+      "kind": "file",
+      "bytes": 591,
+      "sha256": "04df42f9ba84969789af0f1ce1571873ef9252770df736c7bd5277e16bc458c2"
+    },
+    "requirements.hashed.txt": {
+      "kind": "file",
+      "bytes": 3891,
+      "sha256": "45f3049d84675bdef3478cfb2735e380dfa432e710cebf48022e770729c75ae8"
+    },
+    "wheelhouse/annotated_doc-0.0.5-py3-none-any.whl": {
+      "kind": "file",
+      "bytes": 5302,
+      "sha256": "117bac03a25ede5df5440e855b32d556049ca169ead221505badf432fed4b101"
+    },
+    "wheelhouse/annotated_types-0.8.0-py3-none-any.whl": {
+      "kind": "file",
+      "bytes": 13427,
+      "sha256": "f072f4d804ea359e4eaf198b1af7a8b0943881a87f31bb764f8bf219bb9419e0"
+    },
+    "wheelhouse/anyio-4.15.1-py3-none-any.whl": {
+      "kind": "file",
+      "bytes": 132079,
+      "sha256": "6152fdbbf9a77fdec97731721bebf7c4c44f7c29b424b0065826173efc7ed101"
+    },
+    "wheelhouse/attrs-26.1.0-py3-none-any.whl": {
+      "kind": "file",
+      "bytes": 67548,
+      "sha256": "c647aa4a12dfbad9333ca4e71fe62ddc36f4e63b2d260a37a8b83d2f043ac309"
+    },
+    "wheelhouse/cffi-2.1.1-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl": {
+      "kind": "file",
+      "bytes": 221822,
+      "sha256": "c1453022f490d2459a11819d83ad1d586e9ff65a12ac3e705ffebd46d3685dcf"
+    },
+    "wheelhouse/click-8.5.0-py3-none-any.whl": {
+      "kind": "file",
+      "bytes": 125251,
+      "sha256": "255bc9599cf7748b4b1a446ccc735421bd08a2ae529a8b88597d3de5664ee360"
+    },
+    "wheelhouse/cryptography-50.0.2-cp311-abi3-manylinux_2_34_x86_64.whl": {
+      "kind": "file",
+      "bytes": 4752576,
+      "sha256": "9dab55f57c74c3cad24c323bacbbd04be4705ba6eb0d92e920b1fc4837ed5079"
+    },
+    "wheelhouse/h11-0.16.0-py3-none-any.whl": {
+      "kind": "file",
+      "bytes": 37515,
+      "sha256": "63cf8bbe7522de3bf65932fda1d9c2772064ffb3dae62d55932da54b31cb6c86"
+    },
+    "wheelhouse/httpcore2-2.13.1-py3-none-any.whl": {
+      "kind": "file",
+      "bytes": 83423,
+      "sha256": "e1e05d4f25f7d7d496bfb96748f6f4b67657b03da069b3a68c36069f3db73d0a"
+    },
+    "wheelhouse/httpx2-2.13.1-py3-none-any.whl": {
+      "kind": "file",
+      "bytes": 95597,
+      "sha256": "6dff50fabc270ee5fd25d845d0b078ed20564579744d6d962850975996d2f9a4"
+    },
+    "wheelhouse/idna-3.20-py3-none-any.whl": {
+      "kind": "file",
+      "bytes": 69583,
+      "sha256": "ab7ae7122974553370f0bdb919e1a960b2cd1bc1ef0276416d896db81c14582c"
+    },
+    "wheelhouse/jarvis_control_plane-0.3.2-py3-none-any.whl": {
+      "kind": "file",
+      "bytes": 431726,
+      "sha256": "4c0e295efabb6d4ce205dcd5d2fdc4b525b534e290c1825ab2e4c6a75f3c467f"
+    },
+    "wheelhouse/jsonschema-4.26.0-py3-none-any.whl": {
+      "kind": "file",
+      "bytes": 90630,
+      "sha256": "d489f15263b8d200f8387e64b4c3a75f06629559fb73deb8fdfb525f2dab50ce"
+    },
+    "wheelhouse/jsonschema_specifications-2025.9.1-py3-none-any.whl": {
+      "kind": "file",
+      "bytes": 18437,
+      "sha256": "98802fee3a11ee76ecaca44429fda8a41bff98b00a0f2838151b113f210cc6fe"
+    },
+    "wheelhouse/markdown_it_py-4.2.0-py3-none-any.whl": {
+      "kind": "file",
+      "bytes": 91687,
+      "sha256": "9f7ebbcd14fe59494226453aed97c1070d83f8d24b6fc3a3bcf9a38092641c4a"
+    },
+    "wheelhouse/mcp-2.3.0-py3-none-any.whl": {
+      "kind": "file",
+      "bytes": 368664,
+      "sha256": "dd0c44c089d16453e8ae31a3877a0054d7a2314caaa81f5e0541b9b1734b2377"
+    },
+    "wheelhouse/mcp_types-2.3.0-py3-none-any.whl": {
+      "kind": "file",
+      "bytes": 69108,
+      "sha256": "968efdbdaedfab06adae40d378a34395f1090c5921d4be3c9cde283aaf76d91d"
+    },
+    "wheelhouse/mdurl-0.1.2-py3-none-any.whl": {
+      "kind": "file",
+      "bytes": 9979,
+      "sha256": "84008a41e51615a49fc9966191ff91509e3c40b939176e643fd50a5c2196b8f8"
+    },
+    "wheelhouse/opentelemetry_api-1.45.1-py3-none-any.whl": {
+      "kind": "file",
+      "bytes": 60256,
+      "sha256": "b31553efa588ae44bc306f863c785c5333a9ecc091248c6ee68b4b6c87fdedfb"
+    },
+    "wheelhouse/pip-26.2.1-py3-none-any.whl": {
+      "kind": "file",
+      "bytes": 1816632,
+      "sha256": "71138adf1f4ca900cdb7d289c21b7494329f2332b6d85f0e1c42108c0384ed3e"
+    },
+    "wheelhouse/pycparser-3.11-py3-none-any.whl": {
+      "kind": "file",
+      "bytes": 51178,
+      "sha256": "51d5a8ba2be0bbe440b99d2112604c95bbbc3c2748a64260186c541e1729cd80"
+    },
+    "wheelhouse/pydantic-2.14.1-py3-none-any.whl": {
+      "kind": "file",
+      "bytes": 488106,
+      "sha256": "9195d967ec791692a04438115466764fb8b9a27b31f14a760437694f40d6b454"
+    },
+    "wheelhouse/pydantic_core-2.50.1-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl": {
+      "kind": "file",
+      "bytes": 2160157,
+      "sha256": "93ba4e9d8210d941c200431a56b2c0400b131865947903937ed3ec5404307d2e"
+    },
+    "wheelhouse/pygments-2.21.0-py3-none-any.whl": {
+      "kind": "file",
+      "bytes": 1250147,
+      "sha256": "2363c69b61c4a97c838da3b130dcd6468f4848992b21a82f2a63ec34377137d9"
+    },
+    "wheelhouse/pyjwt-2.15.1-py3-none-any.whl": {
+      "kind": "file",
+      "bytes": 33860,
+      "sha256": "42d59d631f7768a1028a64c7ff581a9bf7519804daf91fc5b6c56e30eec5e193"
+    },
+    "wheelhouse/python_dotenv-1.2.4-py3-none-any.whl": {
+      "kind": "file",
+      "bytes": 23266,
+      "sha256": "42269a8a5b3fd54ffa6f3d84b18abed50064717576b4ecf03dc4a55d8aa04fdc"
+    },
+    "wheelhouse/python_multipart-0.0.32-py3-none-any.whl": {
+      "kind": "file",
+      "bytes": 30042,
+      "sha256": "ff6d3f776f16878c894e52e107296ffc890e913c611b1a4ec6c44e2821fe2e23"
+    },
+    "wheelhouse/referencing-0.37.0-py3-none-any.whl": {
+      "kind": "file",
+      "bytes": 26766,
+      "sha256": "381329a9f99628c9069361716891d34ad94af76e461dcb0335825aecc7692231"
+    },
+    "wheelhouse/rich-15.0.0-py3-none-any.whl": {
+      "kind": "file",
+      "bytes": 310654,
+      "sha256": "33bd4ef74232fb73fe9279a257718407f169c09b78a87ad3d296f548e27de0bb"
+    },
+    "wheelhouse/rpds_py-2026.9.1-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl": {
+      "kind": "file",
+      "bytes": 371261,
+      "sha256": "addeda51556dac7c1a2f14cda62db8b621cd12afba3091d03a96c72932387eab"
+    },
+    "wheelhouse/setuptools-80.9.0-py3-none-any.whl": {
+      "kind": "file",
+      "bytes": 1201486,
+      "sha256": "062d34222ad13e0cc312a4c02d73f059e86a4acbfbdea8f8f76b28c99f306922"
+    },
+    "wheelhouse/shellingham-1.5.4-py2.py3-none-any.whl": {
+      "kind": "file",
+      "bytes": 9755,
+      "sha256": "7ecfff8f2fd72616f7481040475a65b2bf8af90a56c89140852d1120324e8686"
+    },
+    "wheelhouse/sse_starlette-3.5.0-py3-none-any.whl": {
+      "kind": "file",
+      "bytes": 17407,
+      "sha256": "3e6e1070df3f0f5d9cea81496de92dbb72f6721871d99748ece67441dd8b7997"
+    },
+    "wheelhouse/starlette-1.8.0-py3-none-any.whl": {
+      "kind": "file",
+      "bytes": 79612,
+      "sha256": "dfdd6b29c26483288088d990eee59631dedadd66ce20d203402a7ca8e3c4656f"
+    },
+    "wheelhouse/truststore-0.10.5-py3-none-any.whl": {
+      "kind": "file",
+      "bytes": 19017,
+      "sha256": "9aaaedaefaf06d8b206278cf8b5012bc897f485a874503501e12d776df78951c"
+    },
+    "wheelhouse/typer-0.27.3-py3-none-any.whl": {
+      "kind": "file",
+      "bytes": 123312,
+      "sha256": "e50022f28b82a86313e54501317a1db64bf8f8d036ff8cfe5ca7e47675454aff"
+    },
+    "wheelhouse/typing_extensions-4.16.0-py3-none-any.whl": {
+      "kind": "file",
+      "bytes": 45571,
+      "sha256": "481caa481374e813c1b176ada14e97f1f67a4539ce9cfeb3f350d78d6370c2e8"
+    },
+    "wheelhouse/typing_inspection-0.4.4-py3-none-any.whl": {
+      "kind": "file",
+      "bytes": 14750,
+      "sha256": "65b8397ba37ccbce054456aaccddfc91e6e3083c92824df348d96ca832f3f147"
+    },
+    "wheelhouse/uvicorn-0.54.0-py3-none-any.whl": {
+      "kind": "file",
+      "bytes": 87427,
+      "sha256": "505bdb0f318731d45f1f712071fc781a8981f6847a31c902c9f5e652d4f67faf"
+    },
+    "wheelhouse/wheel-0.45.1-py3-none-any.whl": {
+      "kind": "file",
+      "bytes": 72494,
+      "sha256": "708e7481cc80179af0e556bbf0cc00b8444c7321e2700b8d8580231d13017248"
+    }
+  },
+  "validation": {
+    "unit_tests": 50,
+    "offline_integration_tests": 7,
+    "archive_isolated_install": "passed",
+    "sdk_smoke": "passed",
+    "live_execution_verified": false,
+    "installer_r2_independent_audit": "passed"
+  },
+  "release_asset_uploaded": false,
+  "installer_revision": "r2"
+}

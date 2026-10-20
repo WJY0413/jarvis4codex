@@ -2,6 +2,7 @@
 from __future__ import annotations
 from contextlib import contextmanager, ExitStack
 from datetime import datetime, timezone
+import errno
 import hashlib
 import json
 import os
@@ -16,6 +17,10 @@ MARKER = "cancellation.json"
 
 class DispatchCancelledBeforeSend(RuntimeError):
     """This exact turn command was never committed or written to the native pipe."""
+
+
+class StateGateBusy(RuntimeError):
+    """Gate acquisition timed out; no protected operation has started."""
 
 
 class GenerationRetired(RuntimeError):
@@ -315,9 +320,12 @@ def report_guard(path: Path, timeout: float = 0.2):
         while True:
             try:
                 acquire(); break
-            except (BlockingIOError, OSError):
+            except OSError as exc:
+                # Only genuine lock contention is retryable, never arbitrary I/O errors.
+                if exc.errno not in {errno.EAGAIN, errno.EWOULDBLOCK, errno.EACCES}:
+                    raise
                 if time.monotonic() >= deadline:
-                    raise RuntimeError("state gate is busy; protected operation did not complete")
+                    raise StateGateBusy("state gate is busy; protected operation did not complete") from exc
                 time.sleep(0.01)
         try: yield
         finally: release()

@@ -2000,12 +2000,14 @@ class StandardBridgeHeartbeatTransport:
     name = "jarvis-existing-codex-thread"
 
     def __init__(self, config: HeartbeatConfig, controller: WakeController, bridge: Any,
-                 *, execution_reader: Callable[[str, str], dict[str, Any] | None] | None = None):
+                 *, execution_reader: Callable[[str, str], dict[str, Any] | None] | None = None,
+                 exact_reader: Callable[..., tuple[dict[str, Any], str]] | None = None):
         self.config = config
         self.controller = controller
         self.bridge = bridge
         self.launcher_config = NativeTaskLauncherConfig(config.launcher_config_path)
         self.execution_reader = execution_reader
+        self.exact_reader = exact_reader  # Optional owned serialized read-only client.
 
     def health(self) -> dict[str, object]:
         return {"adapter": self.name, "status": "configured"}
@@ -2052,14 +2054,20 @@ class StandardBridgeHeartbeatTransport:
                   if metadata_path else response.get("thread"))
         if not isinstance(thread, dict) or str(thread.get("id") or "") != thread_id:
             raise HeartbeatError("standard Bridge thread/read identity mismatch")
+        from adapters.codex_app_server.native_execution_evidence import classify_native_turn
+        def observed_execution_status(turn):
+            status = WakeController.status_text(turn.get("status"))
+            if status in {"completed", "failed", "interrupted"}:
+                return classify_native_turn(thread_id, str(turn.get("id") or ""), turn,
+                    observed_thread_id=thread_id, protocol_version=getattr(client, "cli_version", None))["status"]
+            return "unknown" if status.casefold() == "notloaded" else status
         turns = tuple(
             self.bridge.TurnState(
                 turn_id=str(turn.get("id") or ""),
                 status=WakeController.status_text(turn.get("status")),
                 items=tuple(item for item in (turn.get("items") or []) if isinstance(item, dict)),
                 error=str(turn.get("error")) if turn.get("error") is not None else None,
-                execution_status=("unknown" if WakeController.status_text(turn.get("status")).casefold()
-                                  in {"interrupted", "notloaded"} else WakeController.status_text(turn.get("status"))),
+                execution_status=observed_execution_status(turn),
                 execution_source="native_observer",
             )
             for turn in (thread.get("turns") or [])
@@ -2093,19 +2101,33 @@ class StandardBridgeHeartbeatTransport:
 
     def read_turn(self, thread_id: str, turn_id: str) -> dict[str, Any]:
         """One exact native turn, with explicitly separate owner evidence."""
-        client = AppServerClient(self.launcher_config)
-        client.read_only = True
         deadline = time.monotonic() + self.launcher_config.turn_readback_timeout_seconds
-        try:
-            client.start(deadline=deadline)
-            data = client.read_exact_turn(thread_id, turn_id, deadline=deadline)
-        finally:
-            client.close()
+        exact_reader = getattr(self, "exact_reader", None)
+        if exact_reader is not None:
+            # The shared reader returns the actual owning protocol version; all
+            # interpretation below remains the same formal authority classifier.
+            data, protocol_version = exact_reader(thread_id, turn_id, deadline=deadline)
+        else:
+            client = AppServerClient(self.launcher_config)
+            client.read_only = True
+            try:
+                client.start(deadline=deadline)
+                data = client.read_exact_turn(thread_id, turn_id, deadline=deadline)
+                protocol_version = getattr(client, "cli_version", None)
+            finally:
+                client.close()
         data["status"] = WakeController.status_text(data.get("status"))
         turn = data["turns"][0]
         native_status = turn["status"]
-        execution_status = "unknown" if native_status == "interrupted" else native_status
-        execution_source = "native_observer"
+        from adapters.codex_app_server.native_execution_evidence import classify_native_turn, OWNER_TERMINAL_EVIDENCE
+        native_evidence = classify_native_turn(thread_id, turn_id,
+            {"id": turn.get("turn_id"), "status": native_status,
+             "startedAt": turn.get("startedAt"), "completedAt": turn.get("completedAt"),
+             "error": turn.get("native_error")}, observed_thread_id=data.get("thread_id"),
+            protocol_version=protocol_version)
+        execution_status = native_evidence["status"]
+        execution_source = native_evidence["witness_source"] or "native_observer"
+        data["native_terminal_evidence"] = native_evidence
         evidence = None
         reader = getattr(self, "execution_reader", None)
         if reader is not None:
@@ -2126,7 +2148,16 @@ class StandardBridgeHeartbeatTransport:
                     or (native_status == "interrupted" and owner_status in
                         {"interrupted", "cancelled", "canceled"})
                 )
-                if owner_terminal and compatible:
+                normalized_unknown = (data.get("thread_id") == thread_id and data.get("turn_id") == turn_id
+                    and turn.get("turn_id") == turn_id and native_status == "interrupted" and turn.get("completedAt") is None
+                    and turn.get("native_error") is None and native_evidence["terminal_confirmed"] is False
+                    and native_evidence.get("protocol_version") == "0.159.2")
+                exact_owner_terminal = (evidence.get("source") == "hold_terminal_result"
+                    and isinstance(evidence.get("request_id"), str) and bool(evidence["request_id"])
+                    and isinstance(evidence.get("hold_id"), str) and bool(evidence["hold_id"])
+                    and evidence.get("terminal_evidence") in OWNER_TERMINAL_EVIDENCE
+                    and owner_status in {"completed", "failed", "interrupted", "cancelled", "canceled", "blocked"})
+                if owner_terminal and (compatible or (normalized_unknown and exact_owner_terminal)):
                     execution_status = owner_status
                     execution_source = str(evidence.get("source") or "hold_evidence")
                 else:

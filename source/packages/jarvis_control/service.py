@@ -587,7 +587,10 @@ class JarvisControl:
                 return self._receipt(
                     "jarvis_read", "completed", target_thread_id=task_id, turn_id=turn_id, data=data,
                     readback={"verified": True,
-                              "native_terminal": turns[0]["status"] in {"completed", "failed", "interrupted"},
+                              "native_terminal": (isinstance(data.get("native_terminal_evidence"), dict)
+                                  and data["native_terminal_evidence"].get("thread_id") == task_id
+                                  and data["native_terminal_evidence"].get("turn_id") == turn_id
+                                  and data["native_terminal_evidence"].get("terminal_confirmed") is True),
                               "terminal": data.get("execution_status") in
                                   {"completed", "failed", "interrupted", "cancelled", "canceled", "blocked"},
                               "final_answer_present": turns[0].get("final_answer_present") is True,

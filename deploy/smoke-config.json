@@ -1,0 +1,27 @@
+{
+  "launcher.json": {
+    "version": 1,
+    "dispatcher_thread_id": "mcp-readonly-test-no-real-thread",
+    "codex_cli": "",
+    "profile": "existing-auth-not-invoked",
+    "expected_codex_home": "",
+    "live_creation_enabled": false,
+    "allowed_projects": {}
+  },
+  "local-heartbeat.json": {
+    "db_path": "../state/local-heartbeats.sqlite",
+    "health_path": "../state/local-heartbeat-health.json",
+    "poll_seconds": 5,
+    "min_interval_seconds": 30,
+    "max_interval_seconds": 2592000
+  },
+  "transport.json": {
+    "db_path": "../state/bridge-heartbeats.sqlite",
+    "health_path": "../state/bridge-health.json",
+    "lock_path": "../state/bridge.lock",
+    "native_task_launcher_config": "launcher.json",
+    "heartbeat_contracts_dir": "../state/heartbeat-contracts",
+    "desktop_recovery_enabled": false,
+    "standard_bridge_package_root": ""
+  }
+}

@@ -27,7 +27,7 @@ from jarvis_schema import MAX_CONCURRENCY
 from jarvis_runtime.coo_dispatcher_store import ProcessLock
 from jarvis_runtime.jarvis_native_task_launcher import AppServerClient, NativeTaskLauncherConfig
 
-BUILD = "Jarvis 0.3.1 Linux (candidate)"
+BUILD = "Jarvis 0.3.2 Linux (candidate)"
 ALLOWED_ITEMS = {"userMessage", "agentMessage", "reasoning", "contextCompaction", "webSearch", "dynamicToolCall"}
 
 DEFAULT_SEAT_COUNT = 10

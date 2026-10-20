@@ -56,11 +56,11 @@ class NativePredictor:
     def __init__(self, client, receipt_dir: Path, config_loader):
         self.client, self.root, self.config_loader = client, receipt_dir, config_loader
 
-    def predict(self, *, thread_id, request_id, source_turn_id=None):
+    def predict(self, *, thread_id, request_id, source_turn_id=None, model=None):
         if not isinstance(request_id, str) or not request_id.strip() or not thread_id:
             return {"status":"invalid_request", "reason":"thread_id and request_id are required"}
         path = self.root / (hashlib.sha256(request_id.encode()).hexdigest() + ".json")
-        binding = {"thread_id":thread_id, "source_turn_id":source_turn_id}
+        binding = {"thread_id":thread_id, "source_turn_id":source_turn_id, "model":model}
         path.parent.mkdir(parents=True, exist_ok=True)
         with ProcessLock(path.with_suffix(".lock")):
             if path.exists():
@@ -75,6 +75,16 @@ class NativePredictor:
             record = {"binding":binding, "result":result}
             parent_id = None
             dispatch_attempted = False
+            rpc_context = {"phase": "source_read", "thread_id": thread_id, "method": None}
+            def request(method, params, **kwargs):
+                rpc_context.update(phase="rpc", method=method, thread_id=params.get("threadId"))
+                return self.client.request(method, params, **kwargs)
+            def error_binding(source):
+                return {"request_id": request_id, "source_thread_id": thread_id,
+                        "source_turn_id": result.get("source_turn_id"),
+                        "prediction_thread_id": result.get("prediction_thread_id"),
+                        "prediction_turn_id": result.get("prediction_turn_id"),
+                        "model": result.get("requested_model"), "source": source}
             try:
                 source = latest_turn(self.client, thread_id)
                 result["source_turn_id"] = source["id"]
@@ -82,38 +92,70 @@ class NativePredictor:
                     return {**result, "status":"stale"}
                 if source.get("status") != "completed":
                     return {**result, "status":"waiting" if source.get("status") in {"inProgress","running"} else "source_not_completed"}
+                # Never inherit the helper server's default model. A task's explicit
+                # model wins; standalone prediction requires source metadata proof.
+                expected_model = model
+                if expected_model is None:
+                    source_thread = request("thread/read", {
+                        "threadId":thread_id, "includeTurns":False}).get("thread", {})
+                    if source_thread.get("id") != thread_id:
+                        raise ValueError("source thread identity mismatch")
+                    expected_model = source_thread.get("model")
+                if not isinstance(expected_model, str) or not expected_model.strip():
+                    raise ValueError("prediction model is unknown; specify the task model or read back source model metadata")
+                result["requested_model"] = expected_model
                 config = self.config_loader()
+                def reject_before_helper(status, reason):
+                    # This branch precedes the first fork and every helper/research send.
+                    config_digest = hashlib.sha256(json.dumps(config, sort_keys=True,
+                        separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
+                    result.update(status=status, reason=reason, pre_helper_rejection={
+                        "schema": "jarvis-prediction-pre-helper-rejection/v1",
+                        "request_id": request_id, "source_thread_id": thread_id,
+                        "source_turn_id": source["id"], "model": expected_model,
+                        "config_sha256": config_digest, "prompt_version": config.get("prompt_version"),
+                        "rejection": status, "helper_fork_attempted": False,
+                        "helper_dispatch_attempted": False, "research_dispatch_attempted": False})
+                    _save(path, record)
+                    return result
                 if config.get("is_enabled") is not True:
-                    return {**result, "status":"disabled"}
+                    return reject_before_helper("disabled", "official prediction configuration disabled")
                 if not config.get("prompt") or not config.get("prediction_reasoning_effort") or not config.get("prompt_version"):
-                    raise ValueError("official prediction configuration is incomplete")
+                    return reject_before_helper("failed", "official prediction configuration is incomplete")
+                if expected_model in config.get("unsupported_models", []):
+                    return reject_before_helper("unsupported", "requested prediction model is unsupported")
                 _save(path, record)  # Crash/timeout after this point is not permission to regenerate.
-                parent = self.client.request("thread/fork", {"threadId":thread_id, "lastTurnId":source["id"],
+                parent = request("thread/fork", {"threadId":thread_id, "lastTurnId":source["id"],
                     "ephemeral":False, "deferGoalContinuation":True, "threadSource":"composer_predictions",
-                    "excludeTurns":True, "sandbox":"read-only", "approvalPolicy":"never"})
+                    "excludeTurns":True, "sandbox":"read-only", "approvalPolicy":"never",
+                    "model":expected_model, "modelProvider":"openai"})
                 parent_id = parent["thread"]["id"]
                 result["parent_thread_id"] = parent_id
                 _save(path, record)
-                fork = self.client.request("thread/fork", {"threadId":parent_id, "ephemeral":True,
-                    "experimentalPredictionMode":True, "threadSource":"composer_predictions", "excludeTurns":True})
+                if parent.get("model") != expected_model or parent.get("modelProvider") != "openai":
+                    raise ValueError("prediction parent model/provider mismatch; no helper turn dispatched")
+                fork = request("thread/fork", {"threadId":parent_id, "ephemeral":True,
+                    "experimentalPredictionMode":True, "threadSource":"composer_predictions", "excludeTurns":True,
+                    "model":expected_model, "modelProvider":"openai"})
                 prediction_id = fork["thread"]["id"]
                 result.update(prediction_thread_id=prediction_id, model=fork.get("model"),
                               model_provider=fork.get("modelProvider"), prompt_version=config["prompt_version"])
-                if (fork.get("modelProvider") != "openai" or fork.get("model") in config.get("unsupported_models", [])
+                if (fork.get("modelProvider") != "openai" or fork.get("model") != expected_model
+                        or fork.get("model") in config.get("unsupported_models", [])
                         or fork["thread"].get("ephemeral") is not True):
-                    result["status"] = "unsupported"
+                    result.update(status="unsupported", reason="prediction helper model/provider or ephemeral identity mismatch; no helper turn dispatched")
                 else:
                     schema = {"type":"object", "properties":{"suggestion":{"type":["string","null"]}},
                               "required":["suggestion"], "additionalProperties":False}
                     # The source Hold's dispatch journal must never bind a helper turn.
                     original_gate = getattr(self.client, "before_turn_dispatch", None)
                     def prediction_gate(params):
-                        if params.get("threadId") != prediction_id:
+                        if params.get("threadId") != prediction_id or params.get("model") != expected_model:
                             raise RuntimeError("prediction dispatch target mismatch")
                     self.client.before_turn_dispatch = prediction_gate
                     try:
                         dispatch_attempted = True
-                        started = self.client.request("turn/start", {"threadId":prediction_id,
+                        started = request("turn/start", {"threadId":prediction_id, "model":expected_model,
                             "input":[{"type":"text", "text":config["prompt"] + "\n\nReturn only JSON matching this schema: " + json.dumps(schema), "text_elements":[]}],
                             "effort":config["prediction_reasoning_effort"], "outputSchema":schema})
                     finally:
@@ -121,32 +163,43 @@ class NativePredictor:
                     turn_id = started["turn"]["id"]
                     result["prediction_turn_id"] = turn_id
                     _save(path, record)
+                    rpc_context.update(phase="owner_terminal_wait", method=None, thread_id=prediction_id)
                     terminal = self.client.wait_for_turn_terminal(prediction_id, turn_id)
                     result["prediction_terminal_confirmed"] = (terminal.get("id") == turn_id
                         and terminal.get("status") in {"completed", "failed", "interrupted"})
+                    if result["prediction_terminal_confirmed"]:
+                        result["prediction_terminal_status"] = terminal["status"]
+                        if terminal["status"] in {"failed", "interrupted"} and isinstance(terminal.get("error"), dict):
+                            result["native_error"] = json.loads(json.dumps(terminal["error"]))
+                            result["error_binding"] = error_binding("owner_turn_completed")
                     if terminal.get("id") != turn_id or terminal.get("status") != "completed":
                         raise RuntimeError("prediction turn completion unverified")
                     messages = [item.get("text", "") for item in terminal.get("items", [])
                                 if item.get("type") == "agentMessage" and item.get("phase") == "final_answer"]
                     # Ephemeral predictions already carry the final answer in turn/completed.
+                    rpc_context.update(phase="helper_readback", method=None, thread_id=prediction_id)
                     raw = messages[-1] if messages else self.client.wait_for_turn_readback(prediction_id, turn_id)
                     output = json.loads(raw)
                     if not isinstance(output, dict) or set(output) != {"suggestion"} or not (output["suggestion"] is None or isinstance(output["suggestion"], str)):
                         raise ValueError("invalid native prediction output")
                     result["suggestion"] = output["suggestion"]
+                    rpc_context.update(phase="source_read", method=None, thread_id=thread_id)
                     current = latest_turn(self.client, thread_id)
                     result["source_unchanged"] = current == source
                     result["status"] = ("stale" if not result["source_unchanged"] else
                                         "completed" if output["suggestion"] and output["suggestion"].strip() else "no_prediction")
             except Exception as exc:
                 rpc_error = getattr(exc, "rpc_error", None)
+                if isinstance(rpc_error, dict):
+                    result["rpc_error"] = json.loads(json.dumps(rpc_error))
+                    result["rpc_error_binding"] = {**error_binding("native_rpc_error"), **rpc_context}
                 unsupported = isinstance(rpc_error, dict) and rpc_error.get("code") == -32601
                 result.update(status="requires_readback" if dispatch_attempted and not result["prediction_terminal_confirmed"]
                     else "unsupported" if unsupported else "failed", reason=str(exc))
             finally:
                 if parent_id:
                     try:
-                        self.client.request("thread/archive", {"threadId":parent_id})
+                        request("thread/archive", {"threadId":parent_id})
                         result["parent_archived"] = True
                         result["cleanup_completed"] = not dispatch_attempted or result["prediction_terminal_confirmed"]
                     except Exception:
@@ -157,7 +210,7 @@ class NativePredictor:
 
 
 def prepare_prediction_prompt(client, *, thread_id, request_id, options, receipt_dir,
-                              source_turn_id=None, stop_requested=None):
+                              source_turn_id=None, stop_requested=None, model=None):
     client.start()
     if source_turn_id is None:
         deadline = time.monotonic() + client.config.turn_completion_timeout_seconds
@@ -180,7 +233,7 @@ def prepare_prediction_prompt(client, *, thread_id, request_id, options, receipt
         return {"status":"cancelled"}
     home = Path(client.config.expected_codex_home)
     result = NativePredictor(client, Path(receipt_dir), lambda: official_prediction_config(home)).predict(
-        thread_id=thread_id, request_id=request_id, source_turn_id=source_turn_id)
+        thread_id=thread_id, request_id=request_id, source_turn_id=source_turn_id, model=model)
     if result["status"] == "completed":
         source = latest_turn(client, thread_id)
         if source.get("id") != source_turn_id or source.get("status") != "completed":

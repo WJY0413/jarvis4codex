@@ -15,6 +15,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from jarvis_schema import MAX_CONCURRENCY
+from jarvis_runtime.business_quarantine_gate import dispatch_scope, require_not_abandoned, management_view
 
 from jarvis_runtime.coo_dispatcher_store import ProcessLock, read_shared
 from jarvis_runtime.cancellation import (
@@ -138,14 +139,45 @@ class CodexAppServerTaskProvisioningAdapter:
         self._pid_started_at = pid_started_at or _pid_started_at
         self._recovery_backend = recovery_backend  # Internal trusted dependency; never read from caller/model input.
 
+    def _quarantine_config(self, *, require_file=False):
+        # Pure metadata read, not CLI resolution or Host initialization.
+        from types import SimpleNamespace
+        from jarvis_runtime.business_quarantine import QuarantineError
+        try:
+            raw = json.loads(self._config_path.read_text()) if (require_file or self._config_path.is_file()) else {}
+            if not isinstance(raw, dict):
+                raise ValueError("launcher metadata must be an object")
+            binding = raw.get("business_quarantine_file")
+            generation_id = raw.get("scheduling_generation_id")
+            if generation_id is not None and (not isinstance(generation_id, str) or not re.fullmatch(r"budget-[a-f0-9]{64}", generation_id) or not binding):
+                raise ValueError("invalid scheduling generation binding")
+            if hasattr(self, "_scheduling_generation_binding") and generation_id != self._scheduling_generation_binding:
+                raise ValueError("scheduling generation changed during adapter lifetime")
+            self._scheduling_generation_binding = generation_id
+            if binding is not None and (not isinstance(binding, str) or not Path(binding).is_absolute()):
+                raise ValueError("invalid quarantine binding")
+            if hasattr(self, "_quarantine_binding") and binding != self._quarantine_binding:
+                raise ValueError("quarantine binding changed during adapter lifetime")
+            self._quarantine_binding = binding
+        except (OSError, ValueError, TypeError) as exc:
+            raise QuarantineError("launcher quarantine metadata unavailable or changed") from exc
+        return SimpleNamespace(business_quarantine_file=binding, scheduling_generation_id=generation_id)
+
     def provision(self, request: TaskProvisionRequest) -> TaskProvisionReceipt:
         try:
             config = self._config_loader(self._config_path)
             project, project_path = config.resolve_project(request.project)
             require_memory_admission(config)
             hold_id = request.hold_id or f"hold-{request.request_id}"
+            with dispatch_scope(config, self._state_dir, {**request.__dict__, "hold_id": hold_id}):
+                pass
             paths = self._paths(hold_id)
             with _hold_guard(paths["request"].parent):
+                if (paths["request"].parent / "owner-control.json").exists():
+                    raise RuntimeError("original control ledger exists; use exact query-stop, never reprovision")
+                controlled = getattr(config, "owner_control_enabled", False)
+                if controlled and (request.max_turns != 1 or request.auto_continue):
+                    raise RuntimeError("owner control currently supports one finite turn only")
                 require_dispatch_open(paths["request"].parent)
                 _write_json(paths["request"], {
                     "mode": "create",
@@ -166,6 +198,8 @@ class CodexAppServerTaskProvisioningAdapter:
                     "turn_history_path": str(self._state_dir / "turn-history.sqlite"),
                     "initial_turn_count": 1,
                     "initial_total_turn_count": 1,
+                    **({"owner_control": {"schema": "jarvis-owner-control-request/v1", "attempt": 1}}
+                       if controlled else {}),
                 })
                 _write_json(paths["ack"], _accepted_ack(
                     request_id=request.request_id,
@@ -340,6 +374,16 @@ class CodexAppServerTaskProvisioningAdapter:
         health = self.hold_host_health(required_workers=required_workers)
         if health.get("status") == "ready":
             return {"status": "ready", "phase": "already_running"}
+        # A PID from another exec namespace can be absent or reused locally.
+        # Failed identity/liveness checks never prove the registry owner exited.
+        health_path = self._state_dir / "hold-host.json"
+        if health_path.exists() or health_path.is_symlink():
+            owner_health = self.hold_host_health(required_workers=1)
+            if owner_health.get("status") != "ready":
+                return {**owner_health, "error_code": "host_owner_unverified",
+                        "reason": "Existing HoldHost ownership cannot be verified; automatic start is blocked. "
+                                  "Run readiness from the owning host environment or use an isolated state directory.",
+                        "identity_reason": owner_health.get("reason", "unknown")}
         try:
             started = self._host_initializer(
                 state_dir=self._state_dir,
@@ -361,6 +405,11 @@ class CodexAppServerTaskProvisioningAdapter:
         from .prediction import NativePredictor, official_prediction_config
         from jarvis_runtime.jarvis_native_task_launcher import AppServerClient
         config = self._config_loader(self._config_path)
+        require_not_abandoned(config, self._state_dir, {"thread_id": thread_id, "request_id": request_id})
+        with dispatch_scope(config, self._state_dir, {"thread_id": thread_id, "request_id": request_id}):
+            pass
+        if getattr(config, "owner_control_enabled", False):
+            return {"status": "blocked", "reason": "owner control supports new finite tasks, not unledgered prediction helpers"}
         if not self.creation_enabled():
             return {"status":"disabled", "reason":"live creation is disabled for this deployment"}
         require_memory_admission(config)
@@ -373,10 +422,33 @@ class CodexAppServerTaskProvisioningAdapter:
         finally:
             client.close()
 
+    def query_owner_control(self, *, hold_id: str, action: str = "query") -> dict[str, Any]:
+        """Explicit original-owner query/stop, without Host/server bootstrap."""
+        from jarvis_runtime.owner_control_ledger import query_stop
+        paths = self._existing_paths(hold_id)
+        if paths is None:
+            return {"status": "unavailable", "reason": "exact Hold does not exist",
+                    "terminal_confirmed": False, "hold_released": False}
+        root = paths["request"].parent
+        try:
+            require_not_abandoned(self._quarantine_config(), self._state_dir,
+                                  _read_json_file(root / "request.json") or {"hold_id": hold_id})
+            result = query_stop(root, action, quarantine_config=self._quarantine_config(require_file=True))
+        except Exception as exc:
+            result = {"status": "unavailable", "reason": str(exc),
+                      "terminal_confirmed": False, "hold_released": False}
+        if result.get("request_id"):
+            refresh_close_report(root, result)
+        return result
+
     def resume_with_monitor(self, request: TaskMonitorResumeRequest) -> TaskProvisionReceipt:
         try:
             config = self._config_loader(self._config_path)
+            if getattr(config, "owner_control_enabled", False):
+                raise RuntimeError("owner control supports new finite tasks only; cold resume is forbidden")
             hold_id = request.hold_id or request.monitor_id or f"hold-{request.request_id}"
+            with dispatch_scope(config, self._state_dir, {**request.__dict__, "hold_id": hold_id, "thread_id": request.task_id}):
+                pass
             hint_root = self._state_dir / "task-holds" / _safe_id(hold_id)
             known_roots = dispatch_roots(hint_root, {"thread_id": request.task_id})
             ancestors = {_state_reference(root, self._state_dir) for root in known_roots if root != hint_root}
@@ -391,6 +463,8 @@ class CodexAppServerTaskProvisioningAdapter:
             if request.prediction_options:
                 declaration["prediction_options"] = dict(request.prediction_options)
             paths = self._existing_paths(hold_id) or self._paths_at(hint_root)
+            if (paths["request"].parent / "owner-control.json").exists():
+                raise RuntimeError("original control ledger exists; cold resume/transfer is forbidden")
             historical_root = paths["request"].parent / "history" / _safe_id(request.request_id)
             historical = _read_json_file(historical_root / "request.json")
             if historical is not None:
@@ -575,11 +649,27 @@ class CodexAppServerTaskProvisioningAdapter:
         return None
 
     def hold_status(self, hold_id: str) -> dict[str, Any]:
+        original = self._hold_status_unprojected(hold_id)
+        config = self._quarantine_config()
+        view = management_view(config, self._state_dir, {**original, "hold_id": hold_id})
+        return {**original, **({"business_management": view} if view else {})}
+
+    def _hold_status_unprojected(self, hold_id: str) -> dict[str, Any]:
         safe_id = _safe_id(str(hold_id))
         for root in (
             self._state_dir / "task-holds" / safe_id,
             self._state_dir / "task-monitors" / safe_id,
         ):
+            if (root / "owner-control.json").is_file():
+                from jarvis_runtime.owner_control_ledger import control_status
+                evidence = control_status(root)
+                # Control terminality is not business/output acceptance.
+                original = _read_json_file(root / "result.json") or _read_json_file(root / "ack.json") or {}
+                return {**original, **evidence, "owner_control": evidence,
+                        "status": original.get("status", "requires_readback"),
+                        "native_execution_status": evidence.get("status", "unknown"),
+                        "evidence_source": "exact_owner_control_ledger",
+                        "output_verification": original.get("output_verification", {"status": "not_checked"})}
             for path in (root / "result.json", root / "ack.json"):
                 if path.is_file():
                     try:
@@ -598,6 +688,13 @@ class CodexAppServerTaskProvisioningAdapter:
                         pause = current.get("resume_pause") or {}
                         if (pause.get("request_id") == current.get("request_id") == value.get("request_id")
                                 and pause.get("execution_state") == "stopped" and pause.get("original_generation_fenced") is True):
+                            if pause.get("permanent_retirement") is True:
+                                # A dispatch fence does not prove the accepted native turn ended.
+                                return {**value, "status": "paused", "logical_running": False,
+                                        "hold_released": False, "terminal_confirmed": False,
+                                        "execution_state": "unknown", "external_execution_unresolved": True,
+                                        "logical_owner_retired": True, "resume_pause": pause,
+                                        "evidence_source": "logical_dispatch_fence_only"}
                             return {**value, "status": "paused", "logical_running": False,
                                     "hold_released": False, "execution_state": "stopped", "resume_pause": pause}
                         mismatched = (current.get("request_id") and value.get("request_id") != current["request_id"]
@@ -625,6 +722,18 @@ class CodexAppServerTaskProvisioningAdapter:
     def monitor_status(self, monitor_id: str) -> dict[str, Any]:
         """Compatibility alias for lifecycle callers using the old field name."""
         return self.hold_status(monitor_id)
+
+    def native_turn_execution_evidence(self, thread_id: str, turn_id: str, native_turn: dict[str, Any],
+                                       *, observed_thread_id: str, protocol_version: str) -> dict[str, Any]:
+        """Classify a bound read response without releasing a Hold or writing state.
+
+        Callers must supply the actual configured native protocol version and RPC
+        thread identity. This API cannot promote a local logical fence to terminal.
+        """
+        from .native_execution_evidence import classify_native_turn
+        return classify_native_turn(thread_id, turn_id, native_turn,
+                                    observed_thread_id=observed_thread_id,
+                                    protocol_version=protocol_version)
 
     def thread_execution_evidence(self, thread_id: str, turn_id: str) -> dict[str, Any] | None:
         """Read existing owner receipts; a claim/PID never proves a running turn."""
@@ -666,6 +775,11 @@ class CodexAppServerTaskProvisioningAdapter:
         if len(exact) != 1 or not turn_id:
             return unknown
         root, request, ack, result = exact[0]
+        pause = request.get("resume_pause") or {}
+        if (pause.get("request_id") == request.get("request_id")
+                and pause.get("permanent_retirement") is True):
+            return {**unknown, "logical_owner_retired": True, "terminal_confirmed": False,
+                    "reason": "permanent dispatch fence is not accepted native execution terminal proof"}
         if any(other != root and not saved.get("terminal_confirmed")
                for other, _, _, saved in matches):
             return unknown
@@ -694,10 +808,16 @@ class CodexAppServerTaskProvisioningAdapter:
         if status not in {"completed", "failed", "cancelled", "canceled", "interrupted", "blocked"}:
             return evidence
         return {**evidence, "status": status, "source": "hold_terminal_result",
+                "request_id": request["request_id"], "terminal_evidence": result.get("terminal_evidence"),
                 "reason": result.get("reason"), "output_verification": verification,
                 "terminal_confirmed": True}
 
     def request_hold_stop(self, hold_id: str) -> dict[str, Any]:
+        from jarvis_runtime.business_quarantine_gate import control_scope
+        with control_scope(self._quarantine_config(require_file=True), self._state_dir, {"hold_id": hold_id}):
+            return self._request_hold_stop_allowed(hold_id)
+
+    def _request_hold_stop_allowed(self, hold_id: str) -> dict[str, Any]:
         """Latch stop intent in the existing request, serialized with turn dispatch."""
         paths = self._existing_paths(hold_id)
         if paths is None:
@@ -711,6 +831,11 @@ class CodexAppServerTaskProvisioningAdapter:
         return {"status": "stop_requested", "hold_id": hold_id}
 
     def close_hold(self, hold_id: str, *, request_id: str | None = None, parent_close=None) -> dict[str, Any]:
+        from jarvis_runtime.business_quarantine_gate import control_scope
+        with control_scope(self._quarantine_config(require_file=True), self._state_dir, {"hold_id": hold_id}):
+            return self._close_hold_allowed(hold_id, request_id=request_id, parent_close=parent_close)
+
+    def _close_hold_allowed(self, hold_id: str, *, request_id: str | None = None, parent_close=None) -> dict[str, Any]:
         """Cancel scheduling unconditionally; execution closure needs real owner evidence."""
         from adapters.codex_app_server.jarvis_hold_host_service import JarvisHoldHost
         paths = self._existing_paths(hold_id)
@@ -769,7 +894,10 @@ class CodexAppServerTaskProvisioningAdapter:
         except Exception as exc:
             data = {"request_id": binding, "hold_id": hold_id, "status": "unknown", "reason": str(exc)}
         action = {"status": "not_sent", "reason": "no exact current owner identity"}
-        if data.get("thread_id") and data.get("turn_id") and not data.get("hold_released"):
+        if (root / "owner-control.json").exists() and not data.get("hold_released"):
+            action = self.query_owner_control(hold_id=hold_id, action="stop")
+            data = self.hold_status(hold_id)
+        elif data.get("thread_id") and data.get("turn_id") and not data.get("hold_released"):
             try:
                 action = JarvisHoldHost(state_dir=self._state_dir, launcher_config=self._config_path).request_host_stop(
                     hold_id, data["thread_id"], data["turn_id"])
@@ -1088,12 +1216,19 @@ def refresh_close_report(root: Path, evidence: dict[str, Any], *, action=None, f
     with report_guard(root / ".close-report.guard"):
         report = _read_json_file(path) or {}
         request = _read_json_file(root / "request.json") or {}
+        controlled = (root / "owner-control.json").exists()
+        if controlled:
+            from jarvis_runtime.owner_control_ledger import control_status
+            # The old holder/process or non-dispatch heuristics must not bypass
+            # the ledger, even with a synthetic legacy backend injected.
+            control = control_status(root)
+            evidence = {**evidence, **control}
         if report.get("request_id") != request.get("request_id") or evidence.get("request_id") != request.get("request_id"):
             return report
         latest = _read_json_file(root / "result.json") or {}
         # A close caller can arrive after the Host with an older holding snapshot.
         # Prefer only exact persisted stopped-unknown evidence, never infer terminal.
-        if (latest.get("request_id") == request.get("request_id")
+        if (not controlled and latest.get("request_id") == request.get("request_id")
                 and latest.get("hold_id") == report.get("hold_id") == request.get("hold_id")
                 and all(latest.get(key) and evidence.get(key) in (None, "", latest[key])
                         and request.get(key) in (None, "", latest[key]) for key in ("thread_id", "turn_id"))
@@ -1104,9 +1239,9 @@ def refresh_close_report(root: Path, evidence: dict[str, Any], *, action=None, f
         released = evidence.get("hold_released") is True
         terminal = evidence.get("terminal_confirmed") is True
         no_claim = not (root / ".user-host-claim").exists()
-        not_sent = (evidence.get("dispatch_evidence") == "not_sent" and not evidence.get("turn_id")
+        not_sent = (not controlled and evidence.get("dispatch_evidence") == "not_sent" and not evidence.get("turn_id")
                     and evidence.get("local_observer_stopped") is True and no_claim)
-        if not_sent or report.get("non_dispatch_confirmed") is True:
+        if not_sent or (not controlled and report.get("non_dispatch_confirmed") is True):
             terminal, released = True, no_claim
         completed = terminal and released
         stopped = evidence.get("local_observer_stopped") is True and (
@@ -1127,7 +1262,7 @@ def refresh_close_report(root: Path, evidence: dict[str, Any], *, action=None, f
             fields["non_dispatch_confirmed"] = True
         if action is not None:
             fields["last_action"] = action
-        if report.get("report_status") == "completed" and not failure:
+        if report.get("report_status") == "completed" and not failure and not controlled:
             if report.get("parent_close"):
                 from jarvis_control.loop import LoopStore
                 LoopStore(root.parents[1] / "loops").record_child_close(report)
@@ -1165,7 +1300,8 @@ def _require_original_hold_selected(roots, target, thread_id):
             continue
         hold_id = request.get("hold_id") or request.get("monitor_id")
         close = _read_json_file(root / "close.json") or {}
-        owned_exit = (all(result.get(key) is True for key in ("holder_exit_confirmed", "holder_client_exit_confirmed"))
+        from jarvis_runtime.holder_transport_release import holder_transport_cleanup_confirmed
+        owned_exit = ((result.get("holder_exit_confirmed") is True and holder_transport_cleanup_confirmed(result, request))
             or (result.get("local_observer_stopped") is True and result.get("host_stop") is not True
                 and all(result.get(key) is not False for key in ("holder_exit_confirmed", "holder_client_exit_confirmed"))))
         release_proof = (result.get("hold_released") is True
@@ -1183,6 +1319,9 @@ def _require_original_hold_selected(roots, target, thread_id):
                 and ack.get("turn_id") in (None, "", result.get("turn_id"))))
             and result.get("status") in {"completed", "failed", "interrupted", "cancelled", "canceled", "blocked", "turn_limit_reached"}
             and result.get("terminal_confirmed") is True and release_proof
+            and (result.get("host_stop") is not True
+                 or (result.get("holder_exit_confirmed") is True
+                     and holder_transport_cleanup_confirmed(result, request)))
             and not request.get("resume_pause")
             and not (root / ".user-host-claim").exists())
         if not retired:
@@ -1401,6 +1540,9 @@ def _complete_original_transfer(paths, pause, roots, backend):
 
 
 def reconcile_original_generation(root, backend):
+    if (Path(root) / "owner-control.json").exists():
+        raise _OriginalRecoveryBlocked("owner_control_required",
+            "original control ledger requires exact query-stop; legacy backend recovery is forbidden")
     paths = CodexAppServerTaskProvisioningAdapter._paths_at(root)
     snapshot = _resume_snapshot(paths)
     request = _snapshot_json(snapshot, "request") or {}

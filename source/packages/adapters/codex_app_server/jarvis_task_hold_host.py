@@ -22,7 +22,7 @@ from jarvis_runtime.jarvis_native_task_launcher import AppServerClient, NativeTa
 from adapters.codex_app_server.jarvis_connection import route_for_model
 from adapters.codex_app_server.task_provisioning_adapter import append_terminal_turn_history, _count_scheduler_failed_items, verify_candidate_output, receive_candidate_final_answer, _pid_is_alive
 from jarvis_runtime.coo_dispatcher_store import ProcessLock
-from jarvis_runtime.cancellation import cancellation_path, commit_dispatch, DispatchCancelledBeforeSend
+from jarvis_runtime.cancellation import cancellation_path, commit_dispatch, DispatchCancelledBeforeSend, StateGateBusy, generation_guard
 from jarvis_control.provisioning import lane_batch_ids, lane_batch_size, final_answer_mode
 from jarvis_control.provisioning import validate_prediction_options
 from adapters.codex_app_server.prediction import prepare_prediction_prompt
@@ -30,6 +30,44 @@ from adapters.codex_app_server.prediction import prepare_prediction_prompt
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+def _client_transport_contiguous(client) -> bool:
+    """Owner event evidence needs an unbroken transport, not an owned Popen."""
+    health = getattr(client, "transport_health", None)
+    if callable(health):
+        try:
+            state = health()
+            if (isinstance(state, dict)
+                    and state.get("schema") == "jarvis-client-transport-health/v1"
+                    and state.get("mode") == "stdio"):
+                # Keep the existing stdio recorder guard unchanged. Protocol
+                # failures are separately recorded by its native event path.
+                process = getattr(client, "process", None)
+                return process is not None and process.poll() is None
+            return (isinstance(state, dict)
+                    and state.get("schema") == "jarvis-client-transport-health/v1"
+                    and state.get("connected") is True
+                    and state.get("contiguous") is True
+                    and state.get("failure") is None)
+        except Exception:
+            return False
+    # Preserve the pre-interface stdio adapter contract.
+    process = getattr(client, "process", None)
+    return process is not None and process.poll() is None
+
+
+def _client_observer_stopped(client, owned_process) -> bool:
+    """A closed attachment proves only its local observer stopped."""
+    health = getattr(client, "transport_health", None)
+    if callable(health):
+        try:
+            state = health()
+            return (isinstance(state, dict)
+                    and state.get("schema") == "jarvis-client-transport-health/v1"
+                    and state.get("local_connection_closed") is True)
+        except Exception:
+            return False
+    return owned_process is None or owned_process.poll() is not None
 
 
 class _HolderStopUnknown(RuntimeError):
@@ -44,19 +82,27 @@ class _RecoveredTurnTerminal(RuntimeError):
         self.status = status
 
 
-def _publish_generation(path: Path, value: dict[str, Any], request: dict[str, Any]) -> bool:
+def _publish_generation(path: Path, value: dict[str, Any], request: dict[str, Any], *, on_busy=None) -> bool:
     from jarvis_runtime.cancellation import generation_guard, GenerationRetired
     if (not isinstance(request, dict) or value.get("request_id") != request.get("request_id")
             or ((request.get("hold_id") or request.get("monitor_id")) is not None
                 and (value.get("hold_id") or value.get("monitor_id")) !=
                     (request.get("hold_id") or request.get("monitor_id")))):
         return False
-    try:
-        with generation_guard(path.parent, request):
-            _write_json(path, value)
-        return True
-    except GenerationRetired:
-        return False  # Preserve the successor and the old owner's historical evidence.
+    while True:
+        try:
+            with generation_guard(path.parent, request):
+                _write_json(path, value)
+            return True
+        except StateGateBusy:
+            # Receipt contention is not execution failure. Retain the owning client;
+            # retry only publication, acquiring all gates and rechecking generation.
+            # No deadline may turn missing terminal proof into owner release.
+            if on_busy is not None:
+                on_busy()
+            time.sleep(0.05)
+        except GenerationRetired:
+            return False  # Preserve the successor and the old owner's historical evidence.
 
 
 def _write_json(path: Path, value: dict[str, Any], *, durable: bool = False) -> None:
@@ -179,14 +225,59 @@ def _candidate_id(request: dict[str, Any], total_turn_count: int) -> int | None:
 
 
 def hold_task(
+    launcher_config_path: Path, request_path: Path, ack_path: Path, result_path: Path,
+    *, monitor: HoldTurnMonitor | None = None, diagnostic_sink=None,
+) -> int:
+    """Legacy by default; opted-in tasks keep the fence through local cleanup."""
+    from jarvis_runtime.owner_control_ledger import ControlLease, ControlUnavailable, control_requested
+    request = _read_json(request_path)
+    if not control_requested(request) and (request_path.parent / "owner-control.json").exists():
+        raise ControlUnavailable("existing owner control ledger cannot downgrade to legacy dispatch")
+    from types import SimpleNamespace
+    from jarvis_runtime.business_quarantine_gate import require_not_abandoned
+    raw_config = _read_json(launcher_config_path)
+    if not isinstance(raw_config, dict):
+        raise ValueError("launcher metadata must be a JSON object")
+    require_not_abandoned(SimpleNamespace(business_quarantine_file=raw_config.get("business_quarantine_file"), scheduling_generation_id=raw_config.get("scheduling_generation_id")),
+                          request_path.parent.parents[1], request)
+    if not control_requested(request):
+        if (request_path.parent / "owner-control.json").exists():
+            raise ControlUnavailable("existing owner control ledger cannot downgrade to legacy dispatch")
+        return _hold_task(launcher_config_path, request_path, ack_path, result_path,
+                          monitor=monitor, diagnostic_sink=diagnostic_sink)
+    config = NativeTaskLauncherConfig(launcher_config_path)
+    with ControlLease(request_path.parent) as lease:
+        # Existing ledger is NOT a new attempt, even if no ACK was published.
+        lease.create(request, config)
+        code = _hold_task(launcher_config_path, request_path, ack_path, result_path,
+                         monitor=monitor, diagnostic_sink=diagnostic_sink,
+                         owner_control_lease=lease, frozen_launcher_config=config)
+        saved = _read_json(result_path) if result_path.is_file() else {}
+        if saved.get("local_observer_stopped") is True and lease._terminal_valid():
+            lease.settle()
+        return code
+
+
+def _hold_task(
     launcher_config_path: Path,
     request_path: Path,
     ack_path: Path,
     result_path: Path,
     *,
     monitor: HoldTurnMonitor | None = None,
+    diagnostic_sink=None,
+    owner_control_lease=None,
+    frozen_launcher_config=None,
 ) -> int:
     request = _read_json(request_path)
+    from types import SimpleNamespace
+    from jarvis_runtime.business_quarantine_gate import dispatch_scope
+    raw_config = _read_json(launcher_config_path)
+    if not isinstance(raw_config, dict):
+        raise ValueError("launcher metadata must be a JSON object")
+    with dispatch_scope(SimpleNamespace(business_quarantine_file=raw_config.get("business_quarantine_file"), scheduling_generation_id=raw_config.get("scheduling_generation_id")),
+                        request_path.parent.parents[1], request):
+        pass  # Before report/lock/result publication: isolation is not task failure.
     request_id = str(request.get("request_id") or "").strip()
     max_turns = max(int(request.get("max_turns") or 1), 1)
     auto_continue = bool(request.get("auto_continue", False))
@@ -195,6 +286,7 @@ def hold_task(
     initial_turn_count = max(int(request.get("initial_turn_count") or 1), 1)
     initial_total_turn_count = max(int(request.get("initial_total_turn_count") or initial_turn_count), 1)
     client: AppServerClient | None = None
+    transport_health = None
     phase = "hold_started"
     terminal_confirmed = request.get("mode") != "recover"
     thread_id = str(request.get("thread_id") or "").strip()
@@ -205,6 +297,7 @@ def hold_task(
     interrupt_at: float | None = None
     host_stop_selected = False
     dispatch_evidence = "unknown" if request.get("mode") == "recover" else "not_sent"
+    pre_helper_rejection = None
 
     def runtime_fields() -> dict[str, Any]:
         # Legacy/mocked clients need not implement this optional contract.
@@ -216,12 +309,15 @@ def hold_task(
                    "environments", "environments_verified", "reasoningEffort", "codex_home", "codex_home_verified"}
         return {"runtime_context": {key: value for key, value in context.items() if key in allowed}}
 
-    def control_poll() -> None:
+    def control_poll(*, publish_interrupt: bool = True) -> None:
         nonlocal interrupt_at, host_stop_selected
         try:
             current = _read_json(request_path)
-            cancelled = cancellation_path(request_path.parent, current) is not None
-        except PermissionError:
+            control = current.get("host_stop")
+            # An explicit exact stop must not wait for unrelated alias snapshots.
+            cancelled = control is None and cancellation_path(request_path.parent, current) is not None
+        except (PermissionError, StateGateBusy):
+            # A busy alias gate or Windows sharing denial is not a stop signal.
             # Windows atomic replacement can briefly deny an alias ack read too.
             # Retry the whole observation next poll; do not interrupt or release.
             return
@@ -237,34 +333,62 @@ def hold_task(
         expected = {"request_id": request_id, "hold_id": hold_id, "thread_id": thread_id, "turn_id": turn_id}
         if (current.get("request_id") != request_id or not isinstance(control, dict)
                 or any(control.get(key) != value for key, value in expected.items())):
+            if not publish_interrupt:
+                return  # Defer the invalid stop; never lose the owner during publication.
             raise _HolderStopUnknown("Host stop identity conflict; no execution interrupt sent")
         host_stop_selected = True
+        if transport_health is not None:
+            try:
+                transport_health.stop(cancelled=cancelled)
+            except Exception:
+                pass
         if request.get("mode") == "recover":
             readback = client.request("thread/read", {"threadId": thread_id, "includeTurns": True})
             thread = readback.get("thread") or {}
             turns = thread.get("turns") or []
             exact = [turn for turn in turns if isinstance(turn, dict) and turn.get("id") == turn_id]
-            if (thread.get("id") == thread_id and len(exact) == 1
-                    and exact[0].get("status") in {"completed", "failed", "interrupted", "cancelled", "canceled"}
-                    and not any(isinstance(turn, dict) and turn.get("status") == "inProgress" for turn in turns)):
-                raise _RecoveredTurnTerminal(exact[0]["status"])
+            if len(exact) == 1:
+                from adapters.codex_app_server.native_execution_evidence import classify_native_turn
+                authority = classify_native_turn(thread_id, turn_id, exact[0],
+                    observed_thread_id=thread.get("id"),
+                    protocol_version=getattr(client, "cli_version", None))
+                if authority.get("terminal_confirmed") is True:
+                    raise _RecoveredTurnTerminal(exact[0]["status"])
             raise _HolderStopUnknown("Recovered observer stopped; original execution terminal remains unknown")
         if interrupt_at is None:
             # Latch before sending: a timeout/ambiguous response must not resend.
             interrupt_at = time.monotonic()
-            report("host_stop_interrupting", {"host_stop": control})
-            client.request("turn/interrupt", {"threadId": thread_id, "turnId": turn_id})
-        elif time.monotonic() - interrupt_at >= 5:
+            # Send once before the optional receipt: a contended receipt must not
+            # prevent an already authorized exact-owner interrupt.
+            try:
+                if owner_control_lease is not None:
+                    owner_control_lease.interrupt(client)
+                else:
+                    client.request("turn/interrupt", {"threadId": thread_id, "turnId": turn_id})
+            except Exception:
+                if publish_interrupt:
+                    raise
+                # An ambiguous interrupt is latched, never resent. Keep ownership
+                # until normal exact-turn observation resumes after contention.
+                return
+            if publish_interrupt:
+                report("host_stop_interrupting", {"host_stop": control})
+        elif publish_interrupt and time.monotonic() - interrupt_at >= 5:
             raise _HolderStopUnknown("Owner stop timed out without exact turn/completed evidence")
 
     def stop_requested() -> bool:
-        current = _read_json(request_path)
-        if current.get("request_id") != request.get("request_id"):
-            raise RuntimeError("Hold request changed while a turn was owned")
-        close_path = request_path.with_name("close.json")
-        close = _read_json(close_path) if close_path.exists() else {}
-        return (cancellation_path(request_path.parent, current) is not None
-                or current.get("stop_requested") is True or close.get("request_id") == request_id)
+        while True:
+            try:
+                current = _read_json(request_path)
+                if current.get("request_id") != request.get("request_id"):
+                    raise RuntimeError("Hold request changed while a turn was owned")
+                close_path = request_path.with_name("close.json")
+                close = _read_json(close_path) if close_path.exists() else {}
+                return (cancellation_path(request_path.parent, current) is not None
+                        or current.get("stop_requested") is True or close.get("request_id") == request_id)
+            except StateGateBusy:
+                # An inconclusive cancellation snapshot cannot authorize continuation.
+                time.sleep(0.05)
 
     def verify_output() -> dict[str, Any]:
         nonlocal verification
@@ -279,7 +403,23 @@ def hold_task(
 
     def publish(path: Path, value: dict[str, Any]) -> None:
         from jarvis_runtime.cancellation import GenerationRetired
-        if not _publish_generation(path, value, request):
+        nonlocal interrupt_at
+        if owner_control_lease is not None:
+            owner_control_lease.check()
+        waited = False
+        def poll_while_busy():
+            nonlocal waited
+            waited = True
+            if (client is not None and thread_id and turn_id and not terminal_confirmed
+                    and request.get("mode") != "recover"):
+                # Never recursively publish while waiting to publish a receipt.
+                control_poll(publish_interrupt=False)
+        published = _publish_generation(path, value, request, on_busy=poll_while_busy)
+        if waited and interrupt_at is not None:
+            # The client could not consume terminal notifications while publishing.
+            # Start its observation budget now; retain the send-once latch.
+            interrupt_at = time.monotonic()
+        if not published:
             raise GenerationRetired("old holder publication was fenced by a paused/successor request_id")
 
     def report(next_phase: str, details: dict[str, Any] | None = None) -> None:
@@ -293,6 +433,9 @@ def hold_task(
             thread_id = str(details["thread_id"])
         if details and details.get("turn_id"):
             turn_id = str(details["turn_id"])
+        if owner_control_lease is not None and phase in {"thread_started", "turn_started"}:
+            owner_control_lease.bind(thread_id=thread_id,
+                                    turn_id=turn_id if phase == "turn_started" else None)
         publish(ack_path, {
             "request_id": request_id,
             "status": "accepted",
@@ -325,13 +468,43 @@ def hold_task(
                 publish(result_path, cancelled)
                 publish(ack_path, cancelled)
                 return 0
-            launcher_config = NativeTaskLauncherConfig(launcher_config_path)
+            launcher_config = frozen_launcher_config or NativeTaskLauncherConfig(launcher_config_path)
             launcher_config.connection_base_url_override = route_for_model(
                 getattr(launcher_config, "jarvis_connection", None),
                 request.get("model"),
                 allow_start=str(request.get("mode") or "create") != "recover",
             )
             client = AppServerClient(launcher_config)
+            client.business_quarantine_context = dict(request)
+            if owner_control_lease is not None:
+                client.owner_control_rpc_guard = owner_control_lease.rpc_guard
+                client.owner_control_wire_scope = owner_control_lease.wire_scope
+                client.owner_control_terminal = lambda observed_thread, native_turn: (
+                    owner_control_lease.event_terminal(client, observed_thread, native_turn))
+            from jarvis_runtime.holder_transport_release import configured_unix_owner_binding
+            binding = configured_unix_owner_binding(client, request)
+            if binding is not None:
+                # Durable before any native dispatch; reconnect never substitutes
+                # another owner for this generation.
+                with generation_guard(request_path.parent, request):
+                    current = _read_json(request_path)
+                    if (current.get("request_id") != request_id
+                            or current.get("hold_id") != hold_id
+                            or current.get("owner_transport_binding") not in (None, binding)):
+                        raise RuntimeError("Hold generation or pinned Unix owner binding changed")
+                    _write_json(request_path, {**current, "owner_transport_binding": binding}, durable=True)
+                request = {**current, "owner_transport_binding": binding}
+            elif "owner_transport_binding" in request:
+                raise RuntimeError("Pinned Unix Hold cannot fall back to a stdio client")
+            if diagnostic_sink is not None:
+                client._terminal_diagnostic_sink = lambda value: diagnostic_sink({**value,
+                    "request_id": request_id, "hold_id": hold_id, "thread_id": thread_id,
+                    "turn_id": turn_id, "model": str(request.get("model") or "")})
+            if request.get("mode") != "recover" and (request_path.parent / ".user-host-claim/owner.json").is_file():
+                from jarvis_runtime.owner_transport_health import OwnerTransportHealthRecorder
+                transport_health = OwnerTransportHealthRecorder(request_path.parent, request_id,
+                    is_connected=lambda: _client_transport_contiguous(client))
+                client.owner_transport_health_recorder = transport_health
             def before_turn_dispatch(params):
                 nonlocal dispatch_evidence
                 try:
@@ -343,6 +516,8 @@ def hold_task(
                     dispatch_evidence = "unknown"  # Existing/uncertain commit is never proof of non-dispatch.
                     raise
                 dispatch_evidence = "possibly_sent"
+                if owner_control_lease is not None:
+                    owner_control_lease.dispatch(params)
             client.before_turn_dispatch = before_turn_dispatch
             report("launcher_config_loaded")
             input_binding = _turn_input_binding(request, initial_total_turn_count)
@@ -364,10 +539,22 @@ def hold_task(
                     report("waiting_for_prediction_source")
                     predicted = prepare_prediction_prompt(client, thread_id=thread_id,
                         request_id=request_id + ":prediction:first", options=prediction_options,
-                        receipt_dir=request_path.parent / "predictions", stop_requested=stop_requested)
+                        receipt_dir=request_path.parent / "predictions", stop_requested=stop_requested, model=request.get("model"))
                     publish(request_path.with_name("prediction-first.json"),
                             {"request_id":request_id, "hold_id":hold_id, "prediction":predicted})
                     if predicted.get("status") != "completed":
+                        witness = predicted.get("pre_helper_rejection")
+                        if (isinstance(witness, dict)
+                                and witness.get("schema") == "jarvis-prediction-pre-helper-rejection/v1"
+                                and witness.get("request_id") == request_id + ":prediction:first"
+                                and witness.get("source_thread_id") == thread_id
+                                and witness.get("source_turn_id") == predicted.get("source_turn_id")
+                                and witness.get("model") == request.get("model")
+                                and all(witness.get(key) is False for key in (
+                                    "helper_fork_attempted", "helper_dispatch_attempted", "research_dispatch_attempted"))
+                                and dispatch_evidence == "not_sent" and not turn_id):
+                            pre_helper_rejection = witness
+                            terminal_confirmed = False
                         if predicted.get("cleanup_completed") is False:
                             terminal_confirmed = False
                         raise RuntimeError("prediction continuation stopped: " + str(predicted.get("status")))
@@ -393,6 +580,14 @@ def hold_task(
                 turn_id = str(created.get("turn_id") or "").strip()
             if not thread_id or not turn_id:
                 raise RuntimeError("App Server task creation did not return thread_id and turn_id")
+        if transport_health is not None:
+            try:
+                transport_health.bind(thread_id, turn_id, getattr(client, "runtime_context", {}))
+            except Exception:
+                try:
+                    transport_health.invalidate()
+                except Exception:
+                    pass
         publish(ack_path, {
             "request_id": request_id,
             "status": "holding",
@@ -491,7 +686,7 @@ def hold_task(
                 if prediction_options:
                     predicted = prepare_prediction_prompt(client, thread_id=thread_id,
                         source_turn_id=turn_id, request_id=decision.command_id + ":prediction",
-                        options=prediction_options, receipt_dir=request_path.parent / "predictions", stop_requested=stop_requested)
+                        options=prediction_options, receipt_dir=request_path.parent / "predictions", stop_requested=stop_requested, model=request.get("model"))
                     publish(request_path.with_name(f"prediction-{total_turn_count + 1}.json"),
                             {"request_id":request_id, "hold_id":hold_id, "prediction":predicted})
                     if predicted.get("status") != "completed":
@@ -585,6 +780,9 @@ def hold_task(
             "dispatch_evidence": dispatch_evidence,
             **runtime_fields(),
         }
+        if pre_helper_rejection is not None:
+            failure["pre_helper_rejection"] = pre_helper_rejection
+            failure["terminal_confirmed"] = False
         if host_stop_selected or interrupt_at is not None:
             failure.update(host_stop=True, execution_evidence="requires_owner_terminal")
         if isinstance(exc, _RecoveredTurnTerminal):
@@ -600,16 +798,29 @@ def hold_task(
         publish(ack_path, failure)
         return 1
     finally:
+        if transport_health is not None:
+            try:
+                transport_health.stop()
+            except Exception:
+                pass
         observer_stopped = client is None
         if client is not None:
             owned_process = getattr(client, "process", None)
             client.close()
-            observer_stopped = owned_process is None or owned_process.poll() is not None
+            observer_stopped = _client_observer_stopped(client, owned_process)
+            if owner_control_lease is not None and observer_stopped and owner_control_lease.state.get("connection"):
+                owner_control_lease.observer_closed(client)
             if result_path.is_file():
                 saved = _read_json(result_path)
                 if saved.get("request_id") == request_id and saved.get("host_stop"):
-                    publish(result_path, {**saved, "holder_client_exit_confirmed": (
-                        owned_process is not None and owned_process.poll() is not None)})
+                    closed = {**saved, "holder_client_exit_confirmed": (
+                        owned_process is not None and owned_process.poll() is not None)}
+                    if owned_process is None and observer_stopped:
+                        from jarvis_runtime.holder_transport_release import make_unix_attachment_release
+                        proof = make_unix_attachment_release(client, closed, _read_json(request_path))
+                        if proof is not None:
+                            closed.update(holder_transport_release=proof, local_observer_stopped=True)
+                    publish(result_path, closed)
         if observer_stopped and result_path.is_file():
             saved = _read_json(result_path)
             current = _read_json(request_path)
